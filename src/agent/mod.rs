@@ -32,17 +32,20 @@ pub struct AgentConfig {
 /// One turn of the agent loop. Returns the assistant's final text.
 pub async fn run_turn(
     provider: &dyn LlmProvider,
-    tools: &ToolRegistry,
+    tools: &mut ToolRegistry,
     config: &AgentConfig,
     user_prompt: &str,
 ) -> Result<String> {
     let mut messages = vec![ChatMessage::system(&config.system_prompt)];
     messages.push(ChatMessage::user(user_prompt));
 
-    let specs = tools.specs();
     let mut step: u32 = 0;
 
     loop {
+        // Fresh specs every turn: evolution tools may have added tools
+        // mid-run, and the model should see them on the next turn.
+        let specs = tools.specs();
+
         if config.max_steps > 0 && step >= config.max_steps {
             anyhow::bail!("step limit ({}) reached", config.max_steps);
         }
@@ -107,6 +110,9 @@ pub async fn run_turn(
                     }
                 }
             }
+            // Evolution: hot-register any tools the model created this
+            // turn so they are callable (and advertised) next turn.
+            tools.drain_hot();
             continue;
         }
 

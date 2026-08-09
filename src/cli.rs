@@ -31,4 +31,8 @@ pub struct Cli {
     /// Directory with Lua scripted tools (default: ~/.sigil/tools/).
     #[arg(long)]
     pub tools_dir: Option<String>,
+
+    /// Harness bundle directory (system prompt + skills; default: ~/.sigil/harness/).
+    #[arg(long)]
+    pub harness_dir: Option<String>,
 }

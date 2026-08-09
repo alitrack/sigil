@@ -46,6 +46,9 @@ pub struct Config {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+    /// System prompt override — superseded by the harness bundle
+    /// (kept for future CLI/config precedence).
+    #[allow(dead_code)]
     pub system_prompt: String,
     pub max_steps: u32,
 }

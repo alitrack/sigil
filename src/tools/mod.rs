@@ -1,4 +1,4 @@
-//! Tool registry: native tools + (Phase 1) scripted LuaJIT tools + MCP
+//! Tool registry: native tools + scripted LuaJIT tools + evolution tools
 //! behind one lookup, so the agent loop and the model treat all identically.
 
 use std::collections::HashMap;
@@ -13,12 +13,16 @@ use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
 pub mod bash;
+pub mod evolve;
 pub mod files;
 pub mod git;
 pub mod scripted;
 
 #[cfg(test)]
 mod scripted_tests;
+
+#[cfg(test)]
+mod evolve_tests;
 
 /// What a tool returns to the agent loop.
 #[derive(Debug, Clone)]
@@ -40,6 +44,9 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    /// Tools hot-registered mid-run by evolution tools, drained by the
+    /// agent loop after each turn.
+    hot_queue: Arc<Mutex<Vec<(String, std::path::PathBuf)>>>,
 }
 
 impl ToolRegistry {
@@ -67,6 +74,19 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitStatusTool));
         registry.register(Arc::new(git::GitDiffTool));
         registry.register(Arc::new(git::GitLogTool));
+        // Evolution tool: the model can write new Lua tools at runtime.
+        let tools_dir = scripted_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(scripted::default_tools_dir);
+        let hot_queue = registry.hot_queue.clone();
+        registry.register(Arc::new(evolve::CreateLuaToolTool {
+            tools_dir: tools_dir.clone(),
+            register: Box::new(move |name: &str, path: std::path::PathBuf| {
+                if let Ok(mut q) = hot_queue.try_lock() {
+                    q.push((name.to_string(), path));
+                }
+            }),
+        }));
         if let Some(dir) = scripted_dir {
             registry.register_scripted(dir);
         }
@@ -83,6 +103,28 @@ impl ToolRegistry {
             match scripted::LuaTool::new(stem, &path, lua.clone()) {
                 Ok(tool) => self.register(Arc::new(tool)),
                 Err(e) => eprintln!("warning: skipping scripted tool {stem}: {e}"),
+            }
+        }
+    }
+
+    /// Hot-register tools queued by evolution tools. Called by the agent
+    /// loop after each turn so newly created tools are available to the
+    /// model on the very next turn.
+    pub fn drain_hot(&mut self) {
+        let lua = Arc::new(Mutex::new(LuaRuntime::new().expect("lua runtime init")));
+        // try_lock: we're in an async context; the queue is only touched
+        // here and by the (sync) evolution tool, so contention is nil.
+        let queued: Vec<_> = match self.hot_queue.try_lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return,
+        };
+        for (name, path) in queued {
+            match scripted::LuaTool::new(&name, &path, lua.clone()) {
+                Ok(tool) => {
+                    self.register(Arc::new(tool));
+                    eprintln!("hot-registered Lua tool: {name}");
+                }
+                Err(e) => eprintln!("warning: hot-register {name} failed: {e}"),
             }
         }
     }
@@ -114,7 +156,7 @@ impl ToolRegistry {
     }
 }
 
-/// Helper: build a JSON error payload. Phase 1: used by scripted/MCP tools.
+/// Helper: build a JSON error payload. Used by scripted/MCP tools.
 #[allow(dead_code)]
 pub fn error_output(msg: impl Into<String>) -> ToolOutput {
     ToolOutput {

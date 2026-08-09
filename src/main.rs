@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod config;
+mod harness;
 mod llm;
 mod lua;
 mod safety;
@@ -45,14 +46,18 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(scripted::default_tools_dir);
-    let tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
+    let mut tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
+
+    // Harness bundle: system prompt + skills from disk (editable).
+    let harness = harness::Harness::load(cli.harness_dir.as_deref().map(std::path::Path::new))?;
+
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
         max_steps: config.max_steps,
-        system_prompt: config.system_prompt.clone(),
+        system_prompt: harness.full_system_prompt(),
     };
 
-    let answer = agent::run_turn(&provider, &tools, &agent_config, &prompt)
+    let answer = agent::run_turn(&provider, &mut tools, &agent_config, &prompt)
         .await
         .context("agent turn failed")?;
 

@@ -8,26 +8,37 @@ use tokio::sync::Mutex;
 use crate::tools::Tool;
 use crate::tools::evolve::CreateLuaToolTool;
 
+fn fresh_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sigil-evolve-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+type HotQueue = Arc<Mutex<Vec<(String, std::path::PathBuf)>>>;
+
+fn make_tool(dir: std::path::PathBuf) -> (CreateLuaToolTool, HotQueue) {
+    let queue: HotQueue = Arc::default();
+    let q = queue.clone();
+    let tool = CreateLuaToolTool {
+        tools_dir: dir,
+        register: Box::new(move |name: &str, path: std::path::PathBuf| {
+            if let Ok(mut q) = q.try_lock() {
+                q.push((name.to_string(), path));
+            }
+        }),
+    };
+    (tool, queue)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn creates_and_hot_registers_tool() {
-        let dir = std::env::temp_dir().join(format!("sigil-evolve-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let queue: Arc<Mutex<Vec<(String, std::path::PathBuf)>>> = Arc::default();
-        let q = queue.clone();
-        let tool = CreateLuaToolTool {
-            tools_dir: dir.clone(),
-            register: Box::new(move |name: &str, path: std::path::PathBuf| {
-                if let Ok(mut q) = q.try_lock() {
-                    q.push((name.to_string(), path));
-                }
-            }),
-        };
+        let dir = fresh_dir("create");
+        let (tool, queue) = make_tool(dir.clone());
 
         assert_eq!(tool.name(), "create_lua_tool");
 
@@ -52,20 +63,8 @@ mod tests {
 
     #[tokio::test]
     async fn sanitizes_unsafe_tool_names() {
-        let dir = std::env::temp_dir().join(format!("sigil-evolve-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let queue: Arc<Mutex<Vec<(String, std::path::PathBuf)>>> = Arc::default();
-        let q = queue.clone();
-        let tool = CreateLuaToolTool {
-            tools_dir: dir.clone(),
-            register: Box::new(move |name: &str, path: std::path::PathBuf| {
-                if let Ok(mut q) = q.try_lock() {
-                    q.push((name.to_string(), path));
-                }
-            }),
-        };
+        let dir = fresh_dir("sanitize");
+        let (tool, _queue) = make_tool(dir.clone());
 
         // Name with path traversal chars gets sanitized to safe chars.
         let out = tool

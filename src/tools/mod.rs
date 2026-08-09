@@ -42,7 +42,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Unified registry, keyed by advertised name.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
@@ -54,6 +54,12 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cheap clone for concurrent sessions: shares the Arc'd tools and
+    /// the hot queue, giving each session its own registry bookkeeping.
+    pub fn clone_shallow(&self) -> Self {
+        self.clone()
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {

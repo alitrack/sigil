@@ -1,3 +1,4 @@
+mod acp;
 mod agent;
 mod cli;
 mod config;
@@ -9,12 +10,10 @@ mod memory;
 mod safety;
 mod tools;
 
-use std::io::Read;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::llm::openai::{OpenAiConfig, OpenAiProvider};
 use crate::tools::{ToolRegistry, scripted};
@@ -34,15 +33,7 @@ async fn main() -> Result<()> {
         api_key: config.api_key.clone(),
     })?;
 
-    // Pipe mode: `echo "fix the bug" | sigil` — read stdin, run one turn.
-    let prompt = match cli.prompt {
-        Some(p) => p,
-        None => read_stdin()?,
-    };
-    if prompt.trim().is_empty() {
-        anyhow::bail!("no prompt: pass -p/--prompt or pipe stdin");
-    }
-
+    // Tools: native + scripted Lua + memory + MCP.
     let tools_dir = cli
         .tools_dir
         .as_deref()
@@ -53,6 +44,7 @@ async fn main() -> Result<()> {
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.
     let memory_path = cli
         .memory
+        .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(memory::default_memory_path);
     tools::memory::register(&mut tools, memory_path);
@@ -62,19 +54,12 @@ async fn main() -> Result<()> {
         match mcp::McpClient::connect(&server.name, &server.command, &server.args).await {
             Ok((client, infos)) => {
                 let client = std::sync::Arc::new(client);
+                let n = infos.len();
                 for info in infos {
                     let tool = tools::mcp::McpTool::new(&server.name, info, client.clone());
                     tools.register(std::sync::Arc::new(tool));
                 }
-                eprintln!(
-                    "mcp: connected '{}' ({} tools)",
-                    server.name,
-                    tools
-                        .specs()
-                        .iter()
-                        .filter(|s| s.name.starts_with(&format!("mcp_{}_", server.name)))
-                        .count()
-                );
+                eprintln!("mcp: connected '{}' ({} tools)", server.name, n);
             }
             Err(e) => eprintln!("mcp: failed to connect '{}': {e}", server.name),
         }
@@ -89,18 +74,25 @@ async fn main() -> Result<()> {
         system_prompt: harness.full_system_prompt(),
     };
 
-    let answer = agent::run_turn(&provider, &mut tools, &agent_config, &prompt)
-        .await
-        .context("agent turn failed")?;
+    let sub_prompt = match &cli.command {
+        Some(Command::Prompt { prompt }) => prompt.clone(),
+        _ => None,
+    };
 
-    println!("{answer}");
-    Ok(())
-}
-
-fn read_stdin() -> Result<String> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .context("reading stdin")?;
-    Ok(buf)
+    match &cli.command {
+        Some(Command::Acp) => {
+            eprintln!("sigil acp: serving Agent Client Protocol on stdio");
+            let provider_arc: std::sync::Arc<dyn crate::llm::provider::LlmProvider> =
+                std::sync::Arc::new(provider);
+            acp::serve(tools, agent_config, provider_arc).await
+        }
+        _ => {
+            let prompt = cli::prompt_from(sub_prompt)?;
+            let answer = agent::run_turn(&provider, &mut tools, &agent_config, &prompt)
+                .await
+                .context("agent turn failed")?;
+            println!("{answer}");
+            Ok(())
+        }
+    }
 }

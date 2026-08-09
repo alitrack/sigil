@@ -7,6 +7,10 @@ description = "A Rust + LuaJIT coding agent with a self-evolving harness."
 repository = "https://github.com/alitrack/sigil"
 rust-version = "1.97"
 
+[[bin]]
+name = "sigil"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"

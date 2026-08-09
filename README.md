@@ -23,9 +23,7 @@ engine, so the agent can grow its own capabilities at runtime.
 # Build
 cargo build --release
 
-# Run (env-var configuration)
-SIGIL_MODEL=deepseek-v4-flash \
-SIGIL_BASE_URL=http://10.10.10.115:8010/v1 \
+# Run (env-var configuration; defaults to the cc-switch proxy + deepseek-v4-flash)
 echo "what files are in this repo?" | ./target/release/sigil
 ```
 
@@ -34,8 +32,11 @@ echo "what files are in this repo?" | ./target/release/sigil
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `SIGIL_MODEL` | `deepseek-v4-flash` | Model name |
-| `SIGIL_BASE_URL` | `http://10.10.10.115:8010/v1` | OpenAI-compatible endpoint |
+| `SIGIL_BASE_URL` | `http://127.0.0.1:15722/v1` | OpenAI-compatible endpoint (cc-switch local proxy) |
 | `SIGIL_API_KEY` | `EMPTY` | API key (bearer token) |
+
+Any OpenAI-compatible endpoint works via `SIGIL_BASE_URL` — vLLM, Ollama,
+llama.cpp, DeepSeek, moon-bridge, etc.
 
 CLI flags override env vars: `--model`, `--base-url`, `--api-key`,
 `--max-steps` (tool-call budget per turn, `0` = unlimited), `-p/--prompt`.

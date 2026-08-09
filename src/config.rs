@@ -20,8 +20,10 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let model = env::var("SIGIL_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-        let base_url = env::var("SIGIL_BASE_URL")
-            .unwrap_or_else(|_| "http://10.10.10.115:8010/v1".to_string());
+        // Default endpoint: cc-switch local proxy (user's provider manager).
+        // Direct vLLM (10.10.10.115:8010) works too via SIGIL_BASE_URL.
+        let base_url =
+            env::var("SIGIL_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:15722/v1".to_string());
         let api_key = env::var("SIGIL_API_KEY").unwrap_or_else(|_| "EMPTY".to_string());
 
         Ok(Self {

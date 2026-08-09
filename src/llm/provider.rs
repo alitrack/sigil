@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Assistant-only: native tool calls (OpenAI function-calling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool-only: id of the tool call this message answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,18 +35,43 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
+    #[allow(dead_code)]
     pub fn assistant(content: impl Into<String>) -> Self {
+        // Kept for Phase-1 plain-text assistant messages; tool-call
+        // messages go through `assistant_with_tools`.
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+    pub fn assistant_with_tools(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: Some(calls),
+            tool_call_id: None,
+        }
+    }
+    pub fn tool_result(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -77,6 +108,16 @@ pub struct ChatChunk {
     pub delta: String,
     pub thinking: bool,
     pub done: bool,
+    /// `finish_reason == "tool_calls"` — the model wants to call tools;
+    /// the call details arrive in the non-streaming replay.
+    pub tool_calls_requested: bool,
+}
+
+/// A complete (non-streaming) completion result.
+#[derive(Debug, Clone)]
+pub struct ChatComplete {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// The provider contract. All backends implement this.
@@ -94,6 +135,9 @@ pub trait LlmProvider: Send + Sync + Debug {
 
     /// Stream a chat completion.
     async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream>;
+
+    /// Non-streaming completion (used for the tool-call replay).
+    async fn chat_complete(&self, req: ChatRequest) -> anyhow::Result<ChatComplete>;
 }
 
 /// Boxed stream of chunks.

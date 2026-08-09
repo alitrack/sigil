@@ -1,12 +1,13 @@
 //! OpenAI-compatible chat client (works against vLLM, Ollama, llama.cpp
-//! `/v1`, moon-bridge, and every OpenAI-compatible endpoint).
+//! `/v1`, moon-bridge, cc-switch proxy, and every OpenAI-compatible
+//! endpoint).
 
 use async_trait::async_trait;
 use futures_util::Stream;
 use serde_json::{Value, json};
 
 use super::provider::{
-    ChatChunk, ChatMessage, ChatRequest, ChatStream, LlmProvider, Role, ToolCall,
+    ChatChunk, ChatComplete, ChatMessage, ChatRequest, ChatStream, LlmProvider, ToolCall,
 };
 
 /// Configuration for an OpenAI-compatible provider.
@@ -25,24 +26,17 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(600))
             .build()?;
         Ok(Self { config, client })
     }
-}
 
-#[async_trait]
-impl LlmProvider for OpenAiProvider {
-    fn name(&self) -> &str {
-        "openai-compatible"
-    }
-
-    async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+    async fn post(&self, req: &ChatRequest) -> anyhow::Result<reqwest::Response> {
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let body = build_body(&req);
+        let body = build_body(req);
         let resp = self
             .client
             .post(&url)
@@ -56,9 +50,34 @@ impl LlmProvider for OpenAiProvider {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("provider error {status}: {text}");
         }
+        Ok(resp)
+    }
+}
 
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    fn name(&self) -> &str {
+        "openai-compatible"
+    }
+
+    async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+        let resp = self.post(&req).await?;
         let bytes = resp.bytes().await?.to_vec();
         Ok(Box::new(parse_stream(bytes)))
+    }
+
+    async fn chat_complete(&self, req: ChatRequest) -> anyhow::Result<ChatComplete> {
+        let mut req = req;
+        req.stream = false;
+        let resp = self.post(&req).await?;
+        let v: Value = resp.json().await?;
+
+        let text = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let tool_calls = parse_tool_calls(&v);
+        Ok(ChatComplete { text, tool_calls })
     }
 }
 
@@ -66,7 +85,7 @@ impl LlmProvider for OpenAiProvider {
 fn build_body(req: &ChatRequest) -> Value {
     let mut body = json!({
         "model": req.model,
-        "messages": req.messages.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>().unwrap_or_default(),
+        "messages": req.messages.iter().map(message_to_json).collect::<Vec<_>>(),
         "stream": req.stream,
     });
     if !req.tools.is_empty() {
@@ -90,6 +109,36 @@ fn build_body(req: &ChatRequest) -> Value {
     body
 }
 
+/// Serialize one message, including native tool-call fields when present.
+fn message_to_json(m: &ChatMessage) -> Value {
+    let mut v = json!({ "role": m.role });
+    if let Some(calls) = &m.tool_calls {
+        v["tool_calls"] = json!(
+            calls
+                .iter()
+                .map(|c| json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": c.arguments.to_string(),
+                    }
+                }))
+                .collect::<Vec<_>>()
+        );
+        // When tool_calls is present, content may be empty/absent.
+        if !m.content.is_empty() {
+            v["content"] = Value::String(m.content.clone());
+        }
+    } else {
+        v["content"] = Value::String(m.content.clone());
+    }
+    if let Some(id) = &m.tool_call_id {
+        v["tool_call_id"] = Value::String(id.clone());
+    }
+    v
+}
+
 /// Chunk stream parser. Handles both plain SSE lines and wrapped
 /// `data: {...}` frames. Robust to trailing whitespace and `[DONE]`.
 pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<ChatChunk>> {
@@ -111,6 +160,7 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
                         delta: String::new(),
                         thinking: false,
                         done: true,
+                        tool_calls_requested: false,
                     }));
                 }
                 let parsed: Result<Value, _> = serde_json::from_str(payload);
@@ -126,10 +176,12 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
                             .unwrap_or("")
                             .to_string();
                         let finish = v["choices"][0]["finish_reason"].as_str();
+                        let tool_calls_requested = finish == Some("tool_calls");
                         Some(Ok(ChatChunk {
                             delta,
                             thinking: !reasoning.is_empty(),
-                            done: finish == Some("stop") || finish == Some("tool_calls"),
+                            done: finish == Some("stop") || tool_calls_requested,
+                            tool_calls_requested,
                         }))
                     }
                     Err(e) => Some(Err(anyhow::anyhow!("bad chunk: {e}"))),
@@ -139,7 +191,6 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
 }
 
 /// Parse an OpenAI function-calling response into tool calls.
-/// Phase 1: native tool-call delta accumulation.
 #[allow(dead_code)]
 pub fn parse_tool_calls(v: &Value) -> Vec<ToolCall> {
     let mut out = Vec::new();
@@ -158,22 +209,4 @@ pub fn parse_tool_calls(v: &Value) -> Vec<ToolCall> {
         }
     }
     out
-}
-
-/// Convert a model tool-call response into a full assistant message.
-/// Phase 1: native tool-call delta accumulation.
-#[allow(dead_code)]
-pub fn tool_call_to_message(calls: &[ToolCall]) -> ChatMessage {
-    let content = json!({
-        "tool_calls": calls.iter().map(|c| json!({
-            "id": c.id,
-            "type": "function",
-            "function": { "name": c.name, "arguments": c.arguments.to_string() }
-        })).collect::<Vec<_>>()
-    })
-    .to_string();
-    ChatMessage {
-        role: Role::Assistant,
-        content,
-    }
 }

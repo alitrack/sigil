@@ -22,9 +22,7 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 # 构建
 cargo build --release
 
-# 运行（环境变量配置）
-SIGIL_MODEL=deepseek-v4-flash \
-SIGIL_BASE_URL=http://10.10.10.115:8010/v1 \
+# 运行（环境变量配置；默认走 cc-switch 代理 + deepseek-v4-flash）
 echo "这个仓库里有哪些文件？" | ./target/release/sigil
 ```
 
@@ -33,8 +31,11 @@ echo "这个仓库里有哪些文件？" | ./target/release/sigil
 | 环境变量 | 默认值 | 用途 |
 |---------|--------|------|
 | `SIGIL_MODEL` | `deepseek-v4-flash` | 模型名 |
-| `SIGIL_BASE_URL` | `http://10.10.10.115:8010/v1` | OpenAI 兼容端点 |
+| `SIGIL_BASE_URL` | `http://127.0.0.1:15722/v1` | OpenAI 兼容端点（cc-switch 本地代理） |
 | `SIGIL_API_KEY` | `EMPTY` | API key（bearer token） |
+
+任意 OpenAI 兼容端点都可通过 `SIGIL_BASE_URL` 使用——vLLM、Ollama、
+llama.cpp、DeepSeek、moon-bridge 等。
 
 CLI 参数覆盖环境变量：`--model`、`--base-url`、`--api-key`、
 `--max-steps`（每轮工具调用预算，`0` = 不限）、`-p/--prompt`。

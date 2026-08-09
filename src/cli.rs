@@ -38,6 +38,18 @@ pub struct Cli {
     /// Memory file for remember/recall tools (default: ~/.sigil/memory.md).
     #[arg(long)]
     pub memory: Option<String>,
+
+    /// Resume an interactive session by id (see ~/.sigil/sessions/).
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// Sessions directory for REPL history (default: ~/.sigil/sessions/).
+    #[arg(long)]
+    pub sessions_dir: Option<String>,
+
+    /// List saved sessions and exit.
+    #[arg(long)]
+    pub list_sessions: bool,
 }
 
 #[derive(Subcommand, Debug)]

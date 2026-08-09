@@ -9,6 +9,7 @@ mod mcp;
 mod memory;
 mod repl;
 mod safety;
+mod session;
 mod tools;
 
 use anyhow::{Context, Result};
@@ -75,6 +76,18 @@ async fn main() -> Result<()> {
         system_prompt: harness.full_system_prompt(),
     };
 
+    if cli.list_sessions {
+        let sessions_dir = cli
+            .sessions_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(session::default_sessions_dir);
+        for id in session::list(&sessions_dir)? {
+            println!("{id}");
+        }
+        return Ok(());
+    }
+
     let sub_prompt = match &cli.command {
         Some(Command::Prompt { prompt }) => prompt.clone(),
         _ => None,
@@ -90,7 +103,19 @@ async fn main() -> Result<()> {
         _ if repl::should_enter_repl(&sub_prompt) => {
             // Interactive mode: multi-turn conversation with human
             // approval for destructive tool calls.
-            repl::run(&provider, &mut tools, &agent_config).await
+            let sessions_dir = cli
+                .sessions_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(session::default_sessions_dir);
+            repl::run(
+                &provider,
+                &mut tools,
+                &agent_config,
+                &sessions_dir,
+                cli.resume.as_deref(),
+            )
+            .await
         }
         _ => {
             let prompt = cli::prompt_from(sub_prompt)?;

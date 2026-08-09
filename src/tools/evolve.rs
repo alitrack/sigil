@@ -36,7 +36,7 @@ impl Tool for CreateLuaToolTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new Lua scripted tool: write Lua code (with optional -- desc: and -- schema: header comments), sigil saves it to the tools dir and makes it callable by name from the next turn on. Returns the new tool's name. Use when a task needs a repeatable operation that the built-in tools don't cover."
+        "Create a new Lua scripted tool: write Lua code (with optional -- desc: and -- schema: header comments), sigil saves it to the tools dir and makes it callable by name from the next turn on. Returns the new tool's name. Use when a task needs a repeatable operation that the built-in tools don't cover. Your Lua code has a global `host` table with safe helpers: host.read_file(path), host.write_file(path, content), host.env(key), host.list_dir(dir), host.cwd(), host.json_encode(value), host.json_decode(text). FFI is available (require('ffi')) for calling system C libraries."
     }
 
     fn parameters(&self) -> Value {

@@ -66,6 +66,54 @@ impl LuaRuntime {
                 .map_err(lua_err)?,
         )
         .map_err(lua_err)?;
+        host.set(
+            "list_dir",
+            lua.create_function(|_lua, dir: String| {
+                let mut names: Vec<String> = Vec::new();
+                let entries = std::fs::read_dir(&dir)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("list_dir: {e}")))?;
+                for e in entries.flatten() {
+                    names.push(e.file_name().to_string_lossy().into_owned());
+                }
+                names.sort();
+                Ok(names)
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+        host.set(
+            "cwd",
+            lua.create_function(|_lua, ()| {
+                Ok(std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default())
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+        host.set(
+            "json_encode",
+            lua.create_function(|lua, value: mlua::Value| {
+                let json = lua
+                    .to_value(&value)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("json_encode: {e}")))?;
+                serde_json::to_string(&json)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("json_encode: {e}")))
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+        host.set(
+            "json_decode",
+            lua.create_function(|lua, text: String| {
+                let json: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("json_decode: {e}")))?;
+                lua.to_value(&json)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("json_decode: {e}")))
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
         lua.globals().set("host", host).map_err(lua_err)?;
 
         Ok(Self {
@@ -161,5 +209,40 @@ return tostring(libc.strlen('hello'))
             )
             .unwrap();
         assert_eq!(out, "\"5\"");
+    }
+
+    #[test]
+    fn host_helpers_available() {
+        let rt = LuaRuntime::new().unwrap();
+        // write + read round-trip through host helpers.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sigil-host-helper-{}.txt", std::process::id()));
+        let p = path.to_string_lossy();
+        let out = rt
+            .run(&format!(
+                "host.write_file('{p}', 'hello helper'); return host.read_file('{p}')"
+            ))
+            .unwrap();
+        assert_eq!(out, "\"hello helper\"");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn host_json_helpers_roundtrip() {
+        let rt = LuaRuntime::new().unwrap();
+        let out = rt
+            .run("local t = host.json_decode('[1, 2, 3]'); return host.json_encode(t)")
+            .unwrap();
+        assert_eq!(out, "\"[1,2,3]\"");
+    }
+
+    #[test]
+    fn host_list_dir_and_cwd() {
+        let rt = LuaRuntime::new().unwrap();
+        // list_dir on the current dir contains at least Cargo.toml
+        // (when the cwd is the project root) — the helper must return
+        // a sorted array.
+        let out = rt.run("return #host.list_dir(host.cwd()) > 0").unwrap();
+        assert_eq!(out, "true");
     }
 }

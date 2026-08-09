@@ -93,7 +93,11 @@ async fn main() -> Result<()> {
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
         max_steps: config.max_steps,
-        system_prompt: harness.full_system_prompt(),
+        system_prompt: harness.system_prompt.clone(),
+        skills: harness.skills.clone(),
+        // Dynamic skill selection: inline at most 3 relevant skills
+        // per turn (keyword-overlap ranked).
+        max_inline_skills: 3,
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

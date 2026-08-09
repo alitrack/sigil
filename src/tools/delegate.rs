@@ -100,6 +100,8 @@ mod tests {
                 model: "test".into(),
                 max_steps: 0,
                 system_prompt: "test".into(),
+                skills: vec![],
+                max_inline_skills: 0,
             },
         };
         assert_eq!(tool.name(), "delegate");

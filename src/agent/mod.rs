@@ -27,6 +27,30 @@ pub struct AgentConfig {
     /// 0 = no step limit (a turn runs until the model stops calling tools).
     pub max_steps: u32,
     pub system_prompt: String,
+    /// Skills available for dynamic inlining (relevance-selected per
+    /// user prompt). Empty = no skill inlining.
+    pub skills: Vec<crate::harness::Skill>,
+    /// Max skills inlined per turn (relevance-ranked). Ignored when
+    /// `skills` is empty.
+    pub max_inline_skills: usize,
+}
+
+impl AgentConfig {
+    /// System prompt for a specific user prompt: base prompt plus the
+    /// most relevant skills inlined (keyword-overlap ranked).
+    pub fn system_prompt_for(&self, prompt: &str) -> String {
+        if self.skills.is_empty() || self.max_inline_skills == 0 {
+            self.system_prompt.clone()
+        } else {
+            let mut p = self.system_prompt.clone();
+            p.push_str(&crate::harness::inline_skills_for(
+                prompt,
+                &self.skills,
+                self.max_inline_skills,
+            ));
+            p
+        }
+    }
 }
 
 /// Approval callback: given a tool call that the gate rejected in
@@ -47,7 +71,7 @@ pub async fn run_turn(
     user_prompt: &str,
 ) -> Result<String> {
     let messages = vec![
-        ChatMessage::system(&config.system_prompt),
+        ChatMessage::system(config.system_prompt_for(user_prompt)),
         ChatMessage::user(user_prompt),
     ];
     run_messages(provider, tools, config, &messages, None, None).await
@@ -63,7 +87,7 @@ pub async fn run_turn_with_approver(
     stream_cb: Option<&StreamCb>,
 ) -> Result<String> {
     let messages = vec![
-        ChatMessage::system(&config.system_prompt),
+        ChatMessage::system(config.system_prompt_for(user_prompt)),
         ChatMessage::user(user_prompt),
     ];
     run_messages(provider, tools, config, &messages, approver, stream_cb).await

@@ -25,7 +25,7 @@ use anyhow::Result;
 pub struct Skill {
     pub name: String,
     pub description: String,
-    /// Full file contents (inlined into the prompt when small).
+    /// Full file contents (inlined into the prompt when relevant).
     pub body: String,
     /// Path to the skill file (for tools that read/edit it).
     #[allow(dead_code)]
@@ -81,15 +81,11 @@ impl Harness {
         })
     }
 
-    /// Render the skills section for the system prompt.
-    ///
-    /// Small skills (≤ 2 KiB) are inlined in full so the model can act
-    /// on them without an extra read_file round-trip; larger ones stay
-    /// as an index entry (read_file on demand).
+    /// Render the skills section for the system prompt (all skills
+    /// inline). Superseded at runtime by `inline_skills_for` (dynamic
+    /// per-turn selection); kept for tests and completeness.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn skills_index(&self) -> String {
-        if self.skills.is_empty() {
-            return String::new();
-        }
         let mut out = String::from("\n\n# Available skills\n\n");
         for s in &self.skills {
             out.push_str(&format!("- **{}** — {}\n", s.name, s.description));
@@ -100,20 +96,81 @@ impl Harness {
         for s in &self.skills {
             if s.body.len() <= 2 * 1024 {
                 out.push_str(&format!(
-                    "\n<skill name=\"{}\">\n{}\n</skill>\n",
-                    s.name, s.body
+                    "\n<skill name=\"{}\">\n{}</skill>\n",
+                    s.name,
+                    s.body.trim()
                 ));
             }
         }
         out
     }
 
-    /// Full system prompt: base + skill index.
+    /// Full system prompt: base + skill index (all skills inline).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn full_system_prompt(&self) -> String {
         let mut p = self.system_prompt.clone();
         p.push_str(&self.skills_index());
         p
     }
+}
+
+/// Render the `<skill>` blocks for the given skills, ranked by keyword
+/// overlap with `prompt` (most relevant first), capped at `max_inline`.
+/// Empty prompt = no inlining.
+pub fn inline_skills_for(prompt: &str, skills: &[Skill], max_inline: usize) -> String {
+    let prompt_tokens = tokenize(prompt);
+    let mut ranked: Vec<(usize, &Skill)> = skills
+        .iter()
+        .filter(|s| s.body.len() <= 2 * 1024)
+        .map(|s| (overlap_score(&prompt_tokens, s), s))
+        .collect();
+    ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    let mut out = String::new();
+    for (score, s) in ranked.iter().take(max_inline) {
+        if *score > 0 {
+            out.push_str(&format!(
+                "\n<skill name=\"{}\">\n{}</skill>\n",
+                s.name,
+                s.body.trim()
+            ));
+        }
+    }
+    out
+}
+
+/// Lowercase alphanumeric tokens (≥ 2 chars) from a string.
+fn tokenize(s: &str) -> Vec<String> {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Keyword overlap between the prompt and a skill
+/// (name/description/body tokens).
+fn overlap_score(prompt_tokens: &[String], skill: &Skill) -> usize {
+    if prompt_tokens.is_empty() {
+        return 0;
+    }
+    let mut corpus = tokenize(&skill.name);
+    corpus.extend(tokenize(&skill.description));
+    corpus.extend(tokenize(&skill.body));
+    let mut score = 0;
+    for t in prompt_tokens {
+        if corpus.iter().any(|c| c == t) {
+            score += 1;
+        }
+    }
+    score
 }
 
 fn load_skills(dir: &Path) -> Vec<Skill> {

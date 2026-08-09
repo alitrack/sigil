@@ -23,11 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 10** — harness 指令层自进化。管道模式、带真实 FFI 的
+> 状态：**Phase 12** — ACP client（跨进程委托）。管道模式、带真实 FFI 的
 > 脚本化 Lua 工具、自进化闭环、三层 safety、MCP 客户端**和 server**、
-> ACP server、持久 memory、交互式 REPL、真正多轮上下文、可续会话、
-> 子代理委托、流式输出、ratchet 回归电池、模型驱动 harness 改进
-> 全部端到端可用。
+> ACP server **和 client**、持久 memory、真正多轮上下文的交互式 REPL、
+> 可续会话、子代理委托、流式输出、ratchet 回归电池、模型驱动 harness
+> 改进全部端到端可用。
 
 ## 快速开始
 
@@ -89,6 +89,8 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   （Claude Desktop、Cursor、其他 agent）。
 - **ACP server** — `sigil acp` 说 Agent Client Protocol（stdio 上的
   JSON-RPC），任意 ACP 宿主（编辑器、其他 agent）都能驱动 sigil。
+- **ACP client** — `acp_call` 工具 spawn 外部 ACP server（另一个
+  sigil、codex、编辑器 agent）并派发任务——跨进程委托，协议双向。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
 - **真正多轮上下文** — REPL 跨轮维护真实消息列表；`--resume` 把会话记录
   作为真实 user/assistant 消息载入（模型记得对话，而非文本 blob）。
@@ -123,6 +125,30 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 - **`lua::LuaRuntime`** — vendored LuaJIT 开启 `ffi`；`host` 辅助表
   （`read_file` / `write_file` / `env`）是脚本↔宿主的安全边界。
 
+## 与 Claude Desktop 集成（MCP）
+
+`sigil mcp` 是标准 stdio MCP server，Claude Desktop 可以直接使用 sigil
+的全部工具（bash、文件、git、Lua 脚本工具、memory、delegate 等）。
+在 Claude Desktop 配置（`claude_desktop_config.json`）中添加：
+
+```json
+{
+  "mcpServers": {
+    "sigil": {
+      "command": "/绝对路径/sigil",
+      "args": ["mcp"],
+      "env": {
+        "SIGIL_MODEL": "deepseek-v4-flash",
+        "SIGIL_BASE_URL": "http://127.0.0.1:15722/v1"
+      }
+    }
+  }
+}
+```
+
+`command` 指向 `cargo build --release` 产物，`env` 填你的端点，重启
+Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
+
 ## 路线图
 
 | 阶段 | 范围 |
@@ -138,6 +164,8 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 | **8** ✅ | 流式输出、ratchet 回归电池 |
 | **9** ✅ | 真正多轮上下文、rustyline 行编辑 + 历史 |
 | **10** ✅ | `improve_harness` — 指令层自进化 |
+| **11** ✅ | REPL 内会话切换（`/sessions`、`/session <id>`） |
+| **12** ✅ | ACP client + `acp_call` — 跨进程委托 |
 
 ## 开发
 

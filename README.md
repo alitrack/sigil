@@ -25,11 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 10** — harness self-evolution (instruction layer). Pipe
+> Status: **Phase 12** — ACP client (cross-process delegation). Pipe
 > mode, scripted Lua tools with real FFI, self-evolution loop, three-layer
-> safety, MCP client **and server**, ACP server, persistent memory,
-> interactive REPL, resumable sessions with true multi-turn context,
-> sub-agent delegation, streaming output, ratchet regression battery, and
+> safety, MCP client **and server**, ACP server **and client**, persistent
+> memory, interactive REPL with true multi-turn context, resumable
+> sessions, sub-agents, streaming output, ratchet tests.
 > model-driven harness improvement all work end to end.
 
 ## Quick start
@@ -96,8 +96,11 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   their tools become `mcp_<server>_<tool>`.
 - **MCP server** — `sigil mcp` exposes sigil's own tools to any MCP client
   (Claude Desktop, Cursor, other agents) over stdio.
-- **ACP server** — `sigil acp` speaks the Agent Client Protocol (JSON-RPC
-  over stdio) so any ACP host (editors, other agents) can drive sigil.
+- **ACP server** — `sigil acp` speaks Agent Client Protocol (JSON-RPC
+  over stdio); any ACP host (editors, other agents) can drive sigil.
+- **ACP client** — the `acp_call` tool spawns an external ACP server
+  (another sigil, codex, an editor agent) and delegates a task to it —
+  cross-process delegation, protocol-both-ways.
 - **Interactive REPL** — multi-turn conversation with human approval for
   destructive commands.
 - **True multi-turn context** — the REPL keeps the real message list across
@@ -135,6 +138,32 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
   helper table (`read_file` / `write_file` / `env`) is the script↔host
   boundary.
 
+## Using sigil with Claude Desktop (MCP)
+
+`sigil mcp` is a standard MCP server over stdio, so Claude Desktop can
+use every sigil tool (bash, files, git, Lua scripted tools, memory,
+delegate, …). Add this to Claude Desktop's config
+(`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "sigil": {
+      "command": "/absolute/path/to/sigil",
+      "args": ["mcp"],
+      "env": {
+        "SIGIL_MODEL": "deepseek-v4-flash",
+        "SIGIL_BASE_URL": "http://127.0.0.1:15722/v1"
+      }
+    }
+  }
+}
+```
+
+Point `command` at `cargo build --release` output, set `env` to your
+endpoint, restart Claude Desktop, and the sigil tools appear in the
+MCP tool list.
+
 ## Roadmap
 
 | Phase | Scope |
@@ -150,6 +179,8 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
 | **8** ✅ | Streaming output, ratchet regression battery |
 | **9** ✅ | True multi-turn context, rustyline line editing + history |
 | **10** ✅ | `improve_harness` — instruction-layer self-evolution |
+| **11** ✅ | In-REPL session switching (`/sessions`, `/session <id>`) |
+| **12** ✅ | ACP client + `acp_call` — cross-process delegation |
 
 ## Development
 

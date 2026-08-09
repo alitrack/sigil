@@ -13,6 +13,9 @@ sigil
 
 # ACP server 模式（供编辑器/其他 agent 驱动 sigil）
 sigil acp
+
+# MCP server 模式（把 sigil 的工具暴露给 MCP 客户端）
+sigil mcp
 ```
 
 sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 chat API，
@@ -20,9 +23,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 6** — 会话持久化 + 子代理。管道模式、带真实 FFI 的脚本化
-> Lua 工具、自进化闭环、三层 safety、MCP 客户端、ACP server、持久 memory、
-> 交互式 REPL、可续会话、子代理委托全部端到端可用。
+> 状态：**Phase 7** — MCP server 模式。管道模式、带真实 FFI 的脚本化 Lua
+> 工具、自进化闭环、三层 safety、MCP 客户端**和 server**、ACP server、
+> 持久 memory、交互式 REPL、可续会话、子代理委托全部端到端可用。
 
 ## 快速开始
 
@@ -77,6 +80,8 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
 - **Memory** — `remember` / `recall`：模型自己维护的跨会话持久事实。
 - **MCP 客户端** — 配置 `[[mcp.servers]]` 拉起 stdio MCP server，其工具
   变成 `mcp_<server>_<tool>`。
+- **MCP server** — `sigil mcp` 把 sigil 自己的工具暴露给任意 MCP 客户端
+  （Claude Desktop、Cursor、其他 agent）。
 - **ACP server** — `sigil acp` 说 Agent Client Protocol（stdio 上的
   JSON-RPC），任意 ACP 宿主（编辑器、其他 agent）都能驱动 sigil。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
@@ -116,7 +121,8 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 | **4** ✅ | MCP 客户端、ACP server、持久 memory |
 | **5** ✅ | 交互式 REPL + 人工审批 |
 | **6** ✅ | 会话持久化（`--resume`）、子代理（`delegate`） |
-| **7** 🔮 | MCP server 模式、TUI 打磨、ratchet 测试 |
+| **7** ✅ | MCP server 模式（`sigil mcp`） |
+| **8** 🔮 | 流式输出、ratchet 回归测试、TUI 打磨 |
 
 ## 开发
 

@@ -13,6 +13,9 @@ sigil
 
 # ACP server mode (drive sigil from editors / other agents)
 sigil acp
+
+# MCP server mode (expose sigil's tools to MCP clients)
+sigil mcp
 ```
 
 sigil is a terminal coding agent built from scratch in Rust. It speaks the
@@ -22,9 +25,9 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 6** — session persistence + sub-agents. Pipe mode, scripted
-> Lua tools with real FFI, self-evolution loop, three-layer safety, MCP
-> client, ACP server, persistent memory, interactive REPL, resumable
+> Status: **Phase 7** — MCP server mode. Pipe mode, scripted Lua tools with
+> real FFI, self-evolution loop, three-layer safety, MCP client **and
+> server**, ACP server, persistent memory, interactive REPL, resumable
 > sessions, and sub-agent delegation all work end to end.
 
 ## Quick start
@@ -84,6 +87,8 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   model maintains itself.
 - **MCP client** — `[[mcp.servers]]` in config spawns stdio MCP servers;
   their tools become `mcp_<server>_<tool>`.
+- **MCP server** — `sigil mcp` exposes sigil's own tools to any MCP client
+  (Claude Desktop, Cursor, other agents) over stdio.
 - **ACP server** — `sigil acp` speaks the Agent Client Protocol (JSON-RPC
   over stdio) so any ACP host (editors, other agents) can drive sigil.
 - **Interactive REPL** — multi-turn conversation with human approval for
@@ -125,7 +130,8 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
 | **4** ✅ | MCP client, ACP server, persistent memory |
 | **5** ✅ | Interactive REPL + human approval |
 | **6** ✅ | Session persistence (`--resume`), sub-agents (`delegate`) |
-| **7** 🔮 | MCP server mode, TUI polish, ratchet tests |
+| **7** ✅ | MCP server mode (`sigil mcp`) |
+| **8** 🔮 | Streaming output, ratchet regression tests, TUI polish |
 
 ## Development
 

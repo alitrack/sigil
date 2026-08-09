@@ -18,11 +18,16 @@ pub fn should_enter_repl(sub_prompt: &Option<String>) -> bool {
 /// Interactive approver: print the rejected call, ask y/N.
 fn interactive_approver() -> Box<Approver> {
     Box::new(|name: &str, args: &serde_json::Value| {
-        eprintln!(
-            "\n⚠ sigil wants to run a command the gate flags as destructive:\n  {name} {args}\n"
+        let warn = crate::ui::YELLOW.paint(
+            &format!(
+                "\n⚠ sigil wants to run a command the gate flags as destructive:\n  {name} {args}\n"
+            ),
+            &std::io::stderr(),
         );
+        eprintln!("{warn}");
         loop {
-            eprint!("  Allow it? [y/N] ");
+            let prompt = crate::ui::GREEN.paint("  Allow it? [y/N] ", &std::io::stderr());
+            eprint!("{prompt}");
             let _ = std::io::stderr().flush();
             let mut line = String::new();
             if std::io::stdin().lock().read_line(&mut line).is_err() {
@@ -47,6 +52,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let approver = interactive_approver();
     let mut stdout = std::io::stdout();
+    let stderr = std::io::stderr();
 
     // Session: resume an existing one or start fresh. `session_id`,
     // `history` and `hist_path` are mutable: `/session <id>` can switch
@@ -57,10 +63,19 @@ pub async fn run(
     };
     let mut history = crate::session::load(sessions_dir, &session_id)?;
     if !history.is_empty() {
-        println!("(resumed session {session_id} — {} turns)", history.len());
+        println!(
+            "{}",
+            crate::ui::CYAN.paint(
+                &format!("(resumed session {session_id} — {} turns)", history.len()),
+                &stderr
+            )
+        );
     }
 
-    println!("sigil — Rust + LuaJIT coding agent (interactive)");
+    println!(
+        "{}",
+        crate::ui::BOLD.paint("sigil — Rust + LuaJIT coding agent (interactive)", &stderr)
+    );
     println!("Type /help for commands, /quit to exit.\n");
 
     // True multi-turn context: the message list accumulates across
@@ -104,6 +119,7 @@ pub async fn run(
             "/quit" | "/exit" | "/q" => break,
             "/help" | "/h" => {
                 println!("  /tools    list available tools");
+                println!("  /tools <q> search tools (name/description substring)");
                 println!("  /session  show this session id");
                 println!("  /sessions list all sessions (or /session <id> to switch)");
                 println!("  /quit     exit");
@@ -172,7 +188,31 @@ pub async fn run(
             }
             "/tools" => {
                 for spec in tools.specs() {
-                    println!("  {} — {}", spec.name, spec.description);
+                    let name = crate::ui::CYAN.paint(&spec.name, &stderr);
+                    println!("  {name} — {}", spec.description);
+                }
+                continue;
+            }
+            cmd if cmd.starts_with("/tools ") => {
+                // /tools <query>: fuzzy-ish substring filter on name+desc.
+                let q = cmd.trim_start_matches("/tools ").trim().to_lowercase();
+                let mut hits: Vec<_> = tools
+                    .specs()
+                    .into_iter()
+                    .filter(|s| {
+                        s.name.to_lowercase().contains(&q)
+                            || s.description.to_lowercase().contains(&q)
+                    })
+                    .collect();
+                hits.sort_by(|a, b| a.name.cmp(&b.name));
+                if hits.is_empty() {
+                    println!("  no tools match '{q}'");
+                } else {
+                    println!("  {} tool(s) matching '{q}':", hits.len());
+                    for spec in hits {
+                        let name = crate::ui::CYAN.paint(&spec.name, &stderr);
+                        println!("  {name} — {}", spec.description);
+                    }
                 }
                 continue;
             }
@@ -199,7 +239,8 @@ pub async fn run(
                 }
                 None => {
                     // Tool call interrupted the text stream.
-                    eprintln!("\n[using tools…]");
+                    let tag = crate::ui::YELLOW.paint("[using tools…]", &std::io::stderr());
+                    eprintln!("\n{tag}");
                 }
             }
         };
@@ -215,7 +256,8 @@ pub async fn run(
         {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("✗ error: {e}");
+                let msg = crate::ui::RED.paint(&format!("✗ error: {e}"), &stderr);
+                eprintln!("{msg}");
                 continue;
             }
         };

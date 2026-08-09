@@ -11,6 +11,7 @@ mod repl;
 mod safety;
 mod session;
 mod tools;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;

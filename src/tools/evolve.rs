@@ -285,12 +285,24 @@ impl Tool for ImproveHarnessTool {
                     // dynamic inlining picks the new skill up now.
                     s.skills = crate::harness::load_skills(&skills_dir);
                 }
-                Ok(ToolOutput {
-                    text: format!(
-                        "skill '{safe}' written to {}. It is live — relevant prompts inline it from the very next turn.",
-                        path.display()
-                    ),
-                })
+                // Detect dependency cycles across all skills and warn
+                // (the write succeeds — a cycle is a quality problem,
+                // not a reason to reject the skill).
+                let all_skills = crate::harness::load_skills(&skills_dir);
+                let cycles = crate::harness::find_dependency_cycles(&all_skills);
+                let mut text = format!(
+                    "skill '{safe}' written to {}. It is live — relevant prompts inline it from the very next turn.",
+                    path.display()
+                );
+                if !cycles.is_empty() {
+                    let desc: Vec<String> = cycles.iter().map(|c| c.join(" -> ")).collect();
+                    text.push_str(&format!(
+                        "\n\nWARNING: dependency cycle(s) detected: {}",
+                        desc.join("; ")
+                    ));
+                    text.push_str(" — break the cycle by removing a depends_on line.");
+                }
+                Ok(ToolOutput { text })
             }
             "list_skills" => {
                 let skills_dir = self.harness_dir.join("skills");

@@ -269,6 +269,61 @@ pub fn parse_skill_description(content: &str) -> Option<String> {
     })
 }
 
+/// Detect cycles in the skill dependency graph.
+///
+/// Returns one entry per cycle found, each a chain like
+/// `["a", "b", "a"]` showing the cycle. Unknown dependency names are
+/// ignored (they just don't resolve to a skill). Uses DFS with
+/// white/grey/black coloring; cycle-safe by construction.
+pub fn find_dependency_cycles(skills: &[Skill]) -> Vec<Vec<String>> {
+    use std::collections::HashMap;
+    let by_name: HashMap<&str, &Skill> = skills.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    // 0 = white (unvisited), 1 = grey (on the DFS stack), 2 = black (done).
+    let mut color: HashMap<&str, u8> = HashMap::new();
+    let mut cycles: Vec<Vec<String>> = Vec::new();
+
+    fn dfs<'a>(
+        name: &'a str,
+        by_name: &HashMap<&'a str, &'a Skill>,
+        color: &mut HashMap<&'a str, u8>,
+        stack: &mut Vec<&'a str>,
+        cycles: &mut Vec<Vec<String>>,
+    ) {
+        color.insert(name, 1);
+        stack.push(name);
+        let skill = by_name.get(name);
+        if let Some(s) = skill {
+            for dep in &s.depends_on {
+                match color.get(dep.as_str()).copied() {
+                    // Grey = back edge → cycle: slice from the dep
+                    // back to itself in the current stack.
+                    Some(1) => {
+                        let pos = stack.iter().position(|n| *n == dep.as_str());
+                        let mut chain: Vec<String> = stack[pos.unwrap_or(0)..]
+                            .iter()
+                            .map(|n| (*n).to_string())
+                            .collect();
+                        chain.push(dep.to_string());
+                        cycles.push(chain);
+                    }
+                    None => dfs(dep, by_name, color, stack, cycles),
+                    _ => {}
+                }
+            }
+        }
+        stack.pop();
+        color.insert(name, 2);
+    }
+
+    for s in skills {
+        if color.get(s.name.as_str()).copied().unwrap_or(0) == 0 {
+            dfs(&s.name, &by_name, &mut color, &mut Vec::new(), &mut cycles);
+        }
+    }
+    cycles
+}
+
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are sigil, a coding agent that works inside a terminal.
 
 You solve the user's task by calling tools. Prefer the dedicated tools

@@ -125,6 +125,45 @@ fn depends_on_pulls_in_dependency_skills_cycle_safe() {
 }
 
 #[test]
+fn find_dependency_cycles_reports_cycles() {
+    use crate::harness::Skill;
+    let skill = |name: &str, deps: Vec<&str>| Skill {
+        name: name.into(),
+        description: name.into(),
+        body: format!("> {name}\nbody"),
+        path: std::path::PathBuf::from(format!("{name}.md")),
+        depends_on: deps.into_iter().map(String::from).collect(),
+    };
+
+    // Acyclic: a → b → c. No cycles.
+    let acyclic = vec![
+        skill("a", vec!["b"]),
+        skill("b", vec!["c"]),
+        skill("c", vec![]),
+    ];
+    assert!(crate::harness::find_dependency_cycles(&acyclic).is_empty());
+
+    // Self-loop: a depends on itself.
+    let self_loop = vec![skill("a", vec!["a"])];
+    let cycles = crate::harness::find_dependency_cycles(&self_loop);
+    assert_eq!(cycles.len(), 1);
+    assert_eq!(cycles[0], vec!["a".to_string(), "a".to_string()]);
+
+    // Two-node cycle: a ↔ b. DFS from a finds the a→b→a back edge.
+    let two = vec![skill("a", vec!["b"]), skill("b", vec!["a"])];
+    let cycles = crate::harness::find_dependency_cycles(&two);
+    assert_eq!(cycles.len(), 1);
+    assert_eq!(
+        cycles[0],
+        vec!["a".to_string(), "b".to_string(), "a".to_string()]
+    );
+
+    // Unknown dependency names are ignored (no crash, no cycle).
+    let unknown = vec![skill("a", vec!["ghost"])];
+    assert!(crate::harness::find_dependency_cycles(&unknown).is_empty());
+}
+
+#[test]
 fn agent_config_inlines_relevant_skills_per_prompt() {
     use crate::agent::AgentConfig;
     use crate::harness::Skill;

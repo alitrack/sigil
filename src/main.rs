@@ -139,6 +139,45 @@ async fn main() -> Result<()> {
     };
 
     match &cli.command {
+        Some(Command::Session { action }) => {
+            let sessions_dir = cli
+                .sessions_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(session::default_sessions_dir);
+            match action {
+                cli::SessionAction::Export { id, output } => {
+                    let out = output
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| sessions_dir.join(format!("{id}.json")));
+                    let archive = session::export_session(&sessions_dir, id, &out)?;
+                    println!(
+                        "exported session {id} ({} turns) → {}",
+                        archive.turns.len(),
+                        out.display()
+                    );
+                }
+                cli::SessionAction::Import { file } => {
+                    let path = std::path::Path::new(file);
+                    let new_id = session::import_session(&sessions_dir, path)?;
+                    println!(
+                        "imported {file} as new session {new_id} (resume with --resume {new_id})"
+                    );
+                }
+                cli::SessionAction::List => {
+                    let ids = session::list(&sessions_dir)?;
+                    if ids.is_empty() {
+                        println!("no sessions");
+                    } else {
+                        for id in ids {
+                            println!("{id}");
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Acp) => {
             eprintln!("sigil acp: serving Agent Client Protocol on stdio");
             acp::serve(tools, agent_config, provider_arc).await

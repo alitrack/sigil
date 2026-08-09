@@ -81,6 +81,34 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Export / import session transcripts (portable JSON).
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+/// Actions for `sigil session`.
+#[derive(Subcommand, Debug)]
+pub enum SessionAction {
+    /// Export a session to a portable JSON archive.
+    Export {
+        /// Session id to export (see `sigil session list`).
+        id: String,
+        /// Output file path (default: <id>.json in the sessions dir).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a session archive as a new session (returns its id).
+    Import {
+        /// Archive file (JSON produced by `session export`).
+        file: String,
+    },
+
+    /// List saved session ids (newest first).
+    List,
 }
 
 /// The prompt to use: from -p/--prompt, else stdin (pipe mode).

@@ -82,7 +82,8 @@ pub fn list(sessions_dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Compact timestamp: YYYYMMDD-HHMMSS (no chrono dependency).
+/// Compact timestamp: YYYYMMDD-HHMMSS-nnnnnnnnn (nanosecond precision
+/// so sessions started in the same second never collide).
 fn chrono_like_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -94,7 +95,67 @@ fn chrono_like_timestamp() -> String {
     // Days since 1970-01-01 → approximate date (ignores leap years' drift
     // beyond 2026; good enough for file naming).
     let y = 1970 + days / 365;
-    format!("{y}-{days:05}-{h:02}{m:02}{s:02}")
+    format!("{y}-{days:05}-{h:02}{m:02}{s:02}-{:09}", now.subsec_nanos())
+}
+
+/// Portable session archive: metadata + the full transcript. Written by
+/// `export_session`, read by `import_session`. The turns array is what
+/// `--resume` replays.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionArchive {
+    /// Sigil version that produced the export.
+    pub version: String,
+    /// Export timestamp.
+    pub exported_at: String,
+    /// Original session id (informational).
+    pub source_id: String,
+    /// Transcript.
+    pub turns: Vec<Turn>,
+}
+
+/// Export a session to a portable JSON archive file.
+pub fn export_session(
+    sessions_dir: &Path,
+    id: &str,
+    out_path: &Path,
+) -> std::io::Result<SessionArchive> {
+    let turns = load(sessions_dir, id)?;
+    if turns.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session {id} not found or empty"),
+        ));
+    }
+    let archive = SessionArchive {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        exported_at: chrono_like_timestamp(),
+        source_id: id.to_string(),
+        turns,
+    };
+    let json = serde_json::to_string_pretty(&archive)?;
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(out_path, json)?;
+    Ok(archive)
+}
+
+/// Import a session archive into the sessions directory as a **new**
+/// session (so the original is never overwritten). Returns the new id.
+pub fn import_session(sessions_dir: &Path, in_path: &Path) -> std::io::Result<String> {
+    let json = fs::read_to_string(in_path)?;
+    let archive: SessionArchive = serde_json::from_str(&json).map_err(std::io::Error::other)?;
+    if archive.turns.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "archive has no turns",
+        ));
+    }
+    let id = start(sessions_dir)?;
+    for turn in &archive.turns {
+        append(sessions_dir, &id, turn)?;
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -137,6 +198,53 @@ mod tests {
 
         // List includes it.
         assert!(list(&dir).unwrap().contains(&id));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-xport-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append(
+            &dir,
+            &id,
+            &Turn {
+                role: "user".into(),
+                text: "hello".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &dir,
+            &id,
+            &Turn {
+                role: "assistant".into(),
+                text: "hi".into(),
+            },
+        )
+        .unwrap();
+
+        // Export to a portable JSON file.
+        let out = dir.join("archive.json");
+        let archive = export_session(&dir, &id, &out).unwrap();
+        assert_eq!(archive.turns.len(), 2);
+        assert_eq!(archive.source_id, id);
+        assert!(out.exists());
+
+        // Import into the same dir → NEW session id, same turns.
+        let new_id = import_session(&dir, &out).unwrap();
+        assert_ne!(new_id, id);
+        let turns = load(&dir, &new_id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].text, "hello");
+        assert_eq!(turns[1].text, "hi");
+
+        // Exporting a missing session fails cleanly.
+        assert!(export_session(&dir, "nope", &dir.join("x.json")).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

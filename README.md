@@ -25,10 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 19** — MCP resources + scripted-tool host helpers.
-> Pipe mode, scripted Lua tools with real FFI and host helpers, dynamic
-> skill selection, self-evolution loop, three-layer safety, MCP client
-> **and server** (tools, progress notifications, resources), ACP server
+> Status: **Phase 20** — scripted-tool lifecycle + MCP resource reading.
+> Pipe mode, scripted Lua tools with real FFI and host helpers (tool
+> create/update/delete/list at runtime), dynamic skill selection,
+> self-evolution loop, three-layer safety, MCP client **and server**
+> (tools, progress notifications, resources both ways), ACP server
 > **and client** (cross-process delegation), persistent memory, resumable
 > sessions with in-REPL switching, sub-agents, streaming output, ratchet
 > regression battery, model-driven harness improvement, skill content
@@ -191,6 +192,7 @@ MCP tool list.
 | **17** ✅ | Shell completions; v0.1.0 release (5-platform binaries) |
 | **18** ✅ | Dynamic skill selection; MCP progress notifications |
 | **19** ✅ | Scripted-tool host helpers; MCP resources (harness) |
+| **20** ✅ | Tool lifecycle (create/update/delete/list); MCP resource reading |
 
 ## Changelog
 

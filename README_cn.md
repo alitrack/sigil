@@ -23,12 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 16** — `sigil doctor` 环境自检。管道模式、带真实 FFI 的
-> 脚本化 Lua 工具、自进化闭环、三层 safety、MCP 客户端**和 server**、
-> ACP server **和 client**（跨进程委托）、持久 memory、真正多轮上下文
-> 的交互式 REPL、可续会话、子代理委托、流式输出、ratchet 回归电池、
-> 模型驱动 harness 改进、技能内容内联、TUI 彩色输出、`/tools` 搜索、
-> 诊断子命令 `doctor`——全部端到端可用。
+> 状态：**Phase 19** — MCP resources + 脚本工具 host helpers。管道模式、
+> 带真实 FFI 和 host helpers 的脚本化 Lua 工具、技能动态选择、自进化闭环、
+> 三层 safety、MCP 客户端**和 server**（工具、进度通知、resources）、
+> ACP server **和 client**（跨进程委托）、持久 memory、可续会话、
+> 子代理委托、流式输出、ratchet 回归电池、模型驱动 harness 改进、
+> 技能内容内联、TUI 彩色输出、`/tools` 搜索、`sigil doctor`
+> 环境自检、shell 补全——全部端到端可用。
 
 ## 快速开始
 
@@ -171,6 +172,9 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **14** ✅ | TUI 彩色输出 + `/tools <查询>` 搜索 |
 | **15** ✅ | `sigil doctor` 环境自检 |
 | **16** ✅ | doctor LuaJIT/FFI 检查；子命令后全局参数 |
+| **17** ✅ | shell 补全；v0.1.0 发布（5 平台二进制） |
+| **18** ✅ | 技能动态选择；MCP 进度通知 |
+| **19** ✅ | 脚本工具 host helpers；MCP resources（harness） |
 
 ## 更新日志
 

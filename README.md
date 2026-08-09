@@ -25,13 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 16** — `sigil doctor` environment self-check. Pipe
-> mode, scripted Lua tools with real FFI, self-evolution loop, three-layer
-> safety, MCP client **and server**, ACP server **and client** (cross-process
-> delegation), persistent memory, resumable sessions with in-REPL
-> switching, sub-agents, streaming output, ratchet regression battery,
-> model-driven harness improvement, skill content inlining, TUI colors,
-> `/tools` search, and a diagnostic `doctor` subcommand — all end to end.
+> Status: **Phase 19** — MCP resources + scripted-tool host helpers.
+> Pipe mode, scripted Lua tools with real FFI and host helpers, dynamic
+> skill selection, self-evolution loop, three-layer safety, MCP client
+> **and server** (tools, progress notifications, resources), ACP server
+> **and client** (cross-process delegation), persistent memory, resumable
+> sessions with in-REPL switching, sub-agents, streaming output, ratchet
+> regression battery, model-driven harness improvement, skill content
+> inlining, TUI colors, `/tools` search, and a diagnostic `doctor`
+> subcommand — all end to end.
 
 ## Quick start
 
@@ -186,6 +188,9 @@ MCP tool list.
 | **14** ✅ | TUI colors + `/tools <query>` search |
 | **15** ✅ | `sigil doctor` environment self-check |
 | **16** ✅ | Doctor LuaJIT/FFI check; global CLI args after subcommands |
+| **17** ✅ | Shell completions; v0.1.0 release (5-platform binaries) |
+| **18** ✅ | Dynamic skill selection; MCP progress notifications |
+| **19** ✅ | Scripted-tool host helpers; MCP resources (harness) |
 
 ## Changelog
 

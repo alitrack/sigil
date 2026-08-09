@@ -8,47 +8,47 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Model to use (overrides config).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub model: Option<String>,
 
     /// Base URL of an OpenAI-compatible endpoint (overrides config).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub base_url: Option<String>,
 
     /// API key (overrides env/config).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub api_key: Option<String>,
 
     /// Maximum tool-calling steps per turn (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, global = true)]
     pub max_steps: u32,
 
     /// Config file (default: ~/.sigil/config.toml).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub config: Option<String>,
 
     /// Directory with Lua scripted tools (default: ~/.sigil/tools/).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub tools_dir: Option<String>,
 
     /// Harness bundle directory (system prompt + skills; default: ~/.sigil/harness/).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub harness_dir: Option<String>,
 
     /// Memory file for remember/recall tools (default: ~/.sigil/memory.md).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub memory: Option<String>,
 
     /// Resume an interactive session by id (see ~/.sigil/sessions/).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub resume: Option<String>,
 
     /// Sessions directory for REPL history (default: ~/.sigil/sessions/).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub sessions_dir: Option<String>,
 
     /// List saved sessions and exit.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub list_sessions: bool,
 }
 

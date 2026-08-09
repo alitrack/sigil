@@ -230,6 +230,12 @@ pub async fn run(config: &crate::config::Config, cli: &crate::cli::Cli) -> Resul
         ),
     }
 
+    // ---- 8. LuaJIT / FFI ----
+    match lua_check() {
+        Ok(detail) => ok(&mut checks, &mut fail, "LuaJIT + FFI", detail),
+        Err(e) => fail_check(&mut checks, &mut fail, "LuaJIT + FFI", format!("{e}")),
+    }
+
     // ---- Report ----
     println!("\n  sigil doctor — environment check\n");
     let mut worst = Level::Ok;
@@ -300,6 +306,27 @@ async fn probe_endpoint(url: &str, api_key: &str) -> Result<Option<usize>> {
     }
     let body: serde_json::Value = resp.json().await?;
     Ok(body.get("data").and_then(|d| d.as_array()).map(|a| a.len()))
+}
+
+/// Check the embedded LuaJIT runtime and real FFI: boot a Lua state
+/// and run the crc32 FFI anchor (crc32("hello") == 0x3610a686).
+fn lua_check() -> Result<String> {
+    let rt = crate::lua::LuaRuntime::new()?;
+    let out = rt.run(
+        "local ffi = require('ffi')
+         ffi.cdef[[unsigned long crc32(unsigned long, const unsigned char*, unsigned long);]]
+         local z = ffi.load('z')
+         local crc = z.crc32(0, 'hello', 5)
+         return string.format('crc32(hello)=%08x', crc)",
+    )?;
+    let trimmed = out.trim();
+    if trimmed.contains("3610a686") {
+        Ok(format!(
+            "vendored LuaJIT + FFI ok ({trimmed} — real zlib crc32 call)"
+        ))
+    } else {
+        anyhow::bail!("FFI crc32 anchor mismatch: {trimmed}")
+    }
 }
 
 #[cfg(test)]

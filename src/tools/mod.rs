@@ -50,8 +50,35 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
     /// Tools hot-registered mid-run by evolution tools, drained by the
-    /// agent loop after each turn.
-    hot_queue: Arc<Mutex<Vec<(String, std::path::PathBuf)>>>,
+    /// agent loop after each turn. `HotOp` carries the operation
+    /// (register / unregister) so create, update and delete all work.
+    hot_queue: Arc<Mutex<Vec<HotOp>>>,
+}
+
+/// A queued evolution operation on a scripted tool.
+#[derive(Debug, Clone)]
+pub struct HotOp {
+    pub name: String,
+    pub path: Option<std::path::PathBuf>,
+    /// true = register/refresh, false = unregister.
+    pub register: bool,
+}
+
+impl HotOp {
+    pub fn register(name: &str, path: std::path::PathBuf) -> Self {
+        Self {
+            name: name.to_string(),
+            path: Some(path),
+            register: true,
+        }
+    }
+    pub fn unregister(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            path: None,
+            register: false,
+        }
+    }
 }
 
 impl ToolRegistry {
@@ -69,6 +96,13 @@ impl ToolRegistry {
         let name = tool.name().to_string();
         self.tools.insert(name.clone(), tool);
         self.order.push(name);
+    }
+
+    /// Remove a tool by name (idempotent). Used by evolution tools to
+    /// delete scripted tools at runtime.
+    pub fn unregister(&mut self, name: &str) {
+        self.tools.remove(name);
+        self.order.retain(|n| n != name);
     }
 
     #[allow(dead_code)]
@@ -90,11 +124,17 @@ impl ToolRegistry {
             .map(Path::to_path_buf)
             .unwrap_or_else(scripted::default_tools_dir);
         let hot_queue = registry.hot_queue.clone();
+        let hot_queue2 = hot_queue.clone();
         registry.register(Arc::new(evolve::CreateLuaToolTool {
             tools_dir: tools_dir.clone(),
             register: Box::new(move |name: &str, path: std::path::PathBuf| {
                 if let Ok(mut q) = hot_queue.try_lock() {
-                    q.push((name.to_string(), path));
+                    q.push(HotOp::register(name, path));
+                }
+            }),
+            unregister: Box::new(move |name: &str| {
+                if let Ok(mut q) = hot_queue2.try_lock() {
+                    q.push(HotOp::unregister(name));
                 }
             }),
         }));
@@ -141,7 +181,14 @@ impl ToolRegistry {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => return,
         };
-        for (name, path) in queued {
+        for op in queued {
+            let name = op.name.clone();
+            if !op.register {
+                self.unregister(&name);
+                eprintln!("hot-unregistered Lua tool: {name}");
+                continue;
+            }
+            let Some(path) = op.path else { continue };
             match scripted::LuaTool::new(&name, &path, lua.clone()) {
                 Ok(tool) => {
                     self.register(Arc::new(tool));

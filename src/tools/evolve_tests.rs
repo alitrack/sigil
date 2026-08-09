@@ -19,17 +19,23 @@ fn fresh_dir(tag: &str) -> std::path::PathBuf {
 }
 
 /// Hot-queue alias (matches ToolRegistry's).
-type HotQueue = std::sync::Arc<std::sync::Mutex<Vec<(String, std::path::PathBuf)>>>;
+type HotQueue = std::sync::Arc<std::sync::Mutex<Vec<crate::tools::HotOp>>>;
 
 fn make_tool(dir: std::path::PathBuf) -> (CreateLuaToolTool, HotQueue) {
     let queue = HotQueue::default();
     let q = queue.clone();
+    let q2 = queue.clone();
     (
         CreateLuaToolTool {
             tools_dir: dir,
             register: Box::new(move |name: &str, path: std::path::PathBuf| {
                 if let Ok(mut q) = q.try_lock() {
-                    q.push((name.to_string(), path));
+                    q.push(crate::tools::HotOp::register(name, path));
+                }
+            }),
+            unregister: Box::new(move |name: &str| {
+                if let Ok(mut q) = q2.try_lock() {
+                    q.push(crate::tools::HotOp::unregister(name));
                 }
             }),
         },
@@ -55,7 +61,8 @@ async fn creates_lua_tool_and_hot_registers() {
     // Hot-register queued.
     let queued = queue.try_lock().unwrap().clone();
     assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].0, "hello_tool");
+    assert_eq!(queued[0].name, "hello_tool");
+    assert!(queued[0].register);
     assert!(out.text.contains("hello_tool"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -76,6 +83,97 @@ async fn sanitizes_unsafe_tool_names() {
         .unwrap();
     assert!(out.text.contains("evilname"));
     assert!(dir.join("evilname.lua").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn lists_scripted_tools() {
+    let dir = fresh_dir("list");
+    let (tool, _queue) = make_tool(dir.clone());
+
+    // Empty dir → friendly message.
+    let out = tool.run(&json!({ "action": "list" })).await.unwrap();
+    assert!(out.text.contains("no scripted tools"));
+
+    // Create one, then list shows it.
+    tool.run(&json!({
+        "name": "alpha",
+        "code": "return function() return 'a' end"
+    }))
+    .await
+    .unwrap();
+    let out = tool.run(&json!({ "action": "list" })).await.unwrap();
+    assert!(out.text.contains("alpha"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn updates_existing_tool() {
+    let dir = fresh_dir("update");
+    let (tool, queue) = make_tool(dir.clone());
+
+    // Create.
+    tool.run(&json!({
+        "name": "greeter",
+        "code": "return function() return 'v1' end"
+    }))
+    .await
+    .unwrap();
+    assert!(dir.join("greeter.lua").exists());
+
+    // Update: overwrite + hot-register again (queue gets a second op).
+    let out = tool
+        .run(&json!({
+            "action": "update",
+            "name": "greeter",
+            "code": "return function() return 'v2' end"
+        }))
+        .await
+        .unwrap();
+    assert!(out.text.contains("updated"));
+    let disk = std::fs::read_to_string(dir.join("greeter.lua")).unwrap();
+    assert!(disk.contains("v2"));
+
+    let queued = queue.try_lock().unwrap().clone();
+    assert_eq!(queued.len(), 2); // create + update
+    assert!(queued[1].register);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn deletes_existing_tool() {
+    let dir = fresh_dir("delete");
+    let (tool, queue) = make_tool(dir.clone());
+
+    // Create.
+    tool.run(&json!({
+        "name": "doomed",
+        "code": "return function() return 1 end"
+    }))
+    .await
+    .unwrap();
+    assert!(dir.join("doomed.lua").exists());
+
+    // Delete: file removed + unregister queued.
+    let out = tool
+        .run(&json!({ "action": "delete", "name": "doomed" }))
+        .await
+        .unwrap();
+    assert!(out.text.contains("deleted"));
+    assert!(!dir.join("doomed.lua").exists());
+    let queued = queue.try_lock().unwrap().clone();
+    assert!(!queued[1].register);
+    assert_eq!(queued[1].name, "doomed");
+
+    // Deleting a non-existent tool is a friendly no-op.
+    let out2 = tool
+        .run(&json!({ "action": "delete", "name": "ghost" }))
+        .await
+        .unwrap();
+    assert!(out2.text.contains("does not exist"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

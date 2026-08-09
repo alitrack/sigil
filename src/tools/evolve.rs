@@ -18,15 +18,21 @@ use serde_json::{Value, json};
 use crate::tools::{Tool, ToolOutput};
 
 /// Runtime hook to hot-register a new scripted tool (used by the agent
-/// loop's evolution path).
+/// loop's evolution path). Sends a `HotOp` into the registry's queue.
 pub type RegisterHook = Box<dyn Fn(&str, std::path::PathBuf) + Send + Sync>;
 
-/// Tool that registers new Lua tools at runtime.
+/// Runtime hook to hot-unregister a scripted tool at runtime.
+pub type UnregisterHook = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Tool that manages Lua scripted tools at runtime: create, update
+/// (overwrite + hot-refresh), delete, and list.
 pub struct CreateLuaToolTool {
     /// Where scripted tools live (hot-loaded by the registry).
     pub tools_dir: std::path::PathBuf,
     /// Runtime handle to hot-register tools without restart.
     pub register: RegisterHook,
+    /// Runtime handle to hot-unregister tools without restart.
+    pub unregister: UnregisterHook,
 }
 
 #[async_trait]
@@ -36,31 +42,57 @@ impl Tool for CreateLuaToolTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new Lua scripted tool: write Lua code (with optional -- desc: and -- schema: header comments), sigil saves it to the tools dir and makes it callable by name from the next turn on. Returns the new tool's name. Use when a task needs a repeatable operation that the built-in tools don't cover. Your Lua code has a global `host` table with safe helpers: host.read_file(path), host.write_file(path, content), host.env(key), host.list_dir(dir), host.cwd(), host.json_encode(value), host.json_decode(text). FFI is available (require('ffi')) for calling system C libraries."
+        "Manage Lua scripted tools: create (default), update (overwrite an existing tool's code), delete (remove a tool), or list (show existing tool names). Write Lua code (with optional -- desc: and -- schema: header comments); sigil saves it to the tools dir and makes it callable by name from the next turn on. Use when a task needs a repeatable operation that the built-in tools don't cover, or to iterate on an existing scripted tool. Your Lua code has a global `host` table with safe helpers: host.read_file(path), host.write_file(path, content), host.env(key), host.list_dir(dir), host.cwd(), host.json_encode(value), host.json_decode(text). FFI is available (require('ffi')) for calling system C libraries."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "update", "delete", "list"],
+                    "description": "create (default): new tool; update: overwrite existing tool's code and hot-refresh it; delete: remove the tool; list: show existing tool names (no name/code needed)"
+                },
                 "name": { "type": "string", "description": "Tool name (alphanumeric + underscore; becomes the Lua file name)" },
                 "code": { "type": "string", "description": "Full Lua source. Must return a function(args) -> result. Optional header comments: -- desc: ... and -- schema: {...}" }
             },
-            "required": ["name", "code"]
+            "required": []
         })
     }
 
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("create")
+            .to_string();
+
+        if action == "list" {
+            let mut names: Vec<String> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&self.tools_dir) {
+                for e in entries.flatten() {
+                    if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str())
+                        && e.path().extension().map(|x| x == "lua").unwrap_or(false)
+                    {
+                        names.push(stem.to_string());
+                    }
+                }
+                names.sort();
+            }
+            let text = if names.is_empty() {
+                "no scripted tools yet".to_string()
+            } else {
+                format!("scripted tools: {}", names.join(", "))
+            };
+            return Ok(ToolOutput { text });
+        }
+
         let name = args
             .get("name")
             .and_then(Value::as_str)
             .filter(|n| !n.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("create_lua_tool requires a non-empty 'name'"))?;
-        let code = args
-            .get("code")
-            .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("create_lua_tool requires non-empty 'code'"))?;
+            .ok_or_else(|| anyhow::anyhow!("{} requires a non-empty 'name'", action))?;
 
         // Sanitize the name into a safe file stem (drop unsafe chars).
         let safe: String = name
@@ -70,20 +102,47 @@ impl Tool for CreateLuaToolTool {
         if safe.is_empty() {
             anyhow::bail!("tool name must contain alphanumerics");
         }
-
-        // Persist the tool so it survives restarts (registry also
-        // hot-registers it for this session).
-        std::fs::create_dir_all(&self.tools_dir)?;
         let path = self.tools_dir.join(format!("{safe}.lua"));
-        std::fs::write(&path, code)?;
-        (self.register)(&safe, path.clone());
 
-        Ok(ToolOutput {
-            text: format!(
-                "tool '{safe}' created at {} and hot-registered. Callable by name from the next turn.",
-                path.display()
-            ),
-        })
+        match action.as_str() {
+            "delete" => {
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    (self.unregister)(&safe);
+                    Ok(ToolOutput {
+                        text: format!("tool '{safe}' deleted and unregistered."),
+                    })
+                } else {
+                    Ok(ToolOutput {
+                        text: format!("tool '{safe}' does not exist (nothing to delete)."),
+                    })
+                }
+            }
+            "update" | "create" => {
+                let code = args
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("{} requires non-empty 'code'", action))?;
+                // Persist the tool so it survives restarts (registry also
+                // hot-registers it for this session).
+                std::fs::create_dir_all(&self.tools_dir)?;
+                std::fs::write(&path, code)?;
+                (self.register)(&safe, path.clone());
+                let verb = if action == "update" {
+                    "updated"
+                } else {
+                    "created"
+                };
+                Ok(ToolOutput {
+                    text: format!(
+                        "tool '{safe}' {verb} at {} and hot-registered. Callable by name from the next turn.",
+                        path.display()
+                    ),
+                })
+            }
+            other => anyhow::bail!("unknown action: {other}"),
+        }
     }
 }
 

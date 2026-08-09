@@ -337,3 +337,9 @@ you have finished the task."#;
 mod harness_tests;
 
 pub mod versions;
+
+/// Cross-process advisory lock for harness/tools directories. See
+/// [`lock::with_dir_lock`] — the evolution tools wrap their write
+/// sequences with it so concurrent sigil instances never interleave
+/// "read old → archive → write new".
+pub mod lock;

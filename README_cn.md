@@ -23,7 +23,7 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 31** — 轮次时间戳 + `session export --since`。管道模式、
+> 状态：**Phase 32** — 自进化写入的跨进程目录锁。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -196,8 +196,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **29** ✅ | 依赖环检测（add_skill 对环发出警告） |
 | **30** ✅ | 技能图视图（list_skills：描述、依赖、环警告） |
 | **31** ✅ | 轮次时间戳 + `session export --since`（按时间过滤转录） |
+| **32** ✅ | 跨进程目录锁（自进化写入加 advisory `.sigil.lock`） |
 
 ## 更新日志
+
+### Phase 32 — 2026-08-10
+- **跨进程目录锁**：并发 sigil 实例（REPL + MCP server + 管道任务）现在
+  可以安全写同一 harness/tools 目录——`create_lua_tool`、`improve_harness`
+  和 `skill_rollback`/`versions_gc` 把「读旧→归档→写新」序列包在 advisory
+  `<dir>/.sigil.lock` 里（fd-lock；Unix flock / Windows LockFileEx），两个
+  写者永不交错。读不加锁；list 类动作在锁外。
 
 ### Phase 31 — 2026-08-10
 - **轮次时间戳**：写入会话 JSONL 的每一轮现在带纳秒级 `ts` 字段（append

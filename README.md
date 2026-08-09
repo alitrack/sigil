@@ -25,7 +25,7 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 31** — timestamped turns + `session export --since`.
+> Status: **Phase 32** — cross-process dir locks for self-evolution writes.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -215,8 +215,18 @@ MCP tool list.
 | **29** ✅ | Dependency cycle detection (add_skill warns on cycles) |
 | **30** ✅ | Skill graph view (list_skills: descriptions, deps, cycle warning) |
 | **31** ✅ | Timestamped turns + `session export --since` (time-filtered transcripts) |
+| **32** ✅ | Cross-process dir locks (advisory `.sigil.lock` on evolution writes) |
 
 ## Changelog
+
+### Phase 32 — 2026-08-10
+- **Cross-process directory locks** for self-evolution writes. Concurrent
+  sigil instances (REPL + MCP server + pipe jobs) can now safely write the
+  same harness/tools dirs: `create_lua_tool`, `improve_harness` and
+  `skill_rollback`/`versions_gc` wrap their read-archive-write sequences in
+  an advisory `<dir>/.sigil.lock` (fd-lock; flock on Unix, LockFileEx on
+  Windows), so two writers never interleave. Reads never lock; list actions
+  stay outside the lock.
 
 ### Phase 31 — 2026-08-10
 - **Timestamped turns**: every turn written to a session JSONL now carries a

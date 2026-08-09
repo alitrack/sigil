@@ -88,27 +88,62 @@ impl Tool for CreateLuaToolTool {
             return Ok(ToolOutput { text });
         }
 
-        let name = args
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("{} requires a non-empty 'name'", action))?;
+        // Writes (create/update/delete) take the directory lock so
+        // concurrent sigil instances never interleave "read old →
+        // archive → write new" on the same tool.
+        crate::harness::lock::with_dir_lock(&self.tools_dir, || {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{} requires a non-empty 'name'", action))?;
 
-        // Sanitize the name into a safe file stem (drop unsafe chars).
-        let safe: String = name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if safe.is_empty() {
-            anyhow::bail!("tool name must contain alphanumerics");
-        }
-        let path = self.tools_dir.join(format!("{safe}.lua"));
+            // Sanitize the name into a safe file stem (drop unsafe chars).
+            let safe: String = name
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if safe.is_empty() {
+                anyhow::bail!("tool name must contain alphanumerics");
+            }
+            let path = self.tools_dir.join(format!("{safe}.lua"));
 
-        match action.as_str() {
-            "delete" => {
-                if path.exists() {
-                    // Archive before removal so a mistaken delete can
-                    // be restored from the version library.
+            match action.as_str() {
+                "delete" => {
+                    if path.exists() {
+                        // Archive before removal so a mistaken delete can
+                        // be restored from the version library.
+                        if let Ok(old) = std::fs::read_to_string(&path) {
+                            crate::harness::versions::backup_and_prune(
+                                &self.tools_dir,
+                                "tools",
+                                &safe,
+                                &old,
+                            );
+                        }
+                        std::fs::remove_file(&path)?;
+                        (self.unregister)(&safe);
+                        Ok(ToolOutput {
+                            text: format!(
+                                "tool '{safe}' deleted and unregistered (previous version archived)."
+                            ),
+                        })
+                    } else {
+                        Ok(ToolOutput {
+                            text: format!("tool '{safe}' does not exist (nothing to delete)."),
+                        })
+                    }
+                }
+                "update" | "create" => {
+                    let code = args
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .filter(|c| !c.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("{} requires non-empty 'code'", action))?;
+                    // Persist the tool so it survives restarts (registry also
+                    // hot-registers it for this session).
+                    std::fs::create_dir_all(&self.tools_dir)?;
+                    // Snapshot the previous version on overwrite.
                     if let Ok(old) = std::fs::read_to_string(&path) {
                         crate::harness::versions::backup_and_prune(
                             &self.tools_dir,
@@ -117,53 +152,23 @@ impl Tool for CreateLuaToolTool {
                             &old,
                         );
                     }
-                    std::fs::remove_file(&path)?;
-                    (self.unregister)(&safe);
+                    std::fs::write(&path, code)?;
+                    (self.register)(&safe, path.clone());
+                    let verb = if action == "update" {
+                        "updated"
+                    } else {
+                        "created"
+                    };
                     Ok(ToolOutput {
                         text: format!(
-                            "tool '{safe}' deleted and unregistered (previous version archived)."
+                            "tool '{safe}' {verb} at {} and hot-registered. Callable by name from the next turn.",
+                            path.display()
                         ),
                     })
-                } else {
-                    Ok(ToolOutput {
-                        text: format!("tool '{safe}' does not exist (nothing to delete)."),
-                    })
                 }
+                other => anyhow::bail!("unknown action: {other}"),
             }
-            "update" | "create" => {
-                let code = args
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .filter(|c| !c.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("{} requires non-empty 'code'", action))?;
-                // Persist the tool so it survives restarts (registry also
-                // hot-registers it for this session).
-                std::fs::create_dir_all(&self.tools_dir)?;
-                // Snapshot the previous version on overwrite.
-                if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup_and_prune(
-                        &self.tools_dir,
-                        "tools",
-                        &safe,
-                        &old,
-                    );
-                }
-                std::fs::write(&path, code)?;
-                (self.register)(&safe, path.clone());
-                let verb = if action == "update" {
-                    "updated"
-                } else {
-                    "created"
-                };
-                Ok(ToolOutput {
-                    text: format!(
-                        "tool '{safe}' {verb} at {} and hot-registered. Callable by name from the next turn.",
-                        path.display()
-                    ),
-                })
-            }
-            other => anyhow::bail!("unknown action: {other}"),
-        }
+        })
     }
 }
 
@@ -219,7 +224,11 @@ impl Tool for ImproveHarnessTool {
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        match action {
+        // Writes (edit_prompt / add_skill) take the directory lock so
+        // concurrent sigil instances never interleave "read old →
+        // archive → write new" on the harness assets. list_skills is
+        // read-only and stays outside the lock.
+        crate::harness::lock::with_dir_lock(&self.harness_dir, || match action {
             "edit_prompt" => {
                 let content = args
                     .get("content")
@@ -332,6 +341,6 @@ impl Tool for ImproveHarnessTool {
                 })
             }
             other => anyhow::bail!("unknown action: {other}"),
-        }
+        })
     }
 }

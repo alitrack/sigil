@@ -138,37 +138,41 @@ impl Tool for SkillRollbackTool {
             "tools" => &self.tools_dir,
             other => anyhow::bail!("unknown kind: {other}"),
         };
-        let restored = versions::restore(base, kind, name, version)?;
-        // For scripted tools, hot-register the restored code so it is
-        // live immediately (the file on disk changed, but the registry
-        // still holds the previous implementation).
-        if kind == "tools"
-            && let Some(reg) = &self.register
-        {
-            (reg)(name, self.tools_dir.join(format!("{name}.lua")));
-        }
-        // For prompts / skills, refresh the live agent state so the
-        // restored content is used on the very next turn.
-        if kind != "tools"
-            && let Some(state) = &self.prompt_state
-            && let Ok(mut s) = state.write()
-        {
-            if kind == "prompt" {
-                s.system_prompt = restored.clone();
-            } else {
-                s.skills = crate::harness::load_skills(&self.harness_dir.join("skills"));
+        // Rollback is a write (restore overwrites the live asset) — take
+        // the directory lock so concurrent instances serialize.
+        crate::harness::lock::with_dir_lock(base, || {
+            let restored = versions::restore(base, kind, name, version)?;
+            // For scripted tools, hot-register the restored code so it is
+            // live immediately (the file on disk changed, but the registry
+            // still holds the previous implementation).
+            if kind == "tools"
+                && let Some(reg) = &self.register
+            {
+                (reg)(name, self.tools_dir.join(format!("{name}.lua")));
             }
-        }
-        Ok(ToolOutput {
-            text: format!(
-                "restored {kind}/{name} to version {version} ({} chars). Live asset updated{}.",
-                restored.chars().count(),
-                if kind == "tools" {
-                    " and hot-registered for this session"
+            // For prompts / skills, refresh the live agent state so the
+            // restored content is used on the very next turn.
+            if kind != "tools"
+                && let Some(state) = &self.prompt_state
+                && let Ok(mut s) = state.write()
+            {
+                if kind == "prompt" {
+                    s.system_prompt = restored.clone();
                 } else {
-                    " — the very next turn uses it"
+                    s.skills = crate::harness::load_skills(&self.harness_dir.join("skills"));
                 }
-            ),
+            }
+            Ok(ToolOutput {
+                text: format!(
+                    "restored {kind}/{name} to version {version} ({} chars). Live asset updated{}.",
+                    restored.chars().count(),
+                    if kind == "tools" {
+                        " and hot-registered for this session"
+                    } else {
+                        " — the very next turn uses it"
+                    }
+                ),
+            })
         })
     }
 }
@@ -229,12 +233,15 @@ impl Tool for VersionsGcTool {
             "tools" => &self.tools_dir,
             other => anyhow::bail!("unknown kind: {other}"),
         };
-        let removed = versions::gc(base, kind, name, keep);
-        let remaining = versions::versions_of(base, kind, name).len();
-        Ok(ToolOutput {
-            text: format!(
-                "pruned {removed} old version(s) of {kind}/{name}; {remaining} kept (newest {keep})"
-            ),
+        // GC deletes archived files — serialize with other writers.
+        crate::harness::lock::with_dir_lock(base, || {
+            let removed = versions::gc(base, kind, name, keep);
+            let remaining = versions::versions_of(base, kind, name).len();
+            Ok(ToolOutput {
+                text: format!(
+                    "pruned {removed} old version(s) of {kind}/{name}; {remaining} kept (newest {keep})"
+                ),
+            })
         })
     }
 }

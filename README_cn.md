@@ -23,11 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 29** — 依赖环检测。管道模式、
+> 状态：**Phase 30** — 技能图视图（list_skills）。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
-> 警告模型）、**带版本历史、会话内热回滚、GC 和实时
+> 警告模型；`list_skills` 显示每个技能的描述、依赖和环警告）、
+> **带版本历史、会话内热回滚、GC 和实时
 > prompt 状态**（harness 编辑下一轮生效，无需重启）的自进化闭环
 > （每个模型可写资产）、三层 safety、MCP 客户端**和 server**（工具、
 > 进度通知、双向 resources **和 prompts**）、ACP server **和 client**
@@ -193,6 +194,7 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **27** ✅ | 技能依赖（`> depends_on:` 头部，闭包内联） |
 | **28** ✅ | ratchet 电池 4 → 10（记忆、技能依赖、live prompt、MCP） |
 | **29** ✅ | 依赖环检测（add_skill 对环发出警告） |
+| **30** ✅ | 技能图视图（list_skills：描述、依赖、环警告） |
 
 ## 更新日志
 

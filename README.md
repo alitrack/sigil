@@ -25,26 +25,27 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 29** — dependency cycle detection.
+> Status: **Phase 30** — skill graph view (list_skills).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
 > inlined transitively, cycle-safe) and **cycle detection** (add_skill
-> warns the model when a write creates a dependency cycle), a
-> self-evolution loop with **version history, rollback that hot-reloads
-> in-session, garbage collection, and live prompt state** (harness
-> edits apply on the very next turn, no restart) for every
-> model-writable asset, three-layer safety, MCP client **and server**
-> (tools, progress notifications, resources **and prompts** both ways),
-> ACP server **and client** (cross-process delegation), persistent
-> memory (**remember/recall/memory_list/memory_delete**), resumable
-> sessions with in-REPL switching and **portable JSON export/import**,
-> sub-agents, streaming output, a **10-task ratchet regression
-> battery** (files/bash/git, memory lifecycle, skill deps, live prompt
-> edits, tool creation, MCP server — all against the real binary and
-> LLM), model-driven harness improvement, skill content inlining, TUI
-> colors, `/tools` search, and a diagnostic `doctor` subcommand — all
-> end to end.
+> warns the model when a write creates a dependency cycle; `list_skills`
+> shows every skill with its description, dependencies, and any cycles
+> as a warning), a self-evolution loop with **version history, rollback
+> that hot-reloads in-session, garbage collection, and live prompt
+> state** (harness edits apply on the very next turn, no restart) for
+> every model-writable asset, three-layer safety, MCP client **and
+> server** (tools, progress notifications, resources **and prompts**
+> both ways), ACP server **and client** (cross-process delegation),
+> persistent memory (**remember/recall/memory_list/memory_delete**),
+> resumable sessions with in-REPL switching and **portable JSON
+> export/import**, sub-agents, streaming output, a **10-task ratchet
+> regression battery** (files/bash/git, memory lifecycle, skill deps,
+> live prompt edits, tool creation, MCP server — all against the real
+> binary and LLM), model-driven harness improvement, skill content
+> inlining, TUI colors, `/tools` search, and a diagnostic `doctor`
+> subcommand — all end to end.
 
 ## Quick start
 
@@ -212,6 +213,7 @@ MCP tool list.
 | **27** ✅ | Skill dependencies (`> depends_on:` header, closure inlining) |
 | **28** ✅ | Ratchet battery 4 → 10 (memory, skill deps, live prompt, MCP) |
 | **29** ✅ | Dependency cycle detection (add_skill warns on cycles) |
+| **30** ✅ | Skill graph view (list_skills: descriptions, deps, cycle warning) |
 
 ## Changelog
 

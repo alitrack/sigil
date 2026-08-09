@@ -88,4 +88,27 @@ mod mcp_tests {
         let err = client.read_resource("echo://nope").await;
         assert!(err.is_err());
     }
+
+    #[tokio::test]
+    async fn lists_and_gets_prompts() {
+        let (client, _) = McpClient::connect("echo_prompt", "python3", &[server_path()])
+            .await
+            .expect("connect");
+
+        // prompts/list → one prompt.
+        let prompts = client.list_prompts().await.expect("list prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].get("name").and_then(|v| v.as_str()),
+            Some("greet")
+        );
+
+        // prompts/get → rendered messages.
+        let text = client.get_prompt("greet").await.expect("get prompt");
+        assert!(text.contains("Please greet the user warmly"));
+
+        // Unknown prompt → error.
+        let err = client.get_prompt("nope").await;
+        assert!(err.is_err());
+    }
 }

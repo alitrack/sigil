@@ -270,4 +270,39 @@ impl McpClient {
         }
         Ok(texts.join("\n"))
     }
+
+    /// List prompt templates exposed by the server (MCP prompts/list).
+    pub async fn list_prompts(&self) -> Result<Vec<Value>> {
+        let result = self.request("prompts/list", json!({})).await?;
+        Ok(result
+            .get("prompts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Fetch a prompt template's rendered messages (MCP prompts/get).
+    /// Returns the concatenated text of all messages.
+    pub async fn get_prompt(&self, name: &str) -> Result<String> {
+        let result = self.request("prompts/get", json!({ "name": name })).await?;
+        let messages = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut texts: Vec<String> = Vec::new();
+        for m in &messages {
+            if let Some(t) = m
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+            {
+                texts.push(t.to_string());
+            }
+        }
+        if texts.is_empty() {
+            anyhow::bail!("MCP prompt '{name}' returned no text content");
+        }
+        Ok(texts.join("\n"))
+    }
 }

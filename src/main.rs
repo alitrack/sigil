@@ -90,7 +90,11 @@ async fn main() -> Result<()> {
     }
     // One tool to read resources from every connected MCP server.
     if !mcp_servers.is_empty() {
+        let servers = mcp_servers.clone();
         tools.register(std::sync::Arc::new(tools::mcp::McpResourcesTool {
+            servers,
+        }));
+        tools.register(std::sync::Arc::new(tools::mcp::McpPromptsTool {
             servers: mcp_servers,
         }));
     }

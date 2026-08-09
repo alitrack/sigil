@@ -54,7 +54,7 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                     "id": id,
                     "result": {
                         "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {}, "progress": {}, "resources": {} },
+                        "capabilities": { "tools": {}, "progress": {}, "resources": {}, "prompts": {} },
                         "serverInfo": { "name": "sigil", "version": "0.1.0" }
                     }
                 });
@@ -129,6 +129,57 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                                 "code": -32002,
                                 "message": format!("resource not found: {uri}")
                             }
+                        });
+                        write_frame(&mut stdout, &resp).await?;
+                    }
+                }
+            }
+            "prompts/list" => {
+                // Every exposed resource doubles as a prompt template.
+                let list: Vec<Value> = resources
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "name": r.name,
+                            "description": r.description,
+                        })
+                    })
+                    .collect();
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "prompts": list }
+                });
+                write_frame(&mut stdout, &resp).await?;
+            }
+            "prompts/get" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match resources.iter().find(|r| r.name == name) {
+                    Some(r) => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "description": r.description,
+                                "messages": [{
+                                    "role": "user",
+                                    "content": {
+                                        "type": "text",
+                                        "text": r.content,
+                                    }
+                                }]
+                            }
+                        });
+                        write_frame(&mut stdout, &resp).await?;
+                    }
+                    None => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32602, "message": format!("prompt not found: {name}") }
                         });
                         write_frame(&mut stdout, &resp).await?;
                     }

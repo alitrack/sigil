@@ -37,6 +37,45 @@ def main():
             })
         elif method == "notifications/initialized":
             pass  # no response needed
+        elif method == "prompts/list":
+            send({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "prompts": [{
+                        "name": "greet",
+                        "description": "Render a greeting prompt",
+                        "arguments": [{
+                            "name": "who",
+                            "description": "Who to greet",
+                            "required": False,
+                        }],
+                    }]
+                },
+            })
+        elif method == "prompts/get":
+            name = msg.get("params", {}).get("name", "")
+            if name == "greet":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "result": {
+                        "description": "Render a greeting prompt",
+                        "messages": [{
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": "Please greet the user warmly.",
+                            },
+                        }],
+                    },
+                })
+            else:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32602, "message": f"prompt not found: {name}"},
+                })
         elif method == "resources/list":
             send({
                 "jsonrpc": "2.0",

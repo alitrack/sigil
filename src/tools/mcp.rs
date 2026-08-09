@@ -160,3 +160,93 @@ impl Tool for McpResourcesTool {
         }
     }
 }
+
+/// Tool that fetches prompt templates from connected MCP servers.
+///
+/// `list` shows every prompt name across all connected servers;
+/// `get` renders one prompt template's messages by name.
+pub struct McpPromptsTool {
+    /// (server_name, client) pairs for every connected MCP server.
+    pub servers: Vec<(String, Arc<McpClient>)>,
+}
+
+#[async_trait]
+impl Tool for McpPromptsTool {
+    fn name(&self) -> &str {
+        "mcp_prompts"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch prompt templates from connected MCP servers. Actions: 'list' (show every prompt name across all connected servers), 'get' (render one prompt template by name, e.g. math). Use to retrieve ready-made instruction templates from external MCP servers."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "get"],
+                    "description": "list: show all prompt names; get: render one prompt by name"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Prompt name to render (required for action=get)"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+
+        match action {
+            "list" => {
+                let mut lines: Vec<String> = Vec::new();
+                for (server, client) in &self.servers {
+                    match client.list_prompts().await {
+                        Ok(prompts) => {
+                            if prompts.is_empty() {
+                                lines.push(format!("[{server}]: (no prompts)"));
+                            } else {
+                                for p in &prompts {
+                                    let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+                                    let desc =
+                                        p.get("description").and_then(Value::as_str).unwrap_or("");
+                                    lines.push(format!("[{server}] {name} — {desc}"));
+                                }
+                            }
+                        }
+                        Err(e) => lines.push(format!("[{server}]: error: {e:#}")),
+                    }
+                }
+                if lines.is_empty() {
+                    lines.push("no MCP servers connected".to_string());
+                }
+                Ok(ToolOutput {
+                    text: lines.join("\n"),
+                })
+            }
+            "get" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("mcp_prompts get requires 'name'"))?;
+                for (_server, client) in &self.servers {
+                    match client.get_prompt(name).await {
+                        Ok(text) => {
+                            return Ok(ToolOutput { text });
+                        }
+                        Err(_) => {
+                            // Try the next server; only fail if none has it.
+                        }
+                    }
+                }
+                anyhow::bail!("prompt '{name}' not found on any connected MCP server")
+            }
+            other => anyhow::bail!("unknown action: {other}"),
+        }
+    }
+}

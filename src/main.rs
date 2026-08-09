@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
     tools::memory::register(&mut tools, memory_path);
 
     // MCP servers: connect, discover tools, register as mcp_<server>_<tool>.
+    let mut mcp_servers: Vec<(String, std::sync::Arc<mcp::McpClient>)> = Vec::new();
     for server in &config.mcp_servers {
         match mcp::McpClient::connect(&server.name, &server.command, &server.args).await {
             Ok((client, infos)) => {
@@ -81,10 +82,17 @@ async fn main() -> Result<()> {
                     let tool = tools::mcp::McpTool::new(&server.name, info, client.clone());
                     tools.register(std::sync::Arc::new(tool));
                 }
+                mcp_servers.push((server.name.clone(), client));
                 eprintln!("mcp: connected '{}' ({} tools)", server.name, n);
             }
             Err(e) => eprintln!("mcp: failed to connect '{}': {e}", server.name),
         }
+    }
+    // One tool to read resources from every connected MCP server.
+    if !mcp_servers.is_empty() {
+        tools.register(std::sync::Arc::new(tools::mcp::McpResourcesTool {
+            servers: mcp_servers,
+        }));
     }
 
     // Harness bundle: system prompt + skills from disk (editable).

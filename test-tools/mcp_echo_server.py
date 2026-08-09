@@ -31,12 +31,45 @@ def main():
                 "id": rid,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                     "serverInfo": {"name": "echo-test", "version": "0.0.1"},
                 },
             })
         elif method == "notifications/initialized":
             pass  # no response needed
+        elif method == "resources/list":
+            send({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "resources": [{
+                        "uri": "echo://greeting",
+                        "name": "greeting",
+                        "description": "A static greeting resource",
+                        "mimeType": "text/markdown",
+                    }]
+                },
+            })
+        elif method == "resources/read":
+            uri = msg.get("params", {}).get("uri", "")
+            if uri == "echo://greeting":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "result": {
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": "# Greeting\n\nHello from the echo server resource!",
+                        }]
+                    },
+                })
+            else:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32002, "message": f"resource not found: {uri}"},
+                })
         elif method == "tools/list":
             send({
                 "jsonrpc": "2.0",

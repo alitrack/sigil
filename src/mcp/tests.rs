@@ -62,4 +62,30 @@ mod mcp_tests {
             assert!(got.as_str().unwrap().contains(&format!("msg{i}")));
         }
     }
+
+    #[tokio::test]
+    async fn lists_and_reads_resources() {
+        let (client, _) = McpClient::connect("echo_res", "python3", &[server_path()])
+            .await
+            .expect("connect");
+
+        // resources/list → one resource.
+        let resources = client.list_resources().await.expect("list resources");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0].get("uri").and_then(|v| v.as_str()),
+            Some("echo://greeting")
+        );
+
+        // resources/read → content.
+        let text = client
+            .read_resource("echo://greeting")
+            .await
+            .expect("read resource");
+        assert!(text.contains("Hello from the echo server resource"));
+
+        // Unknown URI → error.
+        let err = client.read_resource("echo://nope").await;
+        assert!(err.is_err());
+    }
 }

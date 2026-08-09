@@ -238,4 +238,36 @@ impl McpClient {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// List resources exposed by the server (MCP resources/list).
+    pub async fn list_resources(&self) -> Result<Vec<Value>> {
+        let result = self.request("resources/list", json!({})).await?;
+        Ok(result
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Read a resource's content by URI (MCP resources/read).
+    pub async fn read_resource(&self, uri: &str) -> Result<String> {
+        let result = self
+            .request("resources/read", json!({ "uri": uri }))
+            .await?;
+        let contents = result
+            .get("contents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut texts: Vec<String> = Vec::new();
+        for c in &contents {
+            if let Some(t) = c.get("text").and_then(Value::as_str) {
+                texts.push(t.to_string());
+            }
+        }
+        if texts.is_empty() {
+            anyhow::bail!("MCP resource '{uri}' returned no text content");
+        }
+        Ok(texts.join("\n"))
+    }
 }

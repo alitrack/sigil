@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::mcp::{McpClient, McpToolInfo};
 use crate::tools::{Tool, ToolOutput};
@@ -67,5 +67,96 @@ impl Tool for McpTool {
         let text = self.client.call_tool(&self.info.name, args.clone()).await?;
         let text = serde_json::from_str::<String>(&text.to_string()).unwrap_or(text.to_string());
         Ok(ToolOutput { text })
+    }
+}
+
+/// Tool that reads resources from connected MCP servers.
+///
+/// `list` returns every resource URI across all connected servers;
+/// `read` fetches one resource's content by full URI.
+/// Naming: `mcp_resources` (singular tool, no per-server registration).
+pub struct McpResourcesTool {
+    /// (server_name, client) pairs for every connected MCP server.
+    pub servers: Vec<(String, Arc<McpClient>)>,
+}
+
+#[async_trait]
+impl Tool for McpResourcesTool {
+    fn name(&self) -> &str {
+        "mcp_resources"
+    }
+
+    fn description(&self) -> &str {
+        "Read resources exposed by connected MCP servers. Actions: 'list' (show every resource URI across all connected servers), 'read' (fetch one resource's content by full URI, e.g. sigil://skills/math). Use to pull knowledge/context from external MCP servers."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "read"],
+                    "description": "list: show all resource URIs; read: fetch one resource's content"
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Full resource URI to read (required for action=read)"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+
+        match action {
+            "list" => {
+                let mut lines: Vec<String> = Vec::new();
+                for (server, client) in &self.servers {
+                    match client.list_resources().await {
+                        Ok(resources) => {
+                            if resources.is_empty() {
+                                lines.push(format!("[{server}]: (no resources)"));
+                            } else {
+                                for r in &resources {
+                                    let uri = r.get("uri").and_then(Value::as_str).unwrap_or("?");
+                                    let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                                    lines.push(format!("[{server}] {uri} — {name}"));
+                                }
+                            }
+                        }
+                        Err(e) => lines.push(format!("[{server}]: error: {e:#}")),
+                    }
+                }
+                if lines.is_empty() {
+                    lines.push("no MCP servers connected".to_string());
+                }
+                Ok(ToolOutput {
+                    text: lines.join("\n"),
+                })
+            }
+            "read" => {
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("mcp_resources read requires 'uri'"))?;
+                for (_server, client) in &self.servers {
+                    match client.read_resource(uri).await {
+                        Ok(text) => {
+                            return Ok(ToolOutput { text });
+                        }
+                        Err(e) => {
+                            // Try the next server; only fail if none has it.
+                            let _ = e;
+                        }
+                    }
+                }
+                anyhow::bail!("resource '{uri}' not found on any connected MCP server")
+            }
+            other => anyhow::bail!("unknown action: {other}"),
+        }
     }
 }

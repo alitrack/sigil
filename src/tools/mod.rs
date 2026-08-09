@@ -94,8 +94,14 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
-        self.tools.insert(name.clone(), tool);
-        self.order.push(name);
+        // Re-registering the same name replaces the impl but must not
+        // duplicate the order entry (a scripted tool may shadow a
+        // native tool of the same name — e.g. a model-authored
+        // mcp_resources.lua — without breaking the advertised list).
+        if !self.tools.contains_key(&name) {
+            self.order.push(name.clone());
+        }
+        self.tools.insert(name, tool);
     }
 
     /// Remove a tool by name (idempotent). Used by evolution tools to
@@ -231,5 +237,22 @@ impl ToolRegistry {
 pub fn error_output(msg: impl Into<String>) -> ToolOutput {
     ToolOutput {
         text: json!({ "error": msg.into() }).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::tools::bash::BashTool;
+
+    #[test]
+    fn re_register_same_name_does_not_duplicate_order() {
+        let mut reg = ToolRegistry::new();
+        reg.register(std::sync::Arc::new(BashTool));
+        // Re-register (e.g. a scripted tool shadowing a native one).
+        reg.register(std::sync::Arc::new(BashTool));
+        let specs = reg.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "bash");
     }
 }

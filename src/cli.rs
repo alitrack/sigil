@@ -35,4 +35,8 @@ pub struct Cli {
     /// Harness bundle directory (system prompt + skills; default: ~/.sigil/harness/).
     #[arg(long)]
     pub harness_dir: Option<String>,
+
+    /// Memory file for remember/recall tools (default: ~/.sigil/memory.md).
+    #[arg(long)]
+    pub memory: Option<String>,
 }

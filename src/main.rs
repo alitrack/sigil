@@ -5,6 +5,7 @@ mod harness;
 mod llm;
 mod lua;
 mod mcp;
+mod memory;
 mod safety;
 mod tools;
 
@@ -48,6 +49,13 @@ async fn main() -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(scripted::default_tools_dir);
     let mut tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
+
+    // Memory tools (remember/recall) — default ~/.sigil/memory.md.
+    let memory_path = cli
+        .memory
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(memory::default_memory_path);
+    tools::memory::register(&mut tools, memory_path);
 
     // MCP servers: connect, discover tools, register as mcp_<server>_<tool>.
     for server in &config.mcp_servers {

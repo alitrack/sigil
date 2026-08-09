@@ -20,9 +20,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 5** — 交互式 REPL。管道模式、带真实 FFI 的脚本化 Lua
-> 工具、自进化闭环、三层 safety、MCP 客户端、ACP server、持久 memory、
-> 人工在环 REPL 全部端到端可用。
+> 状态：**Phase 6** — 会话持久化 + 子代理。管道模式、带真实 FFI 的脚本化
+> Lua 工具、自进化闭环、三层 safety、MCP 客户端、ACP server、持久 memory、
+> 交互式 REPL、可续会话、子代理委托全部端到端可用。
 
 ## 快速开始
 
@@ -34,8 +34,13 @@ echo "这个仓库里有哪些文件？" | ./target/release/sigil
 
 # 交互模式
 ./target/release/sigil
-#   /tools   列出可用工具
-#   /quit    退出
+#   /tools    列出可用工具
+#   /session  显示当前会话 id
+#   /quit     退出
+
+# 可续会话
+./target/release/sigil --list-sessions
+./target/release/sigil --resume <会话id>
 ```
 
 ### 配置
@@ -75,6 +80,10 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
 - **ACP server** — `sigil acp` 说 Agent Client Protocol（stdio 上的
   JSON-RPC），任意 ACP 宿主（编辑器、其他 agent）都能驱动 sigil。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
+- **可续会话** — REPL 每轮记录到 `~/.sigil/sessions/<id>.jsonl`；
+  `--resume <id>` 继续对话。
+- **子代理** — `delegate` 工具：主 agent 派发独立子代理（独立对话、
+  独立工具循环），收回摘要。
 
 ## 工作原理
 
@@ -106,7 +115,8 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 | **3** ✅ | Harness bundle + 自进化闭环（AHE）+ safety 三层 |
 | **4** ✅ | MCP 客户端、ACP server、持久 memory |
 | **5** ✅ | 交互式 REPL + 人工审批 |
-| **6** 🔮 | 会话持久化、子代理、TUI 打磨 |
+| **6** ✅ | 会话持久化（`--resume`）、子代理（`delegate`） |
+| **7** 🔮 | MCP server 模式、TUI 打磨、ratchet 测试 |
 
 ## 开发
 

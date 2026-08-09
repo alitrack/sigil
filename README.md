@@ -22,9 +22,10 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 5** — interactive REPL. Pipe mode, scripted Lua tools with
-> real FFI, self-evolution loop, three-layer safety, MCP client, ACP server,
-> persistent memory, and a human-in-the-loop REPL all work end to end.
+> Status: **Phase 6** — session persistence + sub-agents. Pipe mode, scripted
+> Lua tools with real FFI, self-evolution loop, three-layer safety, MCP
+> client, ACP server, persistent memory, interactive REPL, resumable
+> sessions, and sub-agent delegation all work end to end.
 
 ## Quick start
 
@@ -36,8 +37,13 @@ echo "what files are in this repo?" | ./target/release/sigil
 
 # Interactive mode
 ./target/release/sigil
-#   /tools   list available tools
-#   /quit    exit
+#   /tools    list available tools
+#   /session  show this session id
+#   /quit     exit
+
+# Resumable sessions
+./target/release/sigil --list-sessions
+./target/release/sigil --resume <session-id>
 ```
 
 ### Configuration
@@ -82,6 +88,10 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   over stdio) so any ACP host (editors, other agents) can drive sigil.
 - **Interactive REPL** — multi-turn conversation with human approval for
   destructive commands.
+- **Resumable sessions** — every REPL turn is recorded to
+  `~/.sigil/sessions/<id>.jsonl`; `--resume <id>` continues a conversation.
+- **Sub-agents** — `delegate` tool: the main agent spins off an independent
+  sub-agent (own conversation, own tool loop) and gets back a summary.
 
 ## How it works
 
@@ -114,7 +124,8 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
 | **3** ✅ | Harness bundle + self-evolution loop (AHE) + safety 3 layers |
 | **4** ✅ | MCP client, ACP server, persistent memory |
 | **5** ✅ | Interactive REPL + human approval |
-| **6** 🔮 | Session persistence, subagents, TUI polish |
+| **6** ✅ | Session persistence (`--resume`), sub-agents (`delegate`) |
+| **7** 🔮 | MCP server mode, TUI polish, ratchet tests |
 
 ## Development
 

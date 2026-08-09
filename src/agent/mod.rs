@@ -29,12 +29,31 @@ pub struct AgentConfig {
     pub system_prompt: String,
 }
 
+/// Approval callback: given a tool call that the gate rejected in
+/// non-interactive mode, decide whether the human allows it anyway.
+/// Returns true to run it (interactive override).
+pub type Approver = dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync;
+
 /// One turn of the agent loop. Returns the assistant's final text.
 pub async fn run_turn(
     provider: &dyn LlmProvider,
     tools: &mut ToolRegistry,
     config: &AgentConfig,
     user_prompt: &str,
+) -> Result<String> {
+    run_turn_with_approver(provider, tools, config, user_prompt, None).await
+}
+
+/// Like [`run_turn`] but with an optional interactive approver: when
+/// the gate rejects a tool call and `approver` is present, the human
+/// may override the rejection (used by the REPL; piped mode passes
+/// None so the gate's default rejection stands).
+pub async fn run_turn_with_approver(
+    provider: &dyn LlmProvider,
+    tools: &mut ToolRegistry,
+    config: &AgentConfig,
+    user_prompt: &str,
+    approver: Option<&Approver>,
 ) -> Result<String> {
     let mut messages = vec![ChatMessage::system(&config.system_prompt)];
     messages.push(ChatMessage::user(user_prompt));
@@ -99,38 +118,46 @@ pub async fn run_turn(
             ));
             for call in complete.tool_calls {
                 // Approval gate: reject destructive commands in
-                // non-interactive mode before they ever run.
-                match safety::check(&call.name, &call.arguments) {
-                    safety::GateDecision::Allow => {
-                        // Circuit breaker: skip tripped tools entirely.
-                        if breaker.is_tripped(&call.name) {
-                            let msg = safety::CircuitBreaker::tripped_message(&call.name);
-                            messages.push(ChatMessage::tool_result(msg, call.id));
-                            continue;
-                        }
-                        let result = tools.execute(&call).await?;
-                        // Execution ring: flag harness mutations to the
-                        // model so it knows the toolset changed.
-                        let result = match safety::ring_of(&call.name) {
-                            safety::Ring::Harness => {
-                                format!("[harness mutation] {result}")
-                            }
-                            _ => result,
-                        };
-                        // Circuit breaker: failures trip, successes reset.
-                        if result.starts_with("error:") {
-                            if breaker.record_failure(&call.name) {
-                                eprintln!("circuit breaker tripped: {}", call.name);
-                            }
-                        } else {
-                            breaker.record_success(&call.name);
-                        }
-                        messages.push(ChatMessage::tool_result(result, call.id));
-                    }
-                    safety::GateDecision::Reject => {
-                        let msg = safety::reject_message(&call.name, &call.arguments);
+                // non-interactive mode before they ever run. In
+                // interactive mode the human may override.
+                let gate = safety::check(&call.name, &call.arguments);
+                let mut allowed = matches!(gate, safety::GateDecision::Allow);
+                if !allowed
+                    && let Some(approve) = approver
+                    && approve(&call.name, &call.arguments)
+                {
+                    allowed = true;
+                    eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
+                }
+
+                if allowed {
+                    // Circuit breaker: skip tripped tools entirely.
+                    if breaker.is_tripped(&call.name) {
+                        let msg = safety::CircuitBreaker::tripped_message(&call.name);
                         messages.push(ChatMessage::tool_result(msg, call.id));
+                        continue;
                     }
+                    let result = tools.execute(&call).await?;
+                    // Execution ring: flag harness mutations to the
+                    // model so it knows the toolset changed.
+                    let result = match safety::ring_of(&call.name) {
+                        safety::Ring::Harness => {
+                            format!("[harness mutation] {result}")
+                        }
+                        _ => result,
+                    };
+                    // Circuit breaker: failures trip, successes reset.
+                    if result.starts_with("error:") {
+                        if breaker.record_failure(&call.name) {
+                            eprintln!("circuit breaker tripped: {}", call.name);
+                        }
+                    } else {
+                        breaker.record_success(&call.name);
+                    }
+                    messages.push(ChatMessage::tool_result(result, call.id));
+                } else {
+                    let msg = safety::reject_message(&call.name, &call.arguments);
+                    messages.push(ChatMessage::tool_result(msg, call.id));
                 }
             }
             // Evolution: hot-register any tools the model created this

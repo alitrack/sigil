@@ -7,6 +7,7 @@ mod llm;
 mod lua;
 mod mcp;
 mod memory;
+mod repl;
 mod safety;
 mod tools;
 
@@ -85,6 +86,11 @@ async fn main() -> Result<()> {
             let provider_arc: std::sync::Arc<dyn crate::llm::provider::LlmProvider> =
                 std::sync::Arc::new(provider);
             acp::serve(tools, agent_config, provider_arc).await
+        }
+        _ if repl::should_enter_repl(&sub_prompt) => {
+            // Interactive mode: multi-turn conversation with human
+            // approval for destructive tool calls.
+            repl::run(&provider, &mut tools, &agent_config).await
         }
         _ => {
             let prompt = cli::prompt_from(sub_prompt)?;

@@ -46,7 +46,11 @@ pub async fn run_turn(
     config: &AgentConfig,
     user_prompt: &str,
 ) -> Result<String> {
-    run_turn_with_approver(provider, tools, config, user_prompt, None, None).await
+    let messages = vec![
+        ChatMessage::system(&config.system_prompt),
+        ChatMessage::user(user_prompt),
+    ];
+    run_messages(provider, tools, config, &messages, None, None).await
 }
 
 /// [`run_turn`] with optional interactive approver and stream callback.
@@ -58,8 +62,25 @@ pub async fn run_turn_with_approver(
     approver: Option<&Approver>,
     stream_cb: Option<&StreamCb>,
 ) -> Result<String> {
-    let mut messages = vec![ChatMessage::system(&config.system_prompt)];
-    messages.push(ChatMessage::user(user_prompt));
+    let messages = vec![
+        ChatMessage::system(&config.system_prompt),
+        ChatMessage::user(user_prompt),
+    ];
+    run_messages(provider, tools, config, &messages, approver, stream_cb).await
+}
+
+/// The core agent loop over a pre-built message list
+/// (system prompt + any prior turns + the new user message). The REPL
+/// uses this to keep true multi-turn context across turns and sessions.
+pub async fn run_messages(
+    provider: &dyn LlmProvider,
+    tools: &mut ToolRegistry,
+    config: &AgentConfig,
+    messages: &[ChatMessage],
+    approver: Option<&Approver>,
+    stream_cb: Option<&StreamCb>,
+) -> Result<String> {
+    let mut messages = messages.to_vec();
 
     let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;

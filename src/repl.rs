@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 
-use crate::agent::{AgentConfig, Approver, run_turn_with_approver};
+use crate::agent::{AgentConfig, Approver};
 use crate::llm::provider::LlmProvider;
 use crate::tools::ToolRegistry;
 
@@ -63,17 +63,16 @@ pub async fn run(
     println!("sigil — Rust + LuaJIT coding agent (interactive)");
     println!("Type /help for commands, /quit to exit.\n");
 
-    // Prefix the resumed transcript so the model has conversation context.
-    let context_prefix = if history.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from("(Earlier conversation in this session:\n");
-        for t in &history {
-            s.push_str(&format!("{}: {}\n", t.role, t.text));
+    // True multi-turn context: the message list accumulates across
+    // turns. Resumed sessions load their transcript as real messages
+    // (not a text blob), so the model sees the actual conversation.
+    let mut messages: Vec<crate::llm::ChatMessage> = Vec::new();
+    for t in &history {
+        match t.role.as_str() {
+            "assistant" => messages.push(crate::llm::ChatMessage::assistant(&t.text)),
+            _ => messages.push(crate::llm::ChatMessage::user(&t.text)),
         }
-        s.push_str(")\n\n");
-        s
-    };
+    }
 
     loop {
         eprint!("❯ ");
@@ -117,8 +116,9 @@ pub async fn run(
                 text: line.into(),
             },
         )?;
-        // Turn with interactive approval + live streaming output.
-        let prompt = format!("{context_prefix}{line}");
+        // Turn with interactive approval + live streaming output, over
+        // the accumulated conversation (multi-turn context).
+        messages.push(crate::llm::ChatMessage::user(line));
         let stream_cb = |delta: Option<&str>| {
             match delta {
                 Some(d) => {
@@ -131,11 +131,11 @@ pub async fn run(
                 }
             }
         };
-        let answer = match run_turn_with_approver(
+        let answer = match crate::agent::run_messages(
             provider,
             tools,
             config,
-            &prompt,
+            &messages,
             Some(&approver),
             Some(&stream_cb),
         )
@@ -155,7 +155,8 @@ pub async fn run(
                 text: answer.clone(),
             },
         )?;
-        println!("\n{answer}\n");
+        messages.push(crate::llm::ChatMessage::assistant(&answer));
+        println!();
         let _ = stdout.flush();
     }
     Ok(())

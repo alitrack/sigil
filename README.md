@@ -25,7 +25,7 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 25** — live harness state (edits apply next turn).
+> Status: **Phase 26** — memory lifecycle (write/read/list/prune).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection,
 > self-evolution loop with **version history, rollback that hot-reloads
@@ -33,7 +33,8 @@ no recompile needed.
 > apply on the very next turn, no restart) for every model-writable
 > asset, three-layer safety, MCP client **and server** (tools, progress
 > notifications, resources **and prompts** both ways), ACP server
-> **and client** (cross-process delegation), persistent memory, resumable
+> **and client** (cross-process delegation), persistent memory
+> (**remember/recall/memory_list/memory_delete**), resumable
 > sessions with in-REPL switching and **portable JSON export/import**,
 > sub-agents, streaming output, ratchet regression battery, model-driven
 > harness improvement, skill content inlining, TUI colors, `/tools`
@@ -201,6 +202,7 @@ MCP tool list.
 | **23** ✅ | Rollback hot-reload; version GC; MCP hot-queue drain |
 | **24** ✅ | Session export/import (portable JSON transcripts) |
 | **25** ✅ | Live harness state (edits apply next turn, no restart) |
+| **26** ✅ | Memory lifecycle (remember / recall / memory_list / memory_delete) |
 
 ## Changelog
 

@@ -107,6 +107,13 @@ async fn main() -> Result<()> {
             eprintln!("sigil acp: serving Agent Client Protocol on stdio");
             acp::serve(tools, agent_config, provider_arc).await
         }
+        Some(Command::Mcp) => {
+            eprintln!(
+                "sigil mcp: serving MCP server on stdio ({} tools)",
+                tools.specs().len()
+            );
+            mcp::server::serve(&tools).await
+        }
         _ if repl::should_enter_repl(&sub_prompt) => {
             // Interactive mode: multi-turn conversation with human
             // approval for destructive tool calls.

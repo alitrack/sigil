@@ -22,6 +22,11 @@ use tokio::sync::{Mutex, mpsc};
 #[cfg(test)]
 mod tests;
 
+pub mod server;
+
+#[cfg(test)]
+mod server_tests;
+
 /// A tool discovered on an MCP server.
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {

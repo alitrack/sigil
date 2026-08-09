@@ -65,6 +65,11 @@ pub enum Command {
     /// Serve as an ACP (Agent Client Protocol) server on stdio —
     /// any ACP client (editors, other agents) can drive sigil.
     Acp,
+
+    /// Serve as an MCP (Model Context Protocol) server on stdio —
+    /// expose sigil's tools (bash, files, git, Lua, ...) to any MCP
+    /// client (Claude Desktop, Cursor, other agents).
+    Mcp,
 }
 
 /// The prompt to use: from -p/--prompt, else stdin (pipe mode).

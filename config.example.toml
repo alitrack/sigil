@@ -9,3 +9,10 @@
 [agent]
 # max_steps = 10            # tool-call budget per turn (0 = unlimited)
 # system_prompt = "..."     # optional override of the default system prompt
+
+# MCP client: spawn stdio MCP servers; their tools become
+# mcp_<server>_<tool> in sigil's registry.
+# [[mcp.servers]]
+# name = "echo"
+# command = "python3"
+# args = ["/path/to/echo_server.py"]

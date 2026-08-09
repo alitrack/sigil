@@ -242,6 +242,21 @@ async fn improve_harness_adds_and_lists_skills() {
     let listed = tool.run(&json!({ "action": "list_skills" })).await.unwrap();
     assert!(listed.text.contains("my-skill"));
     assert!(listed.text.contains("badname"));
+    // Description is shown.
+    assert!(listed.text.contains("A reusable procedure"));
+
+    // Add a skill with a dependency → listed with depends_on.
+    let out3 = tool
+        .run(&json!({
+            "action": "add_skill",
+            "name": "dep-skill",
+            "content": "> Dep skill\n> depends_on: my-skill\n\nbody"
+        }))
+        .await
+        .unwrap();
+    assert!(out3.text.contains("dep-skill"));
+    let listed = tool.run(&json!({ "action": "list_skills" })).await.unwrap();
+    assert!(listed.text.contains("depends_on: my-skill"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

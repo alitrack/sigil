@@ -306,21 +306,30 @@ impl Tool for ImproveHarnessTool {
             }
             "list_skills" => {
                 let skills_dir = self.harness_dir.join("skills");
-                let mut names = Vec::new();
-                if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-                    for e in entries.flatten() {
-                        if let Some(n) = e.file_name().to_str() {
-                            names.push(n.to_string());
-                        }
-                    }
+                let skills = crate::harness::load_skills(&skills_dir);
+                let cycles = crate::harness::find_dependency_cycles(&skills);
+                if skills.is_empty() {
+                    return Ok(ToolOutput {
+                        text: "no skills yet".to_string(),
+                    });
                 }
-                names.sort();
-                let text = if names.is_empty() {
-                    "no skills yet".to_string()
-                } else {
-                    names.join("\n")
-                };
-                Ok(ToolOutput { text })
+                let mut lines = Vec::new();
+                for s in &skills {
+                    let dep = if s.depends_on.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  depends_on: {}", s.depends_on.join(", "))
+                    };
+                    lines.push(format!("- {} — {}{}", s.name, s.description, dep));
+                }
+                if !cycles.is_empty() {
+                    let desc: Vec<String> = cycles.iter().map(|c| c.join(" -> ")).collect();
+                    lines.push(String::new());
+                    lines.push(format!("⚠ dependency cycle(s): {}", desc.join("; ")));
+                }
+                Ok(ToolOutput {
+                    text: lines.join("\n"),
+                })
             }
             other => anyhow::bail!("unknown action: {other}"),
         }

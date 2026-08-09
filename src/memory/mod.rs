@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn remember_appends_and_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-mem-rem-{}", std::process::id()));
         let path = dir.join("memory.md");
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn recall_filters() {
-        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-mem-rec-{}", std::process::id()));
         let path = dir.join("memory.md");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn list_numbers_entries() {
-        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-mem-lst-{}", std::process::id()));
         let path = dir.join("memory.md");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn delete_by_index_and_substring() {
-        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sigil-mem-del-{}", std::process::id()));
         let path = dir.join("memory.md");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

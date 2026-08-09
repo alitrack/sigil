@@ -25,6 +25,8 @@ use anyhow::Result;
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// Full file contents (inlined into the prompt when small).
+    pub body: String,
     /// Path to the skill file (for tools that read/edit it).
     #[allow(dead_code)]
     pub path: PathBuf,
@@ -79,7 +81,11 @@ impl Harness {
         })
     }
 
-    /// Render the skill index section for the system prompt.
+    /// Render the skills section for the system prompt.
+    ///
+    /// Small skills (≤ 2 KiB) are inlined in full so the model can act
+    /// on them without an extra read_file round-trip; larger ones stay
+    /// as an index entry (read_file on demand).
     pub fn skills_index(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
@@ -88,7 +94,17 @@ impl Harness {
         for s in &self.skills {
             out.push_str(&format!("- **{}** — {}\n", s.name, s.description));
         }
-        out.push_str("\nTo use a skill, read it with the read_file tool before acting.");
+        out.push_str("\nSkills marked *(inlined below)* are embedded in full ");
+        out.push_str("after this index; read the others with read_file before acting.");
+        out.push('\n');
+        for s in &self.skills {
+            if s.body.len() <= 2 * 1024 {
+                out.push_str(&format!(
+                    "\n<skill name=\"{}\">\n{}\n</skill>\n",
+                    s.name, s.body
+                ));
+            }
+        }
         out
     }
 
@@ -113,17 +129,18 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Description: first line starting with `> ` (blockquote).
-        let description = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| {
-                text.lines()
-                    .find_map(|l| l.trim_start().strip_prefix("> ").map(String::from))
-            })
+        // Read once: full body + description from the `> ` header line.
+        let Some(text) = std::fs::read_to_string(&path).ok() else {
+            continue;
+        };
+        let description = text
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("> ").map(String::from))
             .unwrap_or_else(|| "no description".to_string());
         skills.push(Skill {
             name: stem.to_string(),
             description,
+            body: text,
             path,
         });
     }
@@ -149,3 +166,6 @@ You solve the user's task by calling tools. Prefer the dedicated tools
 After a tool result comes back, either call the next tool or give the
 final answer in plain text. Keep answers concise. Do not call tools after
 you have finished the task."#;
+
+#[cfg(test)]
+mod harness_tests;

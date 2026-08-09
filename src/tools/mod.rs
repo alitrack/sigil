@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use crate::llm::ToolSpec;
 
 pub mod bash;
+pub mod files;
+pub mod git;
 
 /// What a tool returns to the agent loop.
 #[derive(Debug, Clone)]
@@ -47,6 +49,11 @@ impl ToolRegistry {
     pub fn with_native_tools() -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
+        registry.register(Arc::new(files::ReadFileTool));
+        registry.register(Arc::new(files::WriteFileTool));
+        registry.register(Arc::new(git::GitStatusTool));
+        registry.register(Arc::new(git::GitDiffTool));
+        registry.register(Arc::new(git::GitLogTool));
         registry
     }
 

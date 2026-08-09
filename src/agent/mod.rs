@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 
 use crate::llm::provider::{ChatComplete, ChatMessage, ChatRequest, LlmProvider};
+use crate::safety;
 use crate::tools::ToolRegistry;
 
 #[cfg(test)]
@@ -93,8 +94,18 @@ pub async fn run_turn(
                 complete.tool_calls.clone(),
             ));
             for call in complete.tool_calls {
-                let result = tools.execute(&call).await?;
-                messages.push(ChatMessage::tool_result(result, call.id));
+                // Approval gate: reject destructive commands in
+                // non-interactive mode before they ever run.
+                match safety::check(&call.name, &call.arguments) {
+                    safety::GateDecision::Allow => {
+                        let result = tools.execute(&call).await?;
+                        messages.push(ChatMessage::tool_result(result, call.id));
+                    }
+                    safety::GateDecision::Reject => {
+                        let msg = safety::reject_message(&call.name, &call.arguments);
+                        messages.push(ChatMessage::tool_result(msg, call.id));
+                    }
+                }
             }
             continue;
         }

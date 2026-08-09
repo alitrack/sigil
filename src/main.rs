@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod llm;
+mod safety;
 mod tools;
 
 use std::io::Read;
@@ -17,10 +18,11 @@ use crate::tools::ToolRegistry;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::from_env()?.with_overrides(
+    let config = Config::load(cli.config.as_deref())?.with_cli_overrides(
         cli.model.as_deref(),
         cli.base_url.as_deref(),
         cli.api_key.as_deref(),
+        cli.max_steps,
     );
 
     let provider = OpenAiProvider::new(OpenAiConfig {
@@ -40,7 +42,7 @@ async fn main() -> Result<()> {
     let tools = ToolRegistry::with_native_tools();
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
-        max_steps: cli.max_steps,
+        max_steps: config.max_steps,
         system_prompt: config.system_prompt.clone(),
     };
 

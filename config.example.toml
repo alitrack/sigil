@@ -1,0 +1,11 @@
+# sigil configuration — copy to ~/.sigil/config.toml
+# Precedence: CLI flags > env vars (SIGIL_*) > this file > defaults
+
+[llm]
+# model = "deepseek-v4-flash"
+# base_url = "http://127.0.0.1:15722/v1"
+# api_key = "EMPTY"
+
+[agent]
+# max_steps = 10            # tool-call budget per turn (0 = unlimited)
+# system_prompt = "..."     # optional override of the default system prompt

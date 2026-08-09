@@ -48,12 +48,14 @@ pub async fn run(
     let approver = interactive_approver();
     let mut stdout = std::io::stdout();
 
-    // Session: resume an existing one or start fresh.
-    let session_id = match resume {
+    // Session: resume an existing one or start fresh. `session_id`,
+    // `history` and `hist_path` are mutable: `/session <id>` can switch
+    // mid-REPL.
+    let mut session_id = match resume {
         Some(id) => id.to_string(),
         None => crate::session::start(sessions_dir)?,
     };
-    let history = crate::session::load(sessions_dir, &session_id)?;
+    let mut history = crate::session::load(sessions_dir, &session_id)?;
     if !history.is_empty() {
         println!("(resumed session {session_id} — {} turns)", history.len());
     }
@@ -75,7 +77,7 @@ pub async fn run(
     // Line editor: created once so history accumulates within the
     // session; saved history is loaded so arrow keys work across
     // sessions.
-    let hist_path = sessions_dir.join(format!("{session_id}.history"));
+    let mut hist_path = sessions_dir.join(format!("{session_id}.history"));
     let mut editor = match rustyline::DefaultEditor::new() {
         Ok(e) => e,
         Err(e) => {
@@ -101,14 +103,71 @@ pub async fn run(
         match line {
             "/quit" | "/exit" | "/q" => break,
             "/help" | "/h" => {
-                println!("  /tools   list available tools");
-                println!("  /session show this session id");
-                println!("  /quit    exit");
+                println!("  /tools    list available tools");
+                println!("  /session  show this session id");
+                println!("  /sessions list all sessions (or /session <id> to switch)");
+                println!("  /quit     exit");
                 println!("  anything else is sent to the agent");
                 continue;
             }
             "/session" => {
                 println!("  session id: {session_id}");
+                continue;
+            }
+            cmd if cmd.starts_with("/session ") => {
+                // Switch to another session: load its transcript as the
+                // conversation context (like --resume, mid-REPL).
+                let target = cmd.trim_start_matches("/session ").trim();
+                if target.is_empty() {
+                    println!("  usage: /session <id>");
+                    continue;
+                }
+                match crate::session::load(sessions_dir, target) {
+                    Ok(turns) => {
+                        session_id = target.to_string();
+                        history = turns.clone();
+                        messages.clear();
+                        for t in &history {
+                            match t.role.as_str() {
+                                "assistant" => {
+                                    messages.push(crate::llm::ChatMessage::assistant(&t.text))
+                                }
+                                _ => messages.push(crate::llm::ChatMessage::user(&t.text)),
+                            }
+                        }
+                        // Point the line-editor history at the new session.
+                        let new_hist = sessions_dir.join(format!("{session_id}.history"));
+                        let _ = editor.save_history(&hist_path);
+                        hist_path = new_hist.clone();
+                        if let Ok(h) = std::fs::read_to_string(&new_hist) {
+                            for l in h.lines() {
+                                let _ = editor.add_history_entry(l);
+                            }
+                        }
+                        println!(
+                            "  switched to session {session_id} ({} turns)",
+                            history.len()
+                        );
+                    }
+                    Err(e) => println!("  no such session {target}: {e}"),
+                }
+                continue;
+            }
+            "/sessions" => {
+                match crate::session::list(sessions_dir) {
+                    Ok(ids) if ids.is_empty() => println!("  no sessions yet"),
+                    Ok(ids) => {
+                        println!("  {} session(s):", ids.len());
+                        for id in ids {
+                            let turns = crate::session::load(sessions_dir, &id)
+                                .map(|t| t.len())
+                                .unwrap_or(0);
+                            let marker = if id == session_id { " ◀ current" } else { "" };
+                            println!("    {id} — {turns} turns{marker}");
+                        }
+                    }
+                    Err(e) => println!("  error listing sessions: {e}"),
+                }
                 continue;
             }
             "/tools" => {

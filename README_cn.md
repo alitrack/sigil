@@ -23,7 +23,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 32** — 自进化写入的跨进程目录锁。管道模式、
+> 状态：**Phase 33** — ratchet 电池扩到 12 项：ACP 协议 e2e、会话导出/
+> 导入、脚本化工具 schema 加固（模型写坏 schema 时回退安全默认值，不再
+> 400 掉所有 LLM 调用）。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -197,8 +199,24 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **30** ✅ | 技能图视图（list_skills：描述、依赖、环警告） |
 | **31** ✅ | 轮次时间戳 + `session export --since`（按时间过滤转录） |
 | **32** ✅ | 跨进程目录锁（自进化写入加 advisory `.sigil.lock`） |
+| **33** ✅ | Ratchet +2（ACP e2e、会话导出/导入）+ 脚本化工具 schema 加固 |
 
 ## 更新日志
+
+### Phase 33 — 2026-08-10
+- **Ratchet 电池扩到 12 项**：新增 `acp_server_tool_use`（按真实协议驱动
+  `sigil acp`——init → session/new → prompt → 工具调用 → close，断言
+  模型回复）和 `session_export_import`（确定性 CLI 路径：手工构造带时间戳
+  JSONL → 完整导出 → `--since` 过滤 → 导入 → 列表；所有断言必须全中，
+  不涉 LLM）。
+- **Ratchet tools-dir 隔离**：电池现在用独立的 `--tools-dir
+  /tmp/sigil-ratchet-tools` 而非真实 `~/.sigil/tools`。之前模型在早期
+  会话创建的工具会泄漏进每次运行——一个坏 schema 会 400 掉所有 LLM 调用
+  导致整批失败。
+- **脚本化工具 schema 加固**（`LuaTool::new`）：模型写的 `-- schema:`
+  头缺顶层 `"type":"object"` 时回退安全默认值，不再原样广告（否则 LLM
+  提供商会拒绝所有带工具请求）。由 `malformed_schema_falls_back_to_default`
+  + `valid_schema_is_kept` 覆盖。
 
 ### Phase 32 — 2026-08-10
 - **跨进程目录锁**：并发 sigil 实例（REPL + MCP server + 管道任务）现在

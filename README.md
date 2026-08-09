@@ -25,7 +25,9 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 32** — cross-process dir locks for self-evolution writes.
+> Status: **Phase 33** — ratchet battery +12: ACP protocol e2e, session
+> export/import, scripted-tool schema hardening (malformed model-written
+> schemas fall back to the safe default instead of 400-ing every LLM call).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -216,8 +218,27 @@ MCP tool list.
 | **30** ✅ | Skill graph view (list_skills: descriptions, deps, cycle warning) |
 | **31** ✅ | Timestamped turns + `session export --since` (time-filtered transcripts) |
 | **32** ✅ | Cross-process dir locks (advisory `.sigil.lock` on evolution writes) |
+| **33** ✅ | Ratchet +2 (ACP e2e, session export/import) + scripted-tool schema hardening |
 
 ## Changelog
+
+### Phase 33 — 2026-08-10
+- **Ratchet battery grown to 12 tasks**: new `acp_server_tool_use`
+  (drives `sigil acp` over the real protocol — init → session/new →
+  prompt → tool use → close — and asserts the model's reply) and
+  `session_export_import` (deterministic CLI path: hand-built timestamped
+  JSONL → full export → `--since` filter → import → list; every assertion
+  must hold, no LLM involved).
+- **Ratchet tools-dir isolation**: the battery now runs with its own
+  `--tools-dir /tmp/sigil-ratchet-tools` instead of the real
+  `~/.sigil/tools`. Previously, tools the model had created in earlier
+  sessions leaked into every run — a bad persisted schema 400'd every LLM
+  call and failed the whole battery.
+- **Scripted-tool schema hardening** (`LuaTool::new`): a model-written
+  `-- schema:` header missing the top-level `"type":"object"` now falls
+  back to the safe default instead of being advertised verbatim (which
+  made the LLM provider reject every tool-bearing request). Covered by
+  `malformed_schema_falls_back_to_default` + `valid_schema_is_kept`.
 
 ### Phase 32 — 2026-08-10
 - **Cross-process directory locks** for self-evolution writes. Concurrent

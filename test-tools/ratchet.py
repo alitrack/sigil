@@ -22,10 +22,11 @@ EXE = "/mnt/d/wsl2/sigil/target/release/sigil"
 HARNESS = "/tmp/sigil-harness-test"
 TIMEOUT = 180
 WORK = "/tmp/sigil-ratchet-work"
+TOOLS = "/tmp/sigil-ratchet-tools"
 
 
 def run(prompt: str, harness: str = HARNESS, extra: list | None = None) -> str:
-    cmd = [EXE, "--harness-dir", harness, "--max-steps", "10"]
+    cmd = [EXE, "--harness-dir", harness, "--tools-dir", TOOLS, "--max-steps", "10"]
     if extra:
         cmd += extra
     proc = subprocess.run(
@@ -39,7 +40,7 @@ def run_mcp(prompt: str, harness: str = HARNESS) -> str:
     import subprocess as sp
 
     proc = sp.Popen(
-        [EXE, "mcp", "--harness-dir", harness],
+        [EXE, "mcp", "--harness-dir", harness, "--tools-dir", TOOLS],
         stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, text=True,
     )
     assert proc.stdin is not None, "MCP server stdin must be a pipe"
@@ -62,6 +63,120 @@ def run_mcp(prompt: str, harness: str = HARNESS) -> str:
     except Exception:
         pass
     return out
+
+
+def run_acp(prompt: str, harness: str = HARNESS) -> str:
+    """Drive `sigil acp` as a real ACP client: init → session/new →
+    prompt (real LLM, tool use) → collect chunks → close.
+
+    Returns the accumulated agent text (the model's reply). This is the
+    protocol-level twin of `run()` — it exercises the ACP server entry
+    point end to end.
+    """
+    import subprocess as sp
+
+    proc = sp.Popen(
+        [EXE, "acp", "--harness-dir", harness, "--tools-dir", TOOLS],
+        stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL, text=True, bufsize=1,
+    )
+    assert proc.stdin is not None, "ACP server stdin must be a pipe"
+    assert proc.stdout is not None, "ACP server stdout must be a pipe"
+
+    def send(msg):
+        proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+
+    def recv():
+        line = proc.stdout.readline()
+        return None if not line else json.loads(line)
+
+    chunks: list[str] = []
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "agent/initialize",
+              "params": {"protocolVersion": "2025-03-26", "clientCapabilities": {},
+                         "clientInfo": {"name": "ratchet"}}})
+        recv()
+        send({"jsonrpc": "2.0", "id": 2, "method": "agent/session/new",
+              "params": {"cwd": "/mnt/d/wsl2/sigil", "mcpServers": []}})
+        sess = recv()
+        session_id = sess["result"]["sessionId"]
+        send({"jsonrpc": "2.0", "id": 3, "method": "agent/session.prompt",
+              "params": {"sessionId": session_id,
+                         "prompt": [{"type": "text", "text": prompt}]}})
+        deadline = time.time() + TIMEOUT
+        while time.time() < deadline:
+            msg = recv()
+            if msg is None:
+                break
+            if msg.get("id") == 3:
+                break
+            if msg.get("method") == "client/session.update":
+                upd = msg["params"]["update"]
+                if upd.get("sessionUpdate") == "agent_message_chunk":
+                    chunks.append(upd["content"]["text"])
+        try:
+            send({"jsonrpc": "2.0", "id": 4, "method": "agent/session.close",
+                  "params": {"sessionId": session_id}})
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+    return "".join(chunks)
+
+
+def run_session(harness: str = HARNESS) -> str:
+    """Exercise `sigil session export / import / list` end to end — a
+    deterministic CLI path (no LLM): hand-build a timestamped JSONL
+    session, export it (full + --since), import it, list sessions."""
+    import subprocess as sp
+
+    sessions = os.path.join(WORK, "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    sid = "2026-22000-100000-000000000"
+    # Three timestamped turns (Phase 31 format: role/text/ts).
+    turns = [
+        {"role": "user", "text": "early", "ts": "2026-22000-100000-000000000"},
+        {"role": "assistant", "text": "mid", "ts": "2026-22000-120000-000000000"},
+        {"role": "user", "text": "late", "ts": "2026-22000-140000-000000000"},
+    ]
+    with open(os.path.join(sessions, f"{sid}.jsonl"), "w") as f:
+        for t in turns:
+            f.write(json.dumps(t) + "\n")
+
+    out = []
+    base = [EXE, "session", "--sessions-dir", sessions]
+
+    # Full export → archive with all 3 turns.
+    full = os.path.join(WORK, "full.json")
+    r = sp.run(base + ["export", sid, "-o", full], capture_output=True, text=True, timeout=30)
+    out.append(r.stdout + r.stderr)
+    archive = json.load(open(full))
+    out.append(f"turns={len(archive['turns'])} source={archive['source_id']}")
+    # All three turn texts must survive the round trip.
+    texts = [t["text"] for t in archive["turns"]]
+    out.append(f"texts={'/'.join(texts)}")
+
+    # --since filter (Phase 31): only turns at/after the cutoff.
+    since = os.path.join(WORK, "since.json")
+    r = sp.run(base + ["export", sid, "--since", "2026-22000-110000-000000000", "-o", since],
+               capture_output=True, text=True, timeout=30)
+    out.append(r.stdout + r.stderr)
+    archive = json.load(open(since))
+    since_texts = [t["text"] for t in archive["turns"]]
+    out.append(f"since_texts={'/'.join(since_texts)}")
+
+    # Import → brand-new session id, same turns.
+    r = sp.run(base + ["import", full], capture_output=True, text=True, timeout=30)
+    out.append(r.stdout + r.stderr)
+
+    # List → both ids present.
+    r = sp.run(base + ["list"], capture_output=True, text=True, timeout=30)
+    out.append(r.stdout + r.stderr)
+
+    return "\n".join(out)
 
 
 TASKS = [
@@ -122,12 +237,32 @@ TASKS = [
         "assert": ["mcp-ratchet-ok"],
         "special": "mcp",
     },
+    {
+        "name": "acp_server_tool_use",
+        "prompt": "用 bash 工具执行命令 echo acp-ratchet-77，报告输出。",
+        "assert": ["acp-ratchet-77"],
+        "special": "acp",
+    },
+    {
+        "name": "session_export_import",
+        "prompt": "",  # not used — run_session drives the CLI directly
+        "assert": [
+            "texts=early/mid/late",       # full export round-trips all 3 turns
+            "since_texts=mid/late",       # --since drops the early turn
+            "as new session",             # import creates a fresh id
+            "2026-22000-100000-000000000",  # original session still listed
+        ],
+        "special": "session",
+    },
 ]
 
 
 def main() -> int:
-    # Prepare per-task sandboxes.
-    for d in (WORK, HARNESS):
+    # Prepare per-task sandboxes. TOOLS is isolated from the real
+    # ~/.sigil/tools — model-created tools from previous sessions must
+    # never leak into the ratchet (a bad persisted schema would 400
+    # every LLM call, as discovered in Phase 33).
+    for d in (WORK, HARNESS, TOOLS):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
     # Baseline harness for generic tasks.
@@ -156,6 +291,10 @@ def main() -> int:
                 out = run(task["prompt"], extra=["--memory", mem_path])
             elif task.get("special") == "mcp":
                 out = run_mcp(task["prompt"])
+            elif task.get("special") == "acp":
+                out = run_acp(task["prompt"])
+            elif task.get("special") == "session":
+                out = run_session()
             else:
                 out = run(task["prompt"])
         except subprocess.TimeoutExpired:
@@ -163,6 +302,11 @@ def main() -> int:
             failed += 1
             continue
         ok = any(a.lower() in out.lower() for a in task["assert"])
+        if task.get("special") == "session":
+            # Deterministic CLI path — every assertion must hold (the
+            # output is scripted, not LLM prose, so no word-variance
+            # slack is needed).
+            ok = all(a.lower() in out.lower() for a in task["assert"])
         if task.get("special") == "tools":
             ok = "tools" in out.lower() or "no-tools-dir" in out.lower()
         if task.get("special") == "skilldeps":

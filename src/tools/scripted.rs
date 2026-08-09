@@ -74,7 +74,13 @@ impl LuaTool {
                 } else if let Some(rest) = line.strip_prefix("-- schema:")
                     && let Ok(v) = serde_json::from_str::<Value>(rest.trim())
                 {
-                    schema = v;
+                    // A model-written schema must be a JSON object schema;
+                    // a malformed one (e.g. missing the top-level `type`)
+                    // would 400 every LLM call that advertises this tool —
+                    // fall back to the safe default instead.
+                    if v.get("type").and_then(Value::as_str) == Some("object") {
+                        schema = v;
+                    }
                 }
             }
         }
@@ -121,5 +127,49 @@ impl Tool for LuaTool {
         let text = serde_json::from_str::<String>(&text).unwrap_or(text);
 
         Ok(ToolOutput { text })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lua_runtime() -> Arc<Mutex<LuaRuntime>> {
+        Arc::new(Mutex::new(LuaRuntime::new().unwrap()))
+    }
+
+    fn tmp_file(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("sigil-scripted-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn malformed_schema_falls_back_to_default() {
+        // A model-written `-- schema:` missing the top-level `type` must
+        // not leak into the LLM advert (it would 400 every call that
+        // advertises this tool). It falls back to the safe default.
+        let path = tmp_file(
+            "bad_schema.lua",
+            "-- schema: {\"name\":\"greet\",\"parameters\":{\"type\":\"object\"}}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("bad_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(params.get("properties").is_some());
+    }
+
+    #[test]
+    fn valid_schema_is_kept() {
+        let path = tmp_file(
+            "good_schema.lua",
+            "-- schema: {\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("good_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(params.get("properties").is_some());
     }
 }

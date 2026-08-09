@@ -40,7 +40,7 @@ jobs:
         if: matrix.cc != ''
         run: |
           echo "CC_${{ matrix.cc_env }}=${{ matrix.cc }}" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_${{ matrix.cc_env | upper }}_LINKER=${{ matrix.cc }}" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=${{ matrix.cc }}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

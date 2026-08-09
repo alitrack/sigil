@@ -2,16 +2,23 @@
 //! behind one lookup, so the agent loop and the model treat all identically.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use crate::llm::ToolSpec;
+use crate::lua::LuaRuntime;
 
 pub mod bash;
 pub mod files;
 pub mod git;
+pub mod scripted;
+
+#[cfg(test)]
+mod scripted_tests;
 
 /// What a tool returns to the agent loop.
 #[derive(Debug, Clone)]
@@ -46,7 +53,13 @@ impl ToolRegistry {
         self.order.push(name);
     }
 
+    #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
+        Self::with_tools(None)
+    }
+
+    /// Native tools plus any Lua scripted tools found on disk.
+    pub fn with_tools(scripted_dir: Option<&Path>) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
         registry.register(Arc::new(files::ReadFileTool));
@@ -54,7 +67,24 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitStatusTool));
         registry.register(Arc::new(git::GitDiffTool));
         registry.register(Arc::new(git::GitLogTool));
+        if let Some(dir) = scripted_dir {
+            registry.register_scripted(dir);
+        }
         registry
+    }
+
+    /// Register Lua scripted tools found in `dir`.
+    pub fn register_scripted(&mut self, dir: &Path) {
+        let lua = Arc::new(Mutex::new(LuaRuntime::new().expect("lua runtime init")));
+        for path in scripted::discover(dir) {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match scripted::LuaTool::new(stem, &path, lua.clone()) {
+                Ok(tool) => self.register(Arc::new(tool)),
+                Err(e) => eprintln!("warning: skipping scripted tool {stem}: {e}"),
+            }
+        }
     }
 
     /// Tool specs advertised to the model, in registration order.

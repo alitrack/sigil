@@ -27,4 +27,8 @@ pub struct Cli {
     /// Config file (default: ~/.sigil/config.toml).
     #[arg(long)]
     pub config: Option<String>,
+
+    /// Directory with Lua scripted tools (default: ~/.sigil/tools/).
+    #[arg(long)]
+    pub tools_dir: Option<String>,
 }

@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod llm;
+mod lua;
 mod safety;
 mod tools;
 
@@ -13,7 +14,7 @@ use clap::Parser;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::llm::openai::{OpenAiConfig, OpenAiProvider};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, scripted};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,7 +40,12 @@ async fn main() -> Result<()> {
         anyhow::bail!("no prompt: pass -p/--prompt or pipe stdin");
     }
 
-    let tools = ToolRegistry::with_native_tools();
+    let tools_dir = cli
+        .tools_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(scripted::default_tools_dir);
+    let tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
         max_steps: config.max_steps,

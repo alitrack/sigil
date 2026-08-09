@@ -136,7 +136,25 @@ async fn main() -> Result<()> {
                 "sigil mcp: serving MCP server on stdio ({} tools)",
                 tools.specs().len()
             );
-            mcp::server::serve(&tools).await
+            // Expose the harness as read-only MCP resources: the
+            // system prompt plus every skill, so MCP clients (Claude
+            // Desktop, Cursor, ...) can read sigil's instruction layer.
+            let mut resources: Vec<mcp::server::Resource> = Vec::new();
+            resources.push(mcp::server::Resource {
+                uri: "sigil://system-prompt".into(),
+                name: "sigil system prompt".into(),
+                description: "sigil's harness system prompt (editable via improve_harness)".into(),
+                content: harness.system_prompt.clone(),
+            });
+            for s in &harness.skills {
+                resources.push(mcp::server::Resource {
+                    uri: format!("sigil://skills/{}", s.name),
+                    name: format!("skill: {}", s.name),
+                    description: s.description.clone(),
+                    content: s.body.clone(),
+                });
+            }
+            mcp::server::serve(&tools, &resources).await
         }
         _ if repl::should_enter_repl(&sub_prompt) => {
             // Interactive mode: multi-turn conversation with human

@@ -13,13 +13,14 @@ fn server_frame_shape() {
         "id": 1,
         "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {}, "progress": {} },
+            "capabilities": { "tools": {}, "progress": {}, "resources": {} },
             "serverInfo": { "name": "sigil", "version": "0.1.0" }
         }
     });
     assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
     assert!(init["result"]["capabilities"]["tools"].is_object());
     assert!(init["result"]["capabilities"]["progress"].is_object());
+    assert!(init["result"]["capabilities"]["resources"].is_object());
 
     // tools/list result envelope: { tools: [...] }.
     let list = json!({
@@ -59,11 +60,55 @@ fn server_identifies_as_sigil() {
         "id": 1,
         "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {}, "progress": {} },
+            "capabilities": { "tools": {}, "progress": {}, "resources": {} },
             "serverInfo": { "name": "sigil", "version": "0.1.0" }
         }
     });
     assert_eq!(init["result"]["serverInfo"]["name"], "sigil");
+}
+
+/// Resources envelope shapes (list + read).
+#[test]
+fn resources_frame_shapes() {
+    // resources/list result: { resources: [{uri,name,description,mimeType}] }.
+    let list = json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "result": {
+            "resources": [{
+                "uri": "sigil://system-prompt",
+                "name": "sigil system prompt",
+                "description": "harness prompt",
+                "mimeType": "text/markdown"
+            }]
+        }
+    });
+    assert_eq!(
+        list["result"]["resources"][0]["uri"],
+        "sigil://system-prompt"
+    );
+
+    // resources/read result: { contents: [{uri,mimeType,text}] }.
+    let read = json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "result": {
+            "contents": [{
+                "uri": "sigil://skills/ffi",
+                "mimeType": "text/markdown",
+                "text": "> ffi skill\n..."
+            }]
+        }
+    });
+    assert!(read["result"]["contents"][0]["text"].is_string());
+
+    // resources/read error: -32002 resource not found.
+    let err = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "error": { "code": -32002, "message": "resource not found: x" }
+    });
+    assert_eq!(err["error"]["code"], -32002);
 }
 
 /// Progress notification frame shape (sent around tools/call).

@@ -13,10 +13,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::llm::ToolCall;
 use crate::tools::ToolRegistry;
 
+/// A read-only resource exposed via MCP `resources/*` (e.g. harness
+/// skills, the system prompt). URI, human name, description, content.
+#[derive(Debug, Clone)]
+pub struct Resource {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
 /// Serve MCP on stdin/stdout until EOF. `tools` is the registry whose
 /// tools get exposed; a shallow clone is taken so hot-registered tools
 /// (created by evolution mid-session) show up on subsequent tools/list.
-pub async fn serve(tools: &ToolRegistry) -> Result<()> {
+/// `resources` (harness skills etc.) are exposed via resources/list and
+/// resources/read.
+pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
     let registry = tools.clone_shallow();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -42,7 +54,7 @@ pub async fn serve(tools: &ToolRegistry) -> Result<()> {
                     "id": id,
                     "result": {
                         "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {}, "progress": {} },
+                        "capabilities": { "tools": {}, "progress": {}, "resources": {} },
                         "serverInfo": { "name": "sigil", "version": "0.1.0" }
                     }
                 });
@@ -69,6 +81,58 @@ pub async fn serve(tools: &ToolRegistry) -> Result<()> {
                     "result": { "tools": tool_list }
                 });
                 write_frame(&mut stdout, &resp).await?;
+            }
+            "resources/list" => {
+                let list: Vec<Value> = resources
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "uri": r.uri,
+                            "name": r.name,
+                            "description": r.description,
+                            "mimeType": "text/markdown",
+                        })
+                    })
+                    .collect();
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "resources": list }
+                });
+                write_frame(&mut stdout, &resp).await?;
+            }
+            "resources/read" => {
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match resources.iter().find(|r| r.uri == uri) {
+                    Some(r) => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "contents": [{
+                                    "uri": r.uri,
+                                    "mimeType": "text/markdown",
+                                    "text": r.content,
+                                }]
+                            }
+                        });
+                        write_frame(&mut stdout, &resp).await?;
+                    }
+                    None => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32002,
+                                "message": format!("resource not found: {uri}")
+                            }
+                        });
+                        write_frame(&mut stdout, &resp).await?;
+                    }
+                }
             }
             "tools/call" => {
                 let name = params

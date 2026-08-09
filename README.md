@@ -25,7 +25,7 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 23** — rollback hot-reload + version GC.
+> Status: **Phase 24** — portable session export/import.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection,
 > self-evolution loop with **version history, rollback that hot-reloads
@@ -33,10 +33,10 @@ no recompile needed.
 > three-layer safety, MCP client **and server** (tools, progress
 > notifications, resources **and prompts** both ways), ACP server
 > **and client** (cross-process delegation), persistent memory, resumable
-> sessions with in-REPL switching, sub-agents, streaming output, ratchet
-> regression battery, model-driven harness improvement, skill content
-> inlining, TUI colors, `/tools` search, and a diagnostic `doctor`
-> subcommand — all end to end.
+> sessions with in-REPL switching and **portable JSON export/import**,
+> sub-agents, streaming output, ratchet regression battery, model-driven
+> harness improvement, skill content inlining, TUI colors, `/tools`
+> search, and a diagnostic `doctor` subcommand — all end to end.
 
 ## Quick start
 
@@ -198,6 +198,7 @@ MCP tool list.
 | **21** ✅ | MCP prompts (templates both ways) |
 | **22** ✅ | Version library — reversible self-evolution (rollback) |
 | **23** ✅ | Rollback hot-reload; version GC; MCP hot-queue drain |
+| **24** ✅ | Session export/import (portable JSON transcripts) |
 
 ## Changelog
 

@@ -47,8 +47,6 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let approver = interactive_approver();
     let mut stdout = std::io::stdout();
-    let mut stdin = std::io::stdin().lock();
-    let mut buf = String::new();
 
     // Session: resume an existing one or start fresh.
     let session_id = match resume {
@@ -74,16 +72,29 @@ pub async fn run(
         }
     }
 
-    loop {
-        eprint!("❯ ");
-        let _ = std::io::stderr().flush();
-        buf.clear();
-        let n = stdin.read_line(&mut buf)?;
-        if n == 0 {
-            println!();
-            break; // EOF
+    // Line editor: created once so history accumulates within the
+    // session; saved history is loaded so arrow keys work across
+    // sessions.
+    let hist_path = sessions_dir.join(format!("{session_id}.history"));
+    let mut editor = match rustyline::DefaultEditor::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("✗ line editor error: {e}");
+            return Ok(());
         }
-        let line = buf.trim();
+    };
+    if let Ok(h) = std::fs::read_to_string(&hist_path) {
+        for l in h.lines() {
+            let _ = editor.add_history_entry(l);
+        }
+    }
+
+    loop {
+        let Ok(line) = editor.readline("❯ ") else {
+            println!();
+            break; // EOF (Ctrl-D) or Ctrl-C
+        };
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
@@ -116,6 +127,8 @@ pub async fn run(
                 text: line.into(),
             },
         )?;
+        let _ = editor.add_history_entry(line);
+        let _ = editor.save_history(&hist_path);
         // Turn with interactive approval + live streaming output, over
         // the accumulated conversation (multi-turn context).
         messages.push(crate::llm::ChatMessage::user(line));

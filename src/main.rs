@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod cli;
 mod config;
+mod doctor;
 mod harness;
 mod llm;
 mod lua;
@@ -31,6 +32,13 @@ async fn main() -> Result<()> {
         cli.api_key.as_deref(),
         cli.max_steps,
     );
+
+    // `sigil doctor` runs before any provider/tooling is built —
+    // diagnostics must not depend on a working LLM endpoint.
+    if matches!(cli.command, Some(Command::Doctor)) {
+        let code = doctor::run(&config, &cli).await?;
+        std::process::exit(code);
+    }
 
     let provider = OpenAiProvider::new(OpenAiConfig {
         base_url: config.base_url.clone(),

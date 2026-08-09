@@ -70,6 +70,10 @@ pub enum Command {
     /// expose sigil's tools (bash, files, git, Lua, ...) to any MCP
     /// client (Claude Desktop, Cursor, other agents).
     Mcp,
+
+    /// Run environment diagnostics: config, endpoint, harness, tools,
+    /// memory, sessions, git. Exit 0 ok / 1 warnings / 2 failures.
+    Doctor,
 }
 
 /// The prompt to use: from -p/--prompt, else stdin (pipe mode).

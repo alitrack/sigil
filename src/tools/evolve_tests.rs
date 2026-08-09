@@ -18,13 +18,11 @@ fn fresh_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn make_tool(
-    dir: std::path::PathBuf,
-) -> (
-    CreateLuaToolTool,
-    std::sync::Arc<std::sync::Mutex<Vec<(String, std::path::PathBuf)>>>,
-) {
-    let queue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+/// Hot-queue alias (matches ToolRegistry's).
+type HotQueue = std::sync::Arc<std::sync::Mutex<Vec<(String, std::path::PathBuf)>>>;
+
+fn make_tool(dir: std::path::PathBuf) -> (CreateLuaToolTool, HotQueue) {
+    let queue = HotQueue::default();
     let q = queue.clone();
     (
         CreateLuaToolTool {
@@ -111,7 +109,7 @@ async fn improve_harness_edits_prompt() {
 async fn improve_harness_adds_and_lists_skills() {
     let dir = fresh_dir("ahe-skill");
     let harness = dir.join("harness");
-    std::fs::create_dir_all(&harness.join("skills")).unwrap();
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),

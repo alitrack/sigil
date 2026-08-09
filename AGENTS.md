@@ -1,10 +1,12 @@
 # AGENTS.md — Work Contract for AI Agents
 
 sigil is a Rust + LuaJIT coding agent with a self-evolving harness
-(Phase 0-9 complete: pipe mode, interactive REPL, scripted LuaJIT tools
-with real FFI, self-evolution loop, three-layer safety, MCP client **and
-server**, ACP server, persistent memory, resumable sessions with true
-multi-turn context, sub-agents, streaming output, ratchet tests). This
+(Phase 0-13 complete: pipe mode, interactive REPL with true multi-turn
+context, scripted LuaJIT tools with real FFI, self-evolution loop
+(create_lua_tool + improve_harness), skill content inlining, three-layer
+safety, MCP client **and server**, ACP server **and client**
+(cross-process delegation), persistent memory, resumable sessions with
+in-REPL switching, sub-agents, streaming output, ratchet tests). This
 file tells agent tooling how to work here without breaking things.
 
 ## Build & Test
@@ -12,7 +14,7 @@ file tells agent tooling how to work here without breaking things.
 ```bash
 cargo build                # debug
 cargo build --release      # release (strip + lto, single binary)
-cargo test                 # unit tests (39: agent, safety, lua, evolve, mcp, session, acp, ...)
+cargo test                 # unit tests (45: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
 cargo fmt -- --check       # must be zero diff
 cargo clippy --all-targets -- -D warnings   # must be zero warnings
 ```
@@ -39,6 +41,7 @@ src/
 ├── session.rs       # JSONL session store (~/.sigil/sessions/), --resume
 ├── safety/mod.rs    # approval gate: destructive-command detection; CircuitBreaker
 ├── harness/mod.rs   # bundle: system_prompt.md + skills/ from ~/.sigil/harness/
+│   └── harness_tests.rs  # skill inlining (small inline / large index-only)
 ├── llm/
 │   ├── mod.rs       # re-exports the provider surface
 │   ├── provider.rs  # LlmProvider trait + ChatRequest/ChatMessage/ToolSpec/ToolCall
@@ -48,16 +51,20 @@ src/
 ├── mcp/
 │   ├── mod.rs       # MCP client (stdio spawn, env_clear, tools discovery)
 │   ├── server.rs    # MCP server mode (sigil mcp): expose registry to clients
-├── acp/mod.rs       # ACP server mode (sigil acp): handle_message + serve
+├── acp/
+│   ├── mod.rs       # ACP server mode (sigil acp): handle_message + serve
+│   ├── client.rs    # ACP client: spawn external ACP server, prompt, collect reply
+│   └── client_tests.rs  # client against test-tools/fake_acp_server.py
 └── tools/
     ├── mod.rs       # Tool trait + ToolRegistry (unified lookup, hot registration)
     ├── bash.rs      # bash tool
     ├── files.rs     # read_file / write_file
     ├── git.rs       # git_status / git_diff / git_log (read-only)
     ├── scripted.rs  # Lua scripted tools from ~/.sigil/tools/ (*.lua + manifest)
-    ├── evolve.rs    # create_lua_tool: model writes Lua tools at runtime, hot-registered
+    ├── evolve.rs    # create_lua_tool + improve_harness (AHE: tools + instruction layer)
     ├── memory.rs    # remember / recall tools
     ├── mcp.rs       # MCP-backed tools (mcp_<server>_<tool>)
+    ├── acp.rs       # acp_call: cross-process delegation to an external ACP server
     └── delegate.rs  # delegate: sub-agent with own tool loop
 ```
 
@@ -73,6 +80,11 @@ Key contracts:
   backend.
 - `run_messages` is the core loop over a pre-built message list; the REPL
   uses it to keep true multi-turn context across turns and sessions.
+- `Harness::full_system_prompt` inlines small skills (≤ 2 KiB) directly
+  into the prompt (`<skill name=...>` blocks) so the model uses them with
+  zero tool calls; larger skills stay index-only (read_file on demand).
+- `AcpClient` holds the spawned child for the session lifetime —
+  `kill_on_drop` + early drop kills the child mid-protocol (BrokenPipe).
 
 ## Key Patterns
 

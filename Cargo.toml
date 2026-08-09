@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.5"
 dirs = "6.0.0"
 futures-util = "0.3.33"
 mlua = { version = "0.11", features = ["luajit", "vendored", "serialize", "send"] }

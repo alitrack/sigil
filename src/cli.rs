@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 /// sigil — a Rust + LuaJIT coding agent with a self-evolving harness.
 #[derive(Parser, Debug)]
@@ -74,6 +74,13 @@ pub enum Command {
     /// Run environment diagnostics: config, endpoint, harness, tools,
     /// memory, sessions, git. Exit 0 ok / 1 warnings / 2 failures.
     Doctor,
+
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell).
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// The prompt to use: from -p/--prompt, else stdin (pipe mode).
@@ -88,4 +95,11 @@ pub fn prompt_from(sub_prompt: Option<String>) -> anyhow::Result<String> {
         anyhow::bail!("no prompt: pass -p/--prompt or pipe stdin");
     }
     Ok(buf)
+}
+
+/// Generate shell completions to stdout.
+pub fn print_completions(shell: clap_complete::Shell) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }

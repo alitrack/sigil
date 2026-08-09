@@ -187,6 +187,15 @@ MCP tool list.
 | **15** ✅ | `sigil doctor` environment self-check |
 | **16** ✅ | Doctor LuaJIT/FFI check; global CLI args after subcommands |
 
+## Changelog
+
+### v0.1.0 — 2026-08-09
+First tagged release. Full agent core: pipe / REPL / ACP / MCP modes,
+vendored LuaJIT with real FFI, self-evolution (Lua tools + harness
+instruction layer), three-layer safety, sessions with true multi-turn
+context, sub-agent delegation, streaming, ratchet tests, `sigil doctor`,
+shell completions, 48 unit tests.
+
 ## Development
 
 Rust 2024, single binary. `tokio`, `reqwest` (rustls — no OpenSSL link

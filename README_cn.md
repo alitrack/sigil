@@ -172,6 +172,14 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **15** ✅ | `sigil doctor` 环境自检 |
 | **16** ✅ | doctor LuaJIT/FFI 检查；子命令后全局参数 |
 
+## 更新日志
+
+### v0.1.0 — 2026-08-09
+首个正式发布版本。完整 agent 核心：管道 / REPL / ACP / MCP 模式、
+vendored LuaJIT 真实 FFI、自进化（Lua 工具 + harness 指令层）、
+三层 safety、真正多轮上下文的会话、子代理委托、流式输出、
+ratchet 测试、`sigil doctor`、shell 补全、48 个单元测试。
+
 ## 开发
 
 Rust 2024，单二进制。`tokio`、`reqwest`（rustls — 无 OpenSSL 链接依赖）、

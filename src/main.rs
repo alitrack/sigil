@@ -26,6 +26,13 @@ use crate::tools::{ToolRegistry, scripted};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // `sigil completions <shell>` needs no config, env, or provider.
+    if let Some(Command::Completions { shell }) = &cli.command {
+        cli::print_completions(*shell);
+        return Ok(());
+    }
+
     let config = Config::load(cli.config.as_deref())?.with_cli_overrides(
         cli.model.as_deref(),
         cli.base_url.as_deref(),

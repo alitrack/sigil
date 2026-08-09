@@ -25,12 +25,13 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 12** — ACP client (cross-process delegation). Pipe
+> Status: **Phase 16** — `sigil doctor` environment self-check. Pipe
 > mode, scripted Lua tools with real FFI, self-evolution loop, three-layer
-> safety, MCP client **and server**, ACP server **and client**, persistent
-> memory, interactive REPL with true multi-turn context, resumable
-> sessions, sub-agents, streaming output, ratchet tests.
-> model-driven harness improvement all work end to end.
+> safety, MCP client **and server**, ACP server **and client** (cross-process
+> delegation), persistent memory, resumable sessions with in-REPL
+> switching, sub-agents, streaming output, ratchet regression battery,
+> model-driven harness improvement, skill content inlining, TUI colors,
+> `/tools` search, and a diagnostic `doctor` subcommand — all end to end.
 
 ## Quick start
 
@@ -181,6 +182,10 @@ MCP tool list.
 | **10** ✅ | `improve_harness` — instruction-layer self-evolution |
 | **11** ✅ | In-REPL session switching (`/sessions`, `/session <id>`) |
 | **12** ✅ | ACP client + `acp_call` — cross-process delegation |
+| **13** ✅ | Skill content inlining (small skills embedded in the prompt) |
+| **14** ✅ | TUI colors + `/tools <query>` search |
+| **15** ✅ | `sigil doctor` environment self-check |
+| **16** ✅ | Doctor LuaJIT/FFI check; global CLI args after subcommands |
 
 ## Development
 

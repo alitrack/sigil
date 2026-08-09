@@ -1,6 +1,6 @@
-//! Approval-gate unit tests: destructive commands rejected, safe ones allowed.
+//! Safety unit tests: gate decisions, rings, circuit breaker.
 
-use crate::safety::{GateDecision, check};
+use crate::safety::{CircuitBreaker, GateDecision, Ring, check, ring_of};
 use serde_json::json;
 
 #[cfg(test)]
@@ -62,5 +62,49 @@ mod gate_tests {
             check("write_file", &json!({"path": "x", "content": "y"})),
             GateDecision::Allow
         );
+    }
+
+    #[test]
+    fn classifies_execution_rings() {
+        assert_eq!(ring_of("read_file"), Ring::ReadOnly);
+        assert_eq!(ring_of("git_status"), Ring::ReadOnly);
+        assert_eq!(ring_of("create_lua_tool"), Ring::Harness);
+        assert_eq!(ring_of("bash"), Ring::Workspace);
+        assert_eq!(ring_of("write_file"), Ring::Workspace);
+    }
+
+    #[test]
+    fn circuit_breaker_trips_after_three_failures() {
+        let cb = CircuitBreaker::new();
+        assert!(!cb.is_tripped("bash"));
+        assert!(!cb.record_failure("bash"));
+        assert!(!cb.record_failure("bash"));
+        assert!(cb.record_failure("bash"));
+        assert!(cb.is_tripped("bash"));
+    }
+
+    #[test]
+    fn circuit_breaker_resets_on_success() {
+        let cb = CircuitBreaker::new();
+        cb.record_failure("bash");
+        cb.record_failure("bash");
+        cb.record_success("bash");
+        assert!(!cb.is_tripped("bash"));
+        cb.record_failure("bash");
+        cb.record_failure("bash");
+        cb.record_failure("bash");
+        assert!(cb.is_tripped("bash"));
+        cb.record_success("bash");
+        assert!(!cb.is_tripped("bash"));
+    }
+
+    #[test]
+    fn circuit_breaker_is_per_tool() {
+        let cb = CircuitBreaker::new();
+        cb.record_failure("bash");
+        cb.record_failure("bash");
+        cb.record_failure("bash");
+        assert!(cb.is_tripped("bash"));
+        assert!(!cb.is_tripped("read_file"));
     }
 }

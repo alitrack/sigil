@@ -1,15 +1,18 @@
-//! Approval gate — the safety model.
+//! Safety model — three layers, borrowed from forge's safety module:
 //!
-//! Phase 1: dangerous-command detection + non-interactive rejection.
-//! The agent loop checks each tool call against this gate before
-//! execution:
-//!   - Safe (read-only) commands: run freely.
-//!   - Mutating commands: run (write tools are the agent's job), but
-//!     truly destructive commands are rejected in non-interactive
-//!     (pipe) mode, where no human can approve them.
-//!
-//! Interactive approval (prompt-based, like Hermes' approval gate) lands
-//! with the TUI in a later phase.
+//! 1. **Approval gate** (activegate): destructive-command detection +
+//!    non-interactive rejection. Every tool call passes through here.
+//! 2. **Circuit breaker** (circuit_breaker): a tool that fails repeatedly
+//!    in a row gets tripped — further calls are short-circuited with a
+//!    clear message instead of burning more turns on a broken tool.
+//! 3. **Execution ring** (execution_ring): tools are classified by how
+//!    much they can touch. Read-only tools (read_file, git_status, ...)
+//!    run freely; mutating tools (write_file, bash) run but are gated;
+//!    ring 3 (escape) tools like create_lua_tool run but their output
+//!    is flagged to the model as "harness mutation".
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::tools::ToolOutput;
 
@@ -25,7 +28,28 @@ pub enum GateDecision {
     Reject,
 }
 
-/// Classify a tool call and decide.
+/// Execution ring: how much a tool can touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ring {
+    /// Read-only inspection — always allowed (read_file, git_status, ...).
+    ReadOnly,
+    /// Mutates the workspace but is the agent's job (write_file, bash).
+    Workspace,
+    /// Mutates the harness itself (create_lua_tool) — allowed, but the
+    /// model is told the mutation happened.
+    Harness,
+}
+
+/// Classify a tool name into an execution ring.
+pub fn ring_of(name: &str) -> Ring {
+    match name {
+        "read_file" | "git_status" | "git_diff" | "git_log" => Ring::ReadOnly,
+        "create_lua_tool" => Ring::Harness,
+        _ => Ring::Workspace,
+    }
+}
+
+/// Classify a tool call and decide (approval gate).
 pub fn check(call_name: &str, arguments: &serde_json::Value) -> GateDecision {
     match call_name {
         "bash" => check_bash(arguments),
@@ -104,6 +128,53 @@ pub fn reject_message(call_name: &str, arguments: &serde_json::Value) -> String 
          confirmation. Refactor the task to avoid destructive operations, or \
          run the command yourself outside sigil."
     )
+}
+
+/// Circuit breaker: trip a tool after N consecutive failures.
+#[derive(Debug, Default)]
+pub struct CircuitBreaker {
+    failures: Mutex<HashMap<String, u32>>,
+}
+
+impl CircuitBreaker {
+    pub const TRIP_AFTER: u32 = 3;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Is this tool currently tripped (open)?
+    pub fn is_tripped(&self, tool: &str) -> bool {
+        self.failures
+            .lock()
+            .map(|f| f.get(tool).copied().unwrap_or(0) >= Self::TRIP_AFTER)
+            .unwrap_or(false)
+    }
+
+    /// Record a tool failure; returns true when it just tripped.
+    pub fn record_failure(&self, tool: &str) -> bool {
+        let mut f = self.failures.lock().unwrap();
+        let n = f.entry(tool.to_string()).or_insert(0);
+        *n += 1;
+        *n >= Self::TRIP_AFTER
+    }
+
+    /// Record a success (reset the counter).
+    pub fn record_success(&self, tool: &str) {
+        if let Ok(mut f) = self.failures.lock() {
+            f.remove(tool);
+        }
+    }
+
+    /// Tripped message shown to the model.
+    pub fn tripped_message(tool: &str) -> String {
+        format!(
+            "CIRCUIT BREAKER: tool `{tool}` failed {} times in a row and was \
+             automatically tripped. Fix the underlying issue (or the tool's \
+             inputs) before calling it again; do not retry blindly.",
+            Self::TRIP_AFTER
+        )
+    }
 }
 
 /// Gate-aware tool output wrapper.

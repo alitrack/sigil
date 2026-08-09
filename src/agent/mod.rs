@@ -39,6 +39,7 @@ pub async fn run_turn(
     let mut messages = vec![ChatMessage::system(&config.system_prompt)];
     messages.push(ChatMessage::user(user_prompt));
 
+    let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;
 
     loop {
@@ -101,7 +102,29 @@ pub async fn run_turn(
                 // non-interactive mode before they ever run.
                 match safety::check(&call.name, &call.arguments) {
                     safety::GateDecision::Allow => {
+                        // Circuit breaker: skip tripped tools entirely.
+                        if breaker.is_tripped(&call.name) {
+                            let msg = safety::CircuitBreaker::tripped_message(&call.name);
+                            messages.push(ChatMessage::tool_result(msg, call.id));
+                            continue;
+                        }
                         let result = tools.execute(&call).await?;
+                        // Execution ring: flag harness mutations to the
+                        // model so it knows the toolset changed.
+                        let result = match safety::ring_of(&call.name) {
+                            safety::Ring::Harness => {
+                                format!("[harness mutation] {result}")
+                            }
+                            _ => result,
+                        };
+                        // Circuit breaker: failures trip, successes reset.
+                        if result.starts_with("error:") {
+                            if breaker.record_failure(&call.name) {
+                                eprintln!("circuit breaker tripped: {}", call.name);
+                            }
+                        } else {
+                            breaker.record_success(&call.name);
+                        }
                         messages.push(ChatMessage::tool_result(result, call.id));
                     }
                     safety::GateDecision::Reject => {

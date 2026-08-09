@@ -23,7 +23,7 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 27** — 技能依赖（depends_on 闭包）。管道模式、
+> 状态：**Phase 28** — ratchet 回归电池扩展（10 任务）。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）、**带版本历史、会话内热回滚、GC 和实时
@@ -32,7 +32,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 > 进度通知、双向 resources **和 prompts**）、ACP server **和 client**
 > （跨进程委托）、持久 memory（**remember / recall / memory_list /
 > memory_delete**）、可续会话（含 **JSON 导出/导入**）、子代理委托、
-> 流式输出、ratchet 回归电池、模型驱动 harness 改进、技能内容内联、
+> 流式输出、**10 任务 ratchet 回归电池**（files/bash/git、记忆生命周期、
+> 技能依赖、live prompt 编辑、工具创建、MCP server——全部对真实
+> 二进制和 LLM 运行）、模型驱动 harness 改进、技能内容内联、
 > TUI 彩色输出、`/tools` 搜索、`sigil doctor` 环境自检、shell 补全
 > ——全部端到端可用。
 
@@ -188,6 +190,7 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **25** ✅ | 实时 harness 状态（编辑下一轮生效，无需重启） |
 | **26** ✅ | 记忆生命周期（remember / recall / memory_list / memory_delete） |
 | **27** ✅ | 技能依赖（`> depends_on:` 头部，闭包内联） |
+| **28** ✅ | ratchet 电池 4 → 10（记忆、技能依赖、live prompt、MCP） |
 
 ## 更新日志
 

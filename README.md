@@ -25,7 +25,7 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 27** — skill dependencies (depends_on closure).
+> Status: **Phase 28** — ratchet battery expanded (10 tasks).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -38,9 +38,12 @@ no recompile needed.
 > (cross-process delegation), persistent memory
 > (**remember/recall/memory_list/memory_delete**), resumable
 > sessions with in-REPL switching and **portable JSON export/import**,
-> sub-agents, streaming output, ratchet regression battery, model-driven
-> harness improvement, skill content inlining, TUI colors, `/tools`
-> search, and a diagnostic `doctor` subcommand — all end to end.
+> sub-agents, streaming output, a **10-task ratchet regression
+> battery** (files/bash/git, memory lifecycle, skill deps, live prompt
+> edits, tool creation, MCP server — all against the real binary and
+> LLM), model-driven harness improvement, skill content inlining, TUI
+> colors, `/tools` search, and a diagnostic `doctor` subcommand — all
+> end to end.
 
 ## Quick start
 
@@ -206,6 +209,7 @@ MCP tool list.
 | **25** ✅ | Live harness state (edits apply next turn, no restart) |
 | **26** ✅ | Memory lifecycle (remember / recall / memory_list / memory_delete) |
 | **27** ✅ | Skill dependencies (`> depends_on:` header, closure inlining) |
+| **28** ✅ | Ratchet battery 4 → 10 (memory, skill deps, live prompt, MCP) |
 
 ## Changelog
 

@@ -114,11 +114,19 @@ impl ToolRegistry {
 
     #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
-        Self::with_tools(None, None)
+        Self::with_tools(None, None, None)
     }
 
     /// Native tools plus any Lua scripted tools found on disk.
-    pub fn with_tools(scripted_dir: Option<&Path>, harness_dir: Option<&Path>) -> Self {
+    ///
+    /// `prompt_state` is the live harness state shared with the agent
+    /// loop; evolution tools update it so harness edits apply without
+    /// a restart. Pass `None` (tests) to use an isolated state.
+    pub fn with_tools(
+        scripted_dir: Option<&Path>,
+        harness_dir: Option<&Path>,
+        prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
+    ) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
         registry.register(Arc::new(files::ReadFileTool));
@@ -154,6 +162,7 @@ impl ToolRegistry {
             .unwrap_or_else(harness::default_harness_dir);
         registry.register(Arc::new(evolve::ImproveHarnessTool {
             harness_dir: harness_dir.clone(),
+            prompt_state: prompt_state.clone(),
         }));
         // Version library: list & roll back model-written assets.
         registry.register(Arc::new(versions::SkillHistoryTool {
@@ -168,6 +177,7 @@ impl ToolRegistry {
                     q.push(HotOp::register(name, path));
                 }
             })),
+            prompt_state: prompt_state.clone(),
         }));
         registry.register(Arc::new(versions::VersionsGcTool {
             harness_dir,

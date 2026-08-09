@@ -44,6 +44,16 @@ pub struct Harness {
     pub skills_dir: PathBuf,
 }
 
+/// Live prompt state shared between the agent loop and the evolution
+/// tools. `improve_harness` / `skill_rollback` write to disk *and*
+/// update this, so the running agent sees the new system prompt /
+/// skills on the very next turn without a restart.
+#[derive(Debug, Clone, Default)]
+pub struct PromptState {
+    pub system_prompt: String,
+    pub skills: Vec<Skill>,
+}
+
 pub fn default_harness_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
@@ -173,7 +183,7 @@ fn overlap_score(prompt_tokens: &[String], skill: &Skill) -> usize {
     score
 }
 
-fn load_skills(dir: &Path) -> Vec<Skill> {
+pub fn load_skills(dir: &Path) -> Vec<Skill> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };

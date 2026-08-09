@@ -52,6 +52,15 @@ async fn main() -> Result<()> {
         api_key: config.api_key.clone(),
     })?;
 
+    // Harness bundle: system prompt + skills from disk (editable).
+    // Loaded before the tools so the evolution tools can share the
+    // live prompt state with the agent loop.
+    let harness = harness::Harness::load(cli.harness_dir.as_deref().map(std::path::Path::new))?;
+    let prompt_state = std::sync::Arc::new(std::sync::RwLock::new(harness::PromptState {
+        system_prompt: harness.system_prompt.clone(),
+        skills: harness.skills.clone(),
+    }));
+
     // Tools: native + scripted Lua + memory + MCP.
     let tools_dir = cli
         .tools_dir
@@ -61,6 +70,7 @@ async fn main() -> Result<()> {
     let mut tools = ToolRegistry::with_tools(
         Some(tools_dir.as_path()),
         cli.harness_dir.as_deref().map(std::path::Path::new),
+        Some(prompt_state.clone()),
     );
 
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.
@@ -99,14 +109,13 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Harness bundle: system prompt + skills from disk (editable).
-    let harness = harness::Harness::load(cli.harness_dir.as_deref().map(std::path::Path::new))?;
-
+    // Live prompt state is built above (before the tools); the agent
+    // loop shares it with the evolution tools so harness edits apply
+    // on the very next turn.
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
         max_steps: config.max_steps,
-        system_prompt: harness.system_prompt.clone(),
-        skills: harness.skills.clone(),
+        prompt_state: prompt_state.clone(),
         // Dynamic skill selection: inline at most 3 relevant skills
         // per turn (keyword-overlap ranked).
         max_inline_skills: 3,

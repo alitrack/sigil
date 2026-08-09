@@ -171,6 +171,9 @@ impl Tool for CreateLuaToolTool {
 pub struct ImproveHarnessTool {
     /// Absolute path to the harness dir (system_prompt.md lives here).
     pub harness_dir: std::path::PathBuf,
+    /// Live prompt state to update after writes (so the running agent
+    /// sees edits immediately). `None` = isolated (tests).
+    pub prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
 }
 
 #[async_trait]
@@ -233,9 +236,14 @@ impl Tool for ImproveHarnessTool {
                     );
                 }
                 std::fs::write(&path, content)?;
+                if let Some(state) = &self.prompt_state
+                    && let Ok(mut s) = state.write()
+                {
+                    s.system_prompt = content.to_string();
+                }
                 Ok(ToolOutput {
                     text: format!(
-                        "system_prompt.md updated ({} chars). It takes effect on the next turn.",
+                        "system_prompt.md updated ({} chars). It is live — the very next turn uses it.",
                         content.chars().count()
                     ),
                 })
@@ -270,9 +278,16 @@ impl Tool for ImproveHarnessTool {
                     );
                 }
                 std::fs::write(&path, content)?;
+                if let Some(state) = &self.prompt_state
+                    && let Ok(mut s) = state.write()
+                {
+                    // Refresh the in-memory skill list from disk so
+                    // dynamic inlining picks the new skill up now.
+                    s.skills = crate::harness::load_skills(&skills_dir);
+                }
                 Ok(ToolOutput {
                     text: format!(
-                        "skill '{safe}' written to {}. Listed in the skill index from the next turn.",
+                        "skill '{safe}' written to {}. It is live — relevant prompts inline it from the very next turn.",
                         path.display()
                     ),
                 })

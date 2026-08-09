@@ -26,26 +26,28 @@ pub struct AgentConfig {
     pub model: String,
     /// 0 = no step limit (a turn runs until the model stops calling tools).
     pub max_steps: u32,
-    pub system_prompt: String,
-    /// Skills available for dynamic inlining (relevance-selected per
-    /// user prompt). Empty = no skill inlining.
-    pub skills: Vec<crate::harness::Skill>,
+    /// Live prompt state (system prompt + skills). Shared with the
+    /// evolution tools so `improve_harness` / `skill_rollback` take
+    /// effect on the very next turn — no restart needed.
+    pub prompt_state: std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>,
     /// Max skills inlined per turn (relevance-ranked). Ignored when
-    /// `skills` is empty.
+    /// the state has no skills.
     pub max_inline_skills: usize,
 }
 
 impl AgentConfig {
     /// System prompt for a specific user prompt: base prompt plus the
-    /// most relevant skills inlined (keyword-overlap ranked).
+    /// most relevant skills inlined (keyword-overlap ranked). Reads the
+    /// *live* state, so harness edits apply immediately.
     pub fn system_prompt_for(&self, prompt: &str) -> String {
-        if self.skills.is_empty() || self.max_inline_skills == 0 {
-            self.system_prompt.clone()
+        let state = self.prompt_state.read().unwrap_or_else(|e| e.into_inner());
+        if state.skills.is_empty() || self.max_inline_skills == 0 {
+            state.system_prompt.clone()
         } else {
-            let mut p = self.system_prompt.clone();
+            let mut p = state.system_prompt.clone();
             p.push_str(&crate::harness::inline_skills_for(
                 prompt,
-                &self.skills,
+                &state.skills,
                 self.max_inline_skills,
             ));
             p

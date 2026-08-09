@@ -187,6 +187,7 @@ async fn improve_harness_edits_prompt() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        prompt_state: None,
     };
     let out = tool
         .run(&json!({
@@ -211,6 +212,7 @@ async fn improve_harness_adds_and_lists_skills() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        prompt_state: None,
     };
 
     // Add a skill.
@@ -252,12 +254,42 @@ async fn improve_harness_rejects_unknown_action() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        prompt_state: None,
     };
     let err = tool
         .run(&json!({ "action": "nuke_everything" }))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unknown action"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn edit_prompt_updates_live_prompt_state() {
+    let dir = std::env::temp_dir().join(format!("sigil-evolve-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("system_prompt.md"), "old prompt").unwrap();
+
+    let state = std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
+        system_prompt: "old prompt".into(),
+        skills: vec![],
+    }));
+    let tool = ImproveHarnessTool {
+        harness_dir: dir.clone(),
+        prompt_state: Some(state.clone()),
+    };
+    let out = tool
+        .run(&json!({ "action": "edit_prompt", "content": "brand new prompt" }))
+        .await
+        .unwrap();
+    assert!(out.text.contains("live"));
+
+    // The shared state now carries the new prompt — the agent loop
+    // picks it up without a restart.
+    let s = state.read().unwrap();
+    assert_eq!(s.system_prompt, "brand new prompt");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,6 +1,6 @@
 //! Harness tests: skill loading and prompt assembly.
 
-use crate::harness::Harness;
+use crate::harness::{Harness, PromptState};
 
 #[test]
 fn small_skills_are_inlined_into_the_prompt() {
@@ -91,8 +91,10 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
     let cfg = AgentConfig {
         model: "m".into(),
         max_steps: 0,
-        system_prompt: "base".into(),
-        skills,
+        prompt_state: std::sync::Arc::new(std::sync::RwLock::new(PromptState {
+            system_prompt: "base".into(),
+            skills,
+        })),
         max_inline_skills: 2,
     };
 

@@ -99,8 +99,9 @@ mod tests {
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 0,
-                system_prompt: "test".into(),
-                skills: vec![],
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState::default(),
+                )),
                 max_inline_skills: 0,
             },
         };

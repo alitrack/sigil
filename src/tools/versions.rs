@@ -86,6 +86,9 @@ pub struct SkillRollbackTool {
     /// Hook to hot-register a scripted tool after a rollback (so the
     /// restored code is live in the current session, not just on disk).
     pub register: Option<crate::tools::evolve::RegisterHook>,
+    /// Live prompt state to update after a prompt/skill rollback (so
+    /// the running agent sees it immediately). `None` = isolated.
+    pub prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
 }
 
 #[async_trait]
@@ -144,6 +147,18 @@ impl Tool for SkillRollbackTool {
         {
             (reg)(name, self.tools_dir.join(format!("{name}.lua")));
         }
+        // For prompts / skills, refresh the live agent state so the
+        // restored content is used on the very next turn.
+        if kind != "tools"
+            && let Some(state) = &self.prompt_state
+            && let Ok(mut s) = state.write()
+        {
+            if kind == "prompt" {
+                s.system_prompt = restored.clone();
+            } else {
+                s.skills = crate::harness::load_skills(&self.harness_dir.join("skills"));
+            }
+        }
         Ok(ToolOutput {
             text: format!(
                 "restored {kind}/{name} to version {version} ({} chars). Live asset updated{}.",
@@ -151,7 +166,7 @@ impl Tool for SkillRollbackTool {
                 if kind == "tools" {
                     " and hot-registered for this session"
                 } else {
-                    ""
+                    " — the very next turn uses it"
                 }
             ),
         })

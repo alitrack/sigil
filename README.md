@@ -25,7 +25,7 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 30** — skill graph view (list_skills).
+> Status: **Phase 31** — timestamped turns + `session export --since`.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -214,8 +214,17 @@ MCP tool list.
 | **28** ✅ | Ratchet battery 4 → 10 (memory, skill deps, live prompt, MCP) |
 | **29** ✅ | Dependency cycle detection (add_skill warns on cycles) |
 | **30** ✅ | Skill graph view (list_skills: descriptions, deps, cycle warning) |
+| **31** ✅ | Timestamped turns + `session export --since` (time-filtered transcripts) |
 
 ## Changelog
+
+### Phase 31 — 2026-08-10
+- **Timestamped turns**: every turn written to a session JSONL now carries a
+  nanosecond `ts` field (auto-stamped on append; legacy untimestamped lines
+  still load fine via `#[serde(default)]`).
+- **`session export --since <cutoff>`**: export only the turns written at or
+  after the cutoff (same format as turn timestamps). Untimestamped legacy
+  turns are always kept; an export that would be empty fails cleanly.
 
 ### v0.1.0 — 2026-08-09
 First tagged release. Full agent core: pipe / REPL / ACP / MCP modes,

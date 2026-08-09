@@ -224,6 +224,7 @@ pub async fn run(
             &crate::session::Turn {
                 role: "user".into(),
                 text: line.into(),
+                ts: None,
             },
         )?;
         let _ = editor.add_history_entry(line);
@@ -267,6 +268,7 @@ pub async fn run(
             &crate::session::Turn {
                 role: "assistant".into(),
                 text: answer.clone(),
+                ts: None,
             },
         )?;
         messages.push(crate::llm::ChatMessage::assistant(&answer));

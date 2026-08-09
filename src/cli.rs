@@ -99,6 +99,11 @@ pub enum SessionAction {
         /// Output file path (default: <id>.json in the sessions dir).
         #[arg(short, long)]
         output: Option<String>,
+        /// Only include turns at or after this cutoff (same format as the
+        /// turn timestamps, e.g. `2026-22000-120000-000000000`; legacy
+        /// turns without a timestamp are always kept).
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Import a session archive as a new session (returns its id).

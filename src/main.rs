@@ -155,12 +155,13 @@ async fn main() -> Result<()> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(session::default_sessions_dir);
             match action {
-                cli::SessionAction::Export { id, output } => {
+                cli::SessionAction::Export { id, output, since } => {
                     let out = output
                         .as_deref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| sessions_dir.join(format!("{id}.json")));
-                    let archive = session::export_session(&sessions_dir, id, &out)?;
+                    let archive =
+                        session::export_session(&sessions_dir, id, &out, since.as_deref())?;
                     println!(
                         "exported session {id} ({} turns) → {}",
                         archive.turns.len(),

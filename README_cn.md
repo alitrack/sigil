@@ -23,7 +23,7 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 30** — 技能图视图（list_skills）。管道模式、
+> 状态：**Phase 31** — 轮次时间戳 + `session export --since`。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -195,8 +195,15 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **28** ✅ | ratchet 电池 4 → 10（记忆、技能依赖、live prompt、MCP） |
 | **29** ✅ | 依赖环检测（add_skill 对环发出警告） |
 | **30** ✅ | 技能图视图（list_skills：描述、依赖、环警告） |
+| **31** ✅ | 轮次时间戳 + `session export --since`（按时间过滤转录） |
 
 ## 更新日志
+
+### Phase 31 — 2026-08-10
+- **轮次时间戳**：写入会话 JSONL 的每一轮现在带纳秒级 `ts` 字段（append
+  时自动盖章；旧的无时间戳行经 `#[serde(default)]` 仍可正常加载）。
+- **`session export --since <cutoff>`**：只导出 cutoff 及之后写入的轮次
+  （格式与轮次时间戳相同）。无时间戳的旧轮次始终保留；过滤后为空则干净报错。
 
 ### v0.1.0 — 2026-08-09
 首个正式发布版本。完整 agent 核心：管道 / REPL / ACP / MCP 模式、

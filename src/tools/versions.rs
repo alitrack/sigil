@@ -83,6 +83,9 @@ pub struct SkillRollbackTool {
     pub harness_dir: std::path::PathBuf,
     /// Tools dir.
     pub tools_dir: std::path::PathBuf,
+    /// Hook to hot-register a scripted tool after a rollback (so the
+    /// restored code is live in the current session, not just on disk).
+    pub register: Option<crate::tools::evolve::RegisterHook>,
 }
 
 #[async_trait]
@@ -133,10 +136,89 @@ impl Tool for SkillRollbackTool {
             other => anyhow::bail!("unknown kind: {other}"),
         };
         let restored = versions::restore(base, kind, name, version)?;
+        // For scripted tools, hot-register the restored code so it is
+        // live immediately (the file on disk changed, but the registry
+        // still holds the previous implementation).
+        if kind == "tools"
+            && let Some(reg) = &self.register
+        {
+            (reg)(name, self.tools_dir.join(format!("{name}.lua")));
+        }
         Ok(ToolOutput {
             text: format!(
-                "restored {kind}/{name} to version {version} ({} chars). Live asset updated.",
-                restored.chars().count()
+                "restored {kind}/{name} to version {version} ({} chars). Live asset updated{}.",
+                restored.chars().count(),
+                if kind == "tools" {
+                    " and hot-registered for this session"
+                } else {
+                    ""
+                }
+            ),
+        })
+    }
+}
+
+/// Tool that prunes archived versions of a harness asset.
+///
+/// Backups auto-prune at [`versions::AUTO_KEEP`] per asset; this tool
+/// lets the model reduce retention explicitly (e.g. keep 3 versions).
+pub struct VersionsGcTool {
+    /// Harness dir.
+    pub harness_dir: std::path::PathBuf,
+    /// Tools dir.
+    pub tools_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl Tool for VersionsGcTool {
+    fn name(&self) -> &str {
+        "versions_gc"
+    }
+
+    fn description(&self) -> &str {
+        "Prune archived versions of a harness asset, keeping only the newest N. Params: kind (skills | prompt | tools), name (asset base name), keep (how many versions to retain; default 5). Backups auto-prune at 50 per asset, so use this when you want tighter retention."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["skills", "prompt", "tools"],
+                    "description": "Asset kind"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Asset base name"
+                },
+                "keep": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "How many newest versions to keep (default 5)"
+                }
+            },
+            "required": ["kind", "name"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let kind = args.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+        if kind.is_empty() || name.is_empty() {
+            anyhow::bail!("versions_gc requires 'kind' and 'name'");
+        }
+        let keep = args.get("keep").and_then(Value::as_u64).unwrap_or(5) as usize;
+        let base = match kind {
+            "skills" | "prompt" => &self.harness_dir,
+            "tools" => &self.tools_dir,
+            other => anyhow::bail!("unknown kind: {other}"),
+        };
+        let removed = versions::gc(base, kind, name, keep);
+        let remaining = versions::versions_of(base, kind, name).len();
+        Ok(ToolOutput {
+            text: format!(
+                "pruned {removed} old version(s) of {kind}/{name}; {remaining} kept (newest {keep})"
             ),
         })
     }

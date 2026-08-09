@@ -29,7 +29,7 @@ pub struct Resource {
 /// `resources` (harness skills etc.) are exposed via resources/list and
 /// resources/read.
 pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
-    let registry = tools.clone_shallow();
+    let mut registry = tools.clone_shallow();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut next_id: u64 = 0;
@@ -223,6 +223,11 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                             }
                         });
                         write_frame(&mut stdout, &progress).await?;
+                        // A tool may have hot-registered / unregistered
+                        // scripted tools (create_lua_tool, skill_rollback);
+                        // apply the queued ops so the very next tools/call
+                        // sees the new implementation.
+                        registry.drain_hot();
                         let resp = json!({
                             "jsonrpc": "2.0",
                             "id": id,

@@ -132,6 +132,7 @@ impl ToolRegistry {
             .unwrap_or_else(scripted::default_tools_dir);
         let hot_queue = registry.hot_queue.clone();
         let hot_queue2 = hot_queue.clone();
+        let hot_queue3 = hot_queue.clone();
         registry.register(Arc::new(evolve::CreateLuaToolTool {
             tools_dir: tools_dir.clone(),
             register: Box::new(move |name: &str, path: std::path::PathBuf| {
@@ -160,8 +161,17 @@ impl ToolRegistry {
             tools_dir: tools_dir.clone(),
         }));
         registry.register(Arc::new(versions::SkillRollbackTool {
+            harness_dir: harness_dir.clone(),
+            tools_dir: tools_dir.clone(),
+            register: Some(Box::new(move |name: &str, path: std::path::PathBuf| {
+                if let Ok(mut q) = hot_queue3.try_lock() {
+                    q.push(HotOp::register(name, path));
+                }
+            })),
+        }));
+        registry.register(Arc::new(versions::VersionsGcTool {
             harness_dir,
-            tools_dir,
+            tools_dir: tools_dir.clone(),
         }));
         // Cross-process ACP delegation: spawn an external ACP server.
         registry.register(Arc::new(acp::AcpCallTool {

@@ -94,11 +94,59 @@ pub fn restore(
     let target = match kind {
         "prompt" => harness_dir.join("system_prompt.md"),
         "skills" => harness_dir.join("skills").join(format!("{name}.md")),
-        "tools" => harness_dir.join("tools").join(format!("{name}.lua")),
+        // For tools, the base dir passed in IS the tools dir (the
+        // evolution tools call backup/restore with tools_dir as root),
+        // so the live tool lives directly under it.
+        "tools" => harness_dir.join(format!("{name}.lua")),
         other => anyhow::bail!("unknown asset kind: {other}"),
     };
     std::fs::write(&target, &content)?;
     Ok(content)
+}
+
+/// Prune archived versions of an asset, keeping only the newest
+/// `keep` entries. Returns the number of files removed. Ordering is by
+/// stamp (newest first), so the oldest versions are dropped first.
+pub fn gc(harness_dir: &Path, kind: &str, name: &str, keep: usize) -> usize {
+    let dir = kind_dir(harness_dir, kind);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let prefix = format!("{name}.");
+    let mut paths: Vec<(String, PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if !file.starts_with(&prefix) {
+            continue;
+        }
+        let rest = &file[prefix.len()..];
+        let Some(dot) = rest.rfind('.') else {
+            continue;
+        };
+        paths.push((rest[..dot].to_string(), path));
+    }
+    paths.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let mut removed = 0;
+    for (_, path) in paths.iter().skip(keep) {
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Maximum archived versions kept automatically per asset. When a
+/// backup pushes an asset past this, the oldest versions are pruned.
+pub const AUTO_KEEP: usize = 50;
+
+/// `backup` + automatic pruning: after snapshotting, keep only the
+/// newest [`AUTO_KEEP`] versions of this asset.
+pub fn backup_and_prune(harness_dir: &Path, kind: &str, name: &str, content: &str) {
+    backup(harness_dir, kind, name, content);
+    gc(harness_dir, kind, name, AUTO_KEEP);
 }
 
 #[cfg(test)]
@@ -150,5 +198,58 @@ mod tests {
         assert!(versions_of(&dir, "skills", "brandnew").is_empty());
         // And the kind dir may not even exist yet.
         assert!(versions_of(&dir, "prompt", "system_prompt").is_empty());
+    }
+
+    #[test]
+    fn gc_keeps_only_newest_n() {
+        let dir = fresh("gc");
+        let skill = dir.join("skills").join("math.md");
+        for i in 0..5 {
+            std::fs::write(&skill, format!("v{i}")).unwrap();
+            backup(&dir, "skills", "math", &format!("v{i}"));
+        }
+        assert_eq!(versions_of(&dir, "skills", "math").len(), 5);
+
+        // Keep the newest 2.
+        let removed = gc(&dir, "skills", "math", 2);
+        assert_eq!(removed, 3);
+        let left = versions_of(&dir, "skills", "math");
+        assert_eq!(left.len(), 2);
+        // The newest snapshot ("v4") survives.
+        let newest = restore(&dir, "skills", "math", &left[0].0).unwrap();
+        assert_eq!(newest, "v4");
+    }
+
+    #[test]
+    fn backup_and_prune_enforces_auto_keep() {
+        let dir = fresh("auto");
+        let skill = dir.join("skills").join("math.md");
+        for i in 0..(AUTO_KEEP + 3) {
+            std::fs::write(&skill, format!("v{i}")).unwrap();
+            backup_and_prune(&dir, "skills", "math", &format!("v{i}"));
+        }
+        assert_eq!(versions_of(&dir, "skills", "math").len(), AUTO_KEEP);
+    }
+
+    #[test]
+    fn restore_tools_kind_writes_live_tool_directly_under_tools_dir() {
+        let dir = fresh("tools-kind");
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let tool = tools.join("which.lua");
+        std::fs::write(&tool, "v1").unwrap();
+        backup(&tools, "tools", "which", "v1");
+        std::fs::write(&tool, "v2").unwrap();
+        backup(&tools, "tools", "which", "v2");
+
+        let versions = versions_of(&tools, "tools", "which");
+        assert_eq!(versions.len(), 2);
+        // Restore the older version.
+        let old_stamp = versions.last().unwrap().0.clone();
+        let restored = restore(&tools, "tools", "which", &old_stamp).unwrap();
+        assert_eq!(restored, "v1");
+        // The live tool file was overwritten, directly under tools dir.
+        let on_disk = std::fs::read_to_string(&tool).unwrap();
+        assert_eq!(on_disk, "v1");
     }
 }

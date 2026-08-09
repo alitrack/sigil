@@ -110,7 +110,12 @@ impl Tool for CreateLuaToolTool {
                     // Archive before removal so a mistaken delete can
                     // be restored from the version library.
                     if let Ok(old) = std::fs::read_to_string(&path) {
-                        crate::harness::versions::backup(&self.tools_dir, "tools", &safe, &old);
+                        crate::harness::versions::backup_and_prune(
+                            &self.tools_dir,
+                            "tools",
+                            &safe,
+                            &old,
+                        );
                     }
                     std::fs::remove_file(&path)?;
                     (self.unregister)(&safe);
@@ -136,7 +141,12 @@ impl Tool for CreateLuaToolTool {
                 std::fs::create_dir_all(&self.tools_dir)?;
                 // Snapshot the previous version on overwrite.
                 if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup(&self.tools_dir, "tools", &safe, &old);
+                    crate::harness::versions::backup_and_prune(
+                        &self.tools_dir,
+                        "tools",
+                        &safe,
+                        &old,
+                    );
                 }
                 std::fs::write(&path, code)?;
                 (self.register)(&safe, path.clone());
@@ -215,7 +225,7 @@ impl Tool for ImproveHarnessTool {
                 let path = self.harness_dir.join("system_prompt.md");
                 // Snapshot the current prompt before replacing it.
                 if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup(
+                    crate::harness::versions::backup_and_prune(
                         &self.harness_dir,
                         "prompt",
                         "system_prompt",
@@ -252,7 +262,12 @@ impl Tool for ImproveHarnessTool {
                 let path = skills_dir.join(format!("{safe}.md"));
                 // Snapshot the previous version if this skill exists.
                 if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup(&self.harness_dir, "skills", &safe, &old);
+                    crate::harness::versions::backup_and_prune(
+                        &self.harness_dir,
+                        "skills",
+                        &safe,
+                        &old,
+                    );
                 }
                 std::fs::write(&path, content)?;
                 Ok(ToolOutput {

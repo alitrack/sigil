@@ -23,9 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 7** — MCP server 模式。管道模式、带真实 FFI 的脚本化 Lua
-> 工具、自进化闭环、三层 safety、MCP 客户端**和 server**、ACP server、
-> 持久 memory、交互式 REPL、可续会话、子代理委托全部端到端可用。
+> 状态：**Phase 10** — harness 指令层自进化。管道模式、带真实 FFI 的
+> 脚本化 Lua 工具、自进化闭环、三层 safety、MCP 客户端**和 server**、
+> ACP server、持久 memory、交互式 REPL、真正多轮上下文、可续会话、
+> 子代理委托、流式输出、ratchet 回归电池、模型驱动 harness 改进
+> 全部端到端可用。
 
 ## 快速开始
 
@@ -72,6 +74,9 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   `require("ffi")` 调任意 C 库（zlib `crc32` 已端到端验证）。
 - **自进化** — `create_lua_tool`：模型写 Lua → sigil 落盘并热注册 →
   下一轮即可调用，跨会话持久。
+- **Harness 自我改进** — `improve_harness`：模型可编辑自己的
+  `system_prompt.md`（`edit_prompt`）和新增技能（`add_skill`）——
+  指令层从内部进化，免重编译。
 - **Harness bundle** — `~/.sigil/harness/` 存放 `system_prompt.md` 和
   `skills/`；改文件（不改代码）即可改变 agent 行为。
 - **Safety（三层）** — 审批门（破坏性命令非交互模式默认拒绝；REPL 里
@@ -85,10 +90,18 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
 - **ACP server** — `sigil acp` 说 Agent Client Protocol（stdio 上的
   JSON-RPC），任意 ACP 宿主（编辑器、其他 agent）都能驱动 sigil。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
+- **真正多轮上下文** — REPL 跨轮维护真实消息列表；`--resume` 把会话记录
+  作为真实 user/assistant 消息载入（模型记得对话，而非文本 blob）。
+- **行编辑 + 历史** — rustyline：上下键历史、行内编辑；每会话
+  `.history` 文件跨会话持久。
+- **流式输出** — 管道与 REPL 模式实时流式显示 assistant 文本
+  （`[using tools…]` 标记工具调用中断）。
 - **可续会话** — REPL 每轮记录到 `~/.sigil/sessions/<id>.jsonl`；
   `--resume <id>` 继续对话。
 - **子代理** — `delegate` 工具：主 agent 派发独立子代理（独立对话、
   独立工具循环），收回摘要。
+- **Ratchet 测试** — `test-tools/ratchet.py` 用真实二进制 + 真实 LLM
+  跑固定任务电池，断言核心行为不退化。
 
 ## 工作原理
 
@@ -122,7 +135,9 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 | **5** ✅ | 交互式 REPL + 人工审批 |
 | **6** ✅ | 会话持久化（`--resume`）、子代理（`delegate`） |
 | **7** ✅ | MCP server 模式（`sigil mcp`） |
-| **8** 🔮 | 流式输出、ratchet 回归测试、TUI 打磨 |
+| **8** ✅ | 流式输出、ratchet 回归电池 |
+| **9** ✅ | 真正多轮上下文、rustyline 行编辑 + 历史 |
+| **10** ✅ | `improve_harness` — 指令层自进化 |
 
 ## 开发
 

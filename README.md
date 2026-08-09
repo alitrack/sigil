@@ -25,10 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 7** — MCP server mode. Pipe mode, scripted Lua tools with
-> real FFI, self-evolution loop, three-layer safety, MCP client **and
-> server**, ACP server, persistent memory, interactive REPL, resumable
-> sessions, and sub-agent delegation all work end to end.
+> Status: **Phase 10** — harness self-evolution (instruction layer). Pipe
+> mode, scripted Lua tools with real FFI, self-evolution loop, three-layer
+> safety, MCP client **and server**, ACP server, persistent memory,
+> interactive REPL, resumable sessions with true multi-turn context,
+> sub-agent delegation, streaming output, ratchet regression battery, and
+> model-driven harness improvement all work end to end.
 
 ## Quick start
 
@@ -62,7 +64,9 @@ llama.cpp, DeepSeek, etc. Config file at `~/.sigil/config.toml`
 (`[llm]`, `[agent]`, `[[mcp.servers]]`); precedence is CLI > env > file >
 defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
 `--harness-dir` (system prompt + skills, default `~/.sigil/harness/`),
-`--memory` (remember/recall store, default `~/.sigil/memory.md`).
+`--memory` (remember/recall store, default `~/.sigil/memory.md`),
+`--sessions-dir` (session transcripts, default `~/.sigil/sessions/`),
+`--resume <id>` (continue a session), `--list-sessions`.
 
 ## Capabilities
 
@@ -77,6 +81,9 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
 - **Self-evolution** — `create_lua_tool`: the model writes Lua, sigil saves
   and hot-registers it, and it's callable from the next turn — persisted
   across sessions.
+- **Harness self-improvement** — `improve_harness`: the model can edit its
+  own `system_prompt.md` (`edit_prompt`) and add skills (`add_skill`) —
+  the instruction layer evolves from within, recompile-free.
 - **Harness bundle** — `~/.sigil/harness/` holds `system_prompt.md` and
   `skills/`; edit files (not code) to change agent behavior.
 - **Safety (3 layers)** — approval gate (destructive commands rejected in
@@ -93,10 +100,19 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   over stdio) so any ACP host (editors, other agents) can drive sigil.
 - **Interactive REPL** — multi-turn conversation with human approval for
   destructive commands.
+- **True multi-turn context** — the REPL keeps the real message list across
+  turns; `--resume` loads the transcript as actual user/assistant messages
+  (the model remembers the conversation, not a text blob).
+- **Line editing + history** — rustyline: arrow-key history, inline editing;
+  per-session `.history` files persist commands across sessions.
+- **Streaming output** — assistant text streams live in pipe and REPL modes
+  (`[using tools…]` marks tool calls mid-stream).
 - **Resumable sessions** — every REPL turn is recorded to
   `~/.sigil/sessions/<id>.jsonl`; `--resume <id>` continues a conversation.
 - **Sub-agents** — `delegate` tool: the main agent spins off an independent
   sub-agent (own conversation, own tool loop) and gets back a summary.
+- **Ratchet tests** — `test-tools/ratchet.py` runs a fixed task battery
+  through the real binary + real LLM, asserting core behavior holds.
 
 ## How it works
 
@@ -131,7 +147,9 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
 | **5** ✅ | Interactive REPL + human approval |
 | **6** ✅ | Session persistence (`--resume`), sub-agents (`delegate`) |
 | **7** ✅ | MCP server mode (`sigil mcp`) |
-| **8** 🔮 | Streaming output, ratchet regression tests, TUI polish |
+| **8** ✅ | Streaming output, ratchet regression battery |
+| **9** ✅ | True multi-turn context, rustyline line editing + history |
+| **10** ✅ | `improve_harness` — instruction-layer self-evolution |
 
 ## Development
 

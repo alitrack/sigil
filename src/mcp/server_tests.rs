@@ -13,12 +13,13 @@ fn server_frame_shape() {
         "id": 1,
         "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
+            "capabilities": { "tools": {}, "progress": {} },
             "serverInfo": { "name": "sigil", "version": "0.1.0" }
         }
     });
     assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
     assert!(init["result"]["capabilities"]["tools"].is_object());
+    assert!(init["result"]["capabilities"]["progress"].is_object());
 
     // tools/list result envelope: { tools: [...] }.
     let list = json!({
@@ -58,9 +59,28 @@ fn server_identifies_as_sigil() {
         "id": 1,
         "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
+            "capabilities": { "tools": {}, "progress": {} },
             "serverInfo": { "name": "sigil", "version": "0.1.0" }
         }
     });
     assert_eq!(init["result"]["serverInfo"]["name"], "sigil");
+}
+
+/// Progress notification frame shape (sent around tools/call).
+#[test]
+fn progress_notification_frame_shape() {
+    let progress = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": "tool-bash",
+            "progress": 0.0,
+            "total": 1.0,
+            "message": "tool bash started"
+        }
+    });
+    assert_eq!(progress["method"], "notifications/progress");
+    assert_eq!(progress["params"]["progressToken"], "tool-bash");
+    assert_eq!(progress["params"]["progress"], 0.0);
+    assert_eq!(progress["params"]["total"], 1.0);
 }

@@ -42,7 +42,7 @@ pub async fn serve(tools: &ToolRegistry) -> Result<()> {
                     "id": id,
                     "result": {
                         "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {} },
+                        "capabilities": { "tools": {}, "progress": {} },
                         "serverInfo": { "name": "sigil", "version": "0.1.0" }
                     }
                 });
@@ -82,9 +82,32 @@ pub async fn serve(tools: &ToolRegistry) -> Result<()> {
                     id: format!("mcp-{}", next_id),
                 };
                 next_id += 1;
+                // Progress: started before executing, finished after.
+                let progress_start = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": format!("tool-{name}"),
+                        "progress": 0.0,
+                        "total": 1.0,
+                        "message": format!("tool {name} started")
+                    }
+                });
+                write_frame(&mut stdout, &progress_start).await?;
                 let result = registry.execute(&call).await;
                 match result {
                     Ok(out) => {
+                        let progress = json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": format!("tool-{name}"),
+                                "progress": 1.0,
+                                "total": 1.0,
+                                "message": format!("tool {name} finished")
+                            }
+                        });
+                        write_frame(&mut stdout, &progress).await?;
                         let resp = json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -98,6 +121,17 @@ pub async fn serve(tools: &ToolRegistry) -> Result<()> {
                         write_frame(&mut stdout, &resp).await?;
                     }
                     Err(e) => {
+                        let progress = json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": format!("tool-{name}"),
+                                "progress": 1.0,
+                                "total": 1.0,
+                                "message": format!("tool {name} failed: {e:#}")
+                            }
+                        });
+                        write_frame(&mut stdout, &progress).await?;
                         let resp = json!({
                             "jsonrpc": "2.0",
                             "id": id,

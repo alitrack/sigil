@@ -4,6 +4,7 @@ mod config;
 mod harness;
 mod llm;
 mod lua;
+mod mcp;
 mod safety;
 mod tools;
 
@@ -47,6 +48,29 @@ async fn main() -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(scripted::default_tools_dir);
     let mut tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
+
+    // MCP servers: connect, discover tools, register as mcp_<server>_<tool>.
+    for server in &config.mcp_servers {
+        match mcp::McpClient::connect(&server.name, &server.command, &server.args).await {
+            Ok((client, infos)) => {
+                let client = std::sync::Arc::new(client);
+                for info in infos {
+                    let tool = tools::mcp::McpTool::new(&server.name, info, client.clone());
+                    tools.register(std::sync::Arc::new(tool));
+                }
+                eprintln!(
+                    "mcp: connected '{}' ({} tools)",
+                    server.name,
+                    tools
+                        .specs()
+                        .iter()
+                        .filter(|s| s.name.starts_with(&format!("mcp_{}_", server.name)))
+                        .count()
+                );
+            }
+            Err(e) => eprintln!("mcp: failed to connect '{}': {e}", server.name),
+        }
+    }
 
     // Harness bundle: system prompt + skills from disk (editable).
     let harness = harness::Harness::load(cli.harness_dir.as_deref().map(std::path::Path::new))?;

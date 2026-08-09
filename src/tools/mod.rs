@@ -16,6 +16,7 @@ pub mod bash;
 pub mod evolve;
 pub mod files;
 pub mod git;
+pub mod mcp;
 pub mod scripted;
 
 #[cfg(test)]

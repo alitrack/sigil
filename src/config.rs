@@ -24,6 +24,7 @@ use serde::Deserialize;
 struct FileConfig {
     llm: LlmConfig,
     agent: AgentFileConfig,
+    mcp: McpFileConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -41,6 +42,21 @@ struct AgentFileConfig {
     system_prompt: Option<String>,
 }
 
+/// An MCP server to spawn at startup (stdio transport).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct McpFileConfig {
+    servers: Vec<McpServerConfig>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model: String,
@@ -51,6 +67,8 @@ pub struct Config {
     #[allow(dead_code)]
     pub system_prompt: String,
     pub max_steps: u32,
+    /// MCP servers to connect at startup.
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Config {
@@ -79,6 +97,7 @@ impl Config {
             .or(file_cfg.agent.system_prompt)
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
         let max_steps = file_cfg.agent.max_steps.unwrap_or(0);
+        let mcp_servers = file_cfg.mcp.servers;
 
         Ok(Self {
             model,
@@ -86,6 +105,7 @@ impl Config {
             api_key,
             system_prompt,
             max_steps,
+            mcp_servers,
         })
     }
 

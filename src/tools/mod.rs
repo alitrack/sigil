@@ -22,6 +22,7 @@ pub mod git;
 pub mod mcp;
 pub mod memory;
 pub mod scripted;
+pub mod versions;
 
 #[cfg(test)]
 mod scripted_tests;
@@ -150,7 +151,18 @@ impl ToolRegistry {
         let harness_dir = harness_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(harness::default_harness_dir);
-        registry.register(Arc::new(evolve::ImproveHarnessTool { harness_dir }));
+        registry.register(Arc::new(evolve::ImproveHarnessTool {
+            harness_dir: harness_dir.clone(),
+        }));
+        // Version library: list & roll back model-written assets.
+        registry.register(Arc::new(versions::SkillHistoryTool {
+            harness_dir: harness_dir.clone(),
+            tools_dir: tools_dir.clone(),
+        }));
+        registry.register(Arc::new(versions::SkillRollbackTool {
+            harness_dir,
+            tools_dir,
+        }));
         // Cross-process ACP delegation: spawn an external ACP server.
         registry.register(Arc::new(acp::AcpCallTool {
             command: "sigil".to_string(),

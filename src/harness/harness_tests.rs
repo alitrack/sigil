@@ -49,12 +49,14 @@ fn inline_skills_for_selects_by_relevance() {
             description: "wrap C libraries with LuaJIT FFI".into(),
             body: "> wrap C\nuse ffi.cdef and ffi.load".into(),
             path: std::path::PathBuf::from("lua-ffi.md"),
+            depends_on: vec![],
         },
         Skill {
             name: "git-workflow".into(),
             description: "commit and push workflows".into(),
             body: "> git\ncommit, push, revert".into(),
             path: std::path::PathBuf::from("git-workflow.md"),
+            depends_on: vec![],
         },
     ];
 
@@ -78,6 +80,51 @@ fn inline_skills_for_selects_by_relevance() {
 }
 
 #[test]
+fn depends_on_pulls_in_dependency_skills_cycle_safe() {
+    use crate::harness::Skill;
+    // math depends on formulas; formulas and notes depend on each other
+    // (cycle) — must not loop forever.
+    let skills = vec![
+        Skill {
+            name: "math".into(),
+            description: "math rules".into(),
+            body: "> math\nmath body".into(),
+            path: std::path::PathBuf::from("math.md"),
+            depends_on: vec!["formulas".into()],
+        },
+        Skill {
+            name: "formulas".into(),
+            description: "formulas".into(),
+            body: "> formulas\nformula body".into(),
+            path: std::path::PathBuf::from("formulas.md"),
+            depends_on: vec!["notes".into()],
+        },
+        Skill {
+            name: "notes".into(),
+            description: "notes".into(),
+            body: "> notes\nnotes body".into(),
+            path: std::path::PathBuf::from("notes.md"),
+            depends_on: vec!["formulas".into()],
+        },
+        Skill {
+            name: "unrelated".into(),
+            description: "unrelated".into(),
+            body: "> unrelated\nother body".into(),
+            path: std::path::PathBuf::from("unrelated.md"),
+            depends_on: vec![],
+        },
+    ];
+
+    // Math prompt → math + formulas + notes all inlined (closure),
+    // unrelated not.
+    let out = crate::harness::inline_skills_for("math problem", &skills, 5);
+    assert!(out.contains("<skill name=\"math\">"));
+    assert!(out.contains("<skill name=\"formulas\">"));
+    assert!(out.contains("<skill name=\"notes\">"));
+    assert!(!out.contains("unrelated"));
+}
+
+#[test]
 fn agent_config_inlines_relevant_skills_per_prompt() {
     use crate::agent::AgentConfig;
     use crate::harness::Skill;
@@ -86,6 +133,7 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
         description: "math rules".into(),
         body: "> math\nAnswer math questions".into(),
         path: std::path::PathBuf::from("math-notes.md"),
+        depends_on: vec![],
     }];
 
     let cfg = AgentConfig {
@@ -111,4 +159,30 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
     let mut cfg2 = cfg.clone();
     cfg2.max_inline_skills = 0;
     assert_eq!(cfg2.system_prompt_for("answer this math question"), "base");
+}
+
+#[test]
+fn load_skills_parses_depends_on_from_disk() {
+    let dir = std::env::temp_dir().join(format!("sigil-deps-disk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let skills_dir = dir.join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("report.md"),
+        "> 报告技能\n> depends_on: format\n\nbody",
+    )
+    .unwrap();
+    std::fs::write(skills_dir.join("format.md"), "> 格式技能\n\nbody").unwrap();
+
+    let skills = crate::harness::load_skills(&skills_dir);
+    let report = skills.iter().find(|s| s.name == "report").unwrap();
+    assert_eq!(report.depends_on, vec!["format".to_string()]);
+    let format = skills.iter().find(|s| s.name == "format").unwrap();
+    assert!(format.depends_on.is_empty());
+
+    // Inlining the report skill pulls format in.
+    let out = crate::harness::inline_skills_for("report", &skills, 3);
+    assert!(out.contains("<skill name=\"report\">"));
+    assert!(out.contains("<skill name=\"format\">"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

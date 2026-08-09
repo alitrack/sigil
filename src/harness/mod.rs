@@ -30,6 +30,9 @@ pub struct Skill {
     /// Path to the skill file (for tools that read/edit it).
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// Other skill names this skill needs inlined alongside it.
+    /// Declared as a `> depends_on: a, b` header line.
+    pub depends_on: Vec<String>,
 }
 
 /// The harness bundle loaded from disk.
@@ -126,24 +129,52 @@ impl Harness {
 
 /// Render the `<skill>` blocks for the given skills, ranked by keyword
 /// overlap with `prompt` (most relevant first), capped at `max_inline`.
-/// Empty prompt = no inlining.
+/// When a skill is inlined, its `depends_on` skills are pulled in too
+/// (transitively, cycle-safe, deduped). Empty prompt = no inlining.
 pub fn inline_skills_for(prompt: &str, skills: &[Skill], max_inline: usize) -> String {
     let prompt_tokens = tokenize(prompt);
-    let mut ranked: Vec<(usize, &Skill)> = skills
+    if prompt_tokens.is_empty() {
+        return String::new();
+    }
+    let by_name: std::collections::HashMap<&str, &Skill> =
+        skills.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut ranked: Vec<(&Skill, usize)> = skills
         .iter()
         .filter(|s| s.body.len() <= 2 * 1024)
-        .map(|s| (overlap_score(&prompt_tokens, s), s))
+        .map(|s| (s, overlap_score(&prompt_tokens, s)))
+        .filter(|(_, score)| *score > 0)
         .collect();
-    ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    let mut out = String::new();
-    for (score, s) in ranked.iter().take(max_inline) {
-        if *score > 0 {
-            out.push_str(&format!(
-                "\n<skill name=\"{}\">\n{}</skill>\n",
-                s.name,
-                s.body.trim()
-            ));
+    ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+
+    // Dependency closure: BFS from the ranked hits, pulling in
+    // `depends_on` transitively. Visited set makes it cycle-safe.
+    let mut included: Vec<&Skill> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (skill, _) in ranked.iter().take(max_inline) {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(*skill);
+        while let Some(s) = queue.pop_front() {
+            if !visited.insert(s.name.clone()) {
+                continue;
+            }
+            if s.body.len() <= 2 * 1024 {
+                included.push(s);
+            }
+            for dep in &s.depends_on {
+                if let Some(dep_skill) = by_name.get(dep.as_str()) {
+                    queue.push_back(dep_skill);
+                }
+            }
         }
+    }
+
+    let mut out = String::new();
+    for s in included {
+        out.push_str(&format!(
+            "\n<skill name=\"{}\">\n{}</skill>\n",
+            s.name,
+            s.body.trim()
+        ));
     }
     out
 }
@@ -204,11 +235,24 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
             .lines()
             .find_map(|l| l.trim_start().strip_prefix("> ").map(String::from))
             .unwrap_or_else(|| "no description".to_string());
+        // `> depends_on: a, b` header — comma-separated skill names.
+        let depends_on: Vec<String> = text
+            .lines()
+            .find_map(|l| {
+                l.trim_start().strip_prefix("> depends_on:").map(|rest| {
+                    rest.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
         skills.push(Skill {
             name: stem.to_string(),
             description,
             body: text,
             path,
+            depends_on,
         });
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));

@@ -42,7 +42,10 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(scripted::default_tools_dir);
-    let mut tools = ToolRegistry::with_tools(Some(tools_dir.as_path()));
+    let mut tools = ToolRegistry::with_tools(
+        Some(tools_dir.as_path()),
+        cli.harness_dir.as_deref().map(std::path::Path::new),
+    );
 
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.
     let memory_path = cli

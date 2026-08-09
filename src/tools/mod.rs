@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::harness;
 use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
@@ -71,11 +72,11 @@ impl ToolRegistry {
 
     #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
-        Self::with_tools(None)
+        Self::with_tools(None, None)
     }
 
     /// Native tools plus any Lua scripted tools found on disk.
-    pub fn with_tools(scripted_dir: Option<&Path>) -> Self {
+    pub fn with_tools(scripted_dir: Option<&Path>, harness_dir: Option<&Path>) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
         registry.register(Arc::new(files::ReadFileTool));
@@ -96,6 +97,13 @@ impl ToolRegistry {
                 }
             }),
         }));
+        // Harness evolution: the model can improve its own instruction
+        // layer (system prompt / skills). Follows --harness-dir so the
+        // tool edits exactly what the agent loaded.
+        let harness_dir = harness_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(harness::default_harness_dir);
+        registry.register(Arc::new(evolve::ImproveHarnessTool { harness_dir }));
         if let Some(dir) = scripted_dir {
             registry.register_scripted(dir);
         }

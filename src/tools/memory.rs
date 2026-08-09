@@ -76,10 +76,77 @@ impl Tool for RecallTool {
     }
 }
 
-/// Convenience: register both memory tools on a registry.
+/// Numbered index of every memory entry (for `memory_delete`).
+pub struct MemoryListTool {
+    pub memory_path: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MemoryListTool {
+    fn name(&self) -> &str {
+        "memory_list"
+    }
+
+    fn description(&self) -> &str {
+        "List all long-term memory entries as numbered lines (1-based). Use the numbers with memory_delete to remove stale or wrong entries. Entries are the '-' bullet lines the model maintains."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn run(&self, _args: &Value) -> anyhow::Result<ToolOutput> {
+        let text = memory::list(&self.memory_path)?;
+        Ok(ToolOutput { text })
+    }
+}
+
+/// Delete memory entries by index (from memory_list) or substring.
+pub struct MemoryDeleteTool {
+    pub memory_path: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MemoryDeleteTool {
+    fn name(&self) -> &str {
+        "memory_delete"
+    }
+
+    fn description(&self) -> &str {
+        "Delete long-term memory entries: by 'index' (a 1-based number from memory_list) or by 'substring' (case-insensitive, removes every matching line). Use when a remembered fact is stale, wrong, or superseded."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "index": { "type": "integer", "description": "1-based entry number from memory_list (mutually exclusive with substring)." },
+                "substring": { "type": "string", "description": "Case-insensitive substring; every matching line is removed (mutually exclusive with index)." }
+            }
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let index = args
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|i| i as usize);
+        let substring = args.get("substring").and_then(Value::as_str);
+        let text = memory::delete(&self.memory_path, index, substring)?;
+        Ok(ToolOutput { text })
+    }
+}
+
+/// Convenience: register all memory tools on a registry.
 pub fn register(registry: &mut crate::tools::ToolRegistry, memory_path: PathBuf) {
     registry.register(Arc::new(RememberTool {
         memory_path: memory_path.clone(),
     }));
-    registry.register(Arc::new(RecallTool { memory_path }));
+    registry.register(Arc::new(RecallTool {
+        memory_path: memory_path.clone(),
+    }));
+    registry.register(Arc::new(MemoryListTool {
+        memory_path: memory_path.clone(),
+    }));
+    registry.register(Arc::new(MemoryDeleteTool { memory_path }));
 }

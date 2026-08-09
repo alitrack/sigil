@@ -80,6 +80,70 @@ fn chrono_lite_today() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// List memory entries as numbered lines (1-based). Includes every
+/// non-empty line; the model can then delete by index.
+pub fn list(path: &PathBuf) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return Ok("(memory is empty)".into());
+    }
+    let out: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:3}. {}", i + 1, l))
+        .collect();
+    Ok(format!("{} entries:\n{}", lines.len(), out.join("\n")))
+}
+
+/// Delete memory entries by 1-based index (from `list`) or by substring
+/// (case-insensitive). Returns what was removed.
+pub fn delete(
+    path: &PathBuf,
+    index: Option<usize>,
+    substring: Option<&str>,
+) -> anyhow::Result<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut removed: Vec<String> = Vec::new();
+    match (index, substring) {
+        (Some(i), _) if i >= 1 && i <= lines.len() => {
+            removed.push(lines.remove(i - 1));
+        }
+        (Some(i), _) => {
+            return Ok(format!(
+                "index {i} out of range (memory has {} lines)",
+                lines.len()
+            ));
+        }
+        (None, Some(sub)) if !sub.trim().is_empty() => {
+            let lower = sub.to_lowercase();
+            let mut kept = Vec::with_capacity(lines.len());
+            for l in lines {
+                if l.to_lowercase().contains(&lower) {
+                    removed.push(l);
+                } else {
+                    kept.push(l);
+                }
+            }
+            lines = kept;
+        }
+        _ => return Ok("delete needs 'index' (from list) or 'substring'".into()),
+    }
+    let updated = lines.join("\n");
+    std::fs::write(path, updated)?;
+    if removed.is_empty() {
+        Ok("nothing removed".into())
+    } else {
+        Ok(format!(
+            "removed {} entr{}:\n{}",
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" },
+            removed.join("\n")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +187,59 @@ mod tests {
                 .unwrap()
                 .contains("no memory")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_numbers_entries() {
+        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let path = dir.join("memory.md");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "- (2026-08-09) alpha\n- (2026-08-09) beta\n\n").unwrap();
+
+        let out = list(&path).unwrap();
+        assert!(out.contains("2 entries"));
+        assert!(out.contains("  1. - (2026-08-09) alpha"));
+        assert!(out.contains("  2. - (2026-08-09) beta"));
+
+        // Empty file.
+        std::fs::write(&path, "").unwrap();
+        assert!(list(&path).unwrap().contains("empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_by_index_and_substring() {
+        let dir = std::env::temp_dir().join(format!("sigil-mem-{}", std::process::id()));
+        let path = dir.join("memory.md");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "- (2026-08-09) alpha\n- (2026-08-09) beta\n- (2026-08-09) gamma\n",
+        )
+        .unwrap();
+
+        // By index: remove entry 2 (beta).
+        let out = delete(&path, Some(2), None).unwrap();
+        assert!(out.contains("beta"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("beta"));
+
+        // Out of range index is reported cleanly.
+        let out = delete(&path, Some(99), None).unwrap();
+        assert!(out.contains("out of range"));
+
+        // By substring: remove gamma.
+        let out = delete(&path, None, Some("gamma")).unwrap();
+        assert!(out.contains("gamma"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("gamma") && text.contains("alpha"));
+
+        // Neither arg → guidance.
+        let out = delete(&path, None, None).unwrap();
+        assert!(out.contains("delete needs"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

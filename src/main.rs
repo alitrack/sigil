@@ -76,6 +76,15 @@ async fn main() -> Result<()> {
         system_prompt: harness.full_system_prompt(),
     };
 
+    // Sub-agent delegation: the model can spin off independent tasks.
+    let provider_arc: std::sync::Arc<dyn crate::llm::provider::LlmProvider> =
+        std::sync::Arc::new(provider);
+    tools.register(std::sync::Arc::new(tools::delegate::DelegateTool::new(
+        provider_arc.clone(),
+        tools.clone_shallow(),
+        agent_config.clone(),
+    )));
+
     if cli.list_sessions {
         let sessions_dir = cli
             .sessions_dir
@@ -96,8 +105,6 @@ async fn main() -> Result<()> {
     match &cli.command {
         Some(Command::Acp) => {
             eprintln!("sigil acp: serving Agent Client Protocol on stdio");
-            let provider_arc: std::sync::Arc<dyn crate::llm::provider::LlmProvider> =
-                std::sync::Arc::new(provider);
             acp::serve(tools, agent_config, provider_arc).await
         }
         _ if repl::should_enter_repl(&sub_prompt) => {
@@ -109,7 +116,7 @@ async fn main() -> Result<()> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(session::default_sessions_dir);
             repl::run(
-                &provider,
+                provider_arc.as_ref(),
                 &mut tools,
                 &agent_config,
                 &sessions_dir,
@@ -119,7 +126,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             let prompt = cli::prompt_from(sub_prompt)?;
-            let answer = agent::run_turn(&provider, &mut tools, &agent_config, &prompt)
+            let answer = agent::run_turn(provider_arc.as_ref(), &mut tools, &agent_config, &prompt)
                 .await
                 .context("agent turn failed")?;
             println!("{answer}");

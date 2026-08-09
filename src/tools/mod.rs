@@ -13,6 +13,7 @@ use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
 pub mod bash;
+pub mod delegate;
 pub mod evolve;
 pub mod files;
 pub mod git;

@@ -117,17 +117,36 @@ pub async fn run(
                 text: line.into(),
             },
         )?;
-
-        // Turn with interactive approval.
+        // Turn with interactive approval + live streaming output.
         let prompt = format!("{context_prefix}{line}");
-        let answer =
-            match run_turn_with_approver(provider, tools, config, &prompt, Some(&approver)).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("✗ error: {e}");
-                    continue;
+        let stream_cb = |delta: Option<&str>| {
+            match delta {
+                Some(d) => {
+                    print!("{d}");
+                    let _ = std::io::stdout().flush();
                 }
-            };
+                None => {
+                    // Tool call interrupted the text stream.
+                    eprintln!("\n[using tools…]");
+                }
+            }
+        };
+        let answer = match run_turn_with_approver(
+            provider,
+            tools,
+            config,
+            &prompt,
+            Some(&approver),
+            Some(&stream_cb),
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("✗ error: {e}");
+                continue;
+            }
+        };
         crate::session::append(
             sessions_dir,
             &session_id,

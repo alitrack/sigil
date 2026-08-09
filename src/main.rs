@@ -14,6 +14,7 @@ mod tools;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::Write;
 
 use crate::cli::{Cli, Command};
 use crate::config::Config;
@@ -133,10 +134,24 @@ async fn main() -> Result<()> {
         }
         _ => {
             let prompt = cli::prompt_from(sub_prompt)?;
-            let answer = agent::run_turn(provider_arc.as_ref(), &mut tools, &agent_config, &prompt)
-                .await
-                .context("agent turn failed")?;
-            println!("{answer}");
+            // Pipe mode with live streaming to stdout.
+            let stream_cb = |delta: Option<&str>| {
+                if let Some(d) = delta {
+                    print!("{d}");
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            let _answer = agent::run_turn_with_approver(
+                provider_arc.as_ref(),
+                &mut tools,
+                &agent_config,
+                &prompt,
+                None,
+                Some(&stream_cb),
+            )
+            .await
+            .context("agent turn failed")?;
+            println!();
             Ok(())
         }
     }

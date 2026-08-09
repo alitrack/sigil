@@ -34,6 +34,11 @@ pub struct AgentConfig {
 /// Returns true to run it (interactive override).
 pub type Approver = dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync;
 
+/// Stream callback: called with each chunk of assistant text as it
+/// arrives (UI streaming). Also called with `None` when a tool call
+/// interrupts the text stream (so the UI can flush).
+pub type StreamCb = dyn Fn(Option<&str>) + Send + Sync;
+
 /// One turn of the agent loop. Returns the assistant's final text.
 pub async fn run_turn(
     provider: &dyn LlmProvider,
@@ -41,19 +46,17 @@ pub async fn run_turn(
     config: &AgentConfig,
     user_prompt: &str,
 ) -> Result<String> {
-    run_turn_with_approver(provider, tools, config, user_prompt, None).await
+    run_turn_with_approver(provider, tools, config, user_prompt, None, None).await
 }
 
-/// Like [`run_turn`] but with an optional interactive approver: when
-/// the gate rejects a tool call and `approver` is present, the human
-/// may override the rejection (used by the REPL; piped mode passes
-/// None so the gate's default rejection stands).
+/// [`run_turn`] with optional interactive approver and stream callback.
 pub async fn run_turn_with_approver(
     provider: &dyn LlmProvider,
     tools: &mut ToolRegistry,
     config: &AgentConfig,
     user_prompt: &str,
     approver: Option<&Approver>,
+    stream_cb: Option<&StreamCb>,
 ) -> Result<String> {
     let mut messages = vec![ChatMessage::system(&config.system_prompt)];
     messages.push(ChatMessage::user(user_prompt));
@@ -90,6 +93,9 @@ pub async fn run_turn_with_approver(
             let chunk = chunk.context("reading stream")?;
             if !chunk.thinking {
                 text.push_str(&chunk.delta);
+                if let Some(cb) = stream_cb {
+                    cb(Some(&chunk.delta));
+                }
             }
             tool_calls_requested |= chunk.tool_calls_requested;
             if chunk.done {
@@ -98,6 +104,10 @@ pub async fn run_turn_with_approver(
         }
 
         if tool_calls_requested {
+            // Tell the UI the text stream is interrupted by tool calls.
+            if let Some(cb) = stream_cb {
+                cb(None);
+            }
             // Replay non-streaming to get the full tool-call payload.
             let complete: ChatComplete = provider
                 .chat_complete(req)

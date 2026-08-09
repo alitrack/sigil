@@ -13,6 +13,7 @@ use crate::harness;
 use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
+pub mod acp;
 pub mod bash;
 pub mod delegate;
 pub mod evolve;
@@ -104,6 +105,11 @@ impl ToolRegistry {
             .map(Path::to_path_buf)
             .unwrap_or_else(harness::default_harness_dir);
         registry.register(Arc::new(evolve::ImproveHarnessTool { harness_dir }));
+        // Cross-process ACP delegation: spawn an external ACP server.
+        registry.register(Arc::new(acp::AcpCallTool {
+            command: "sigil".to_string(),
+            args: vec!["acp".to_string()],
+        }));
         if let Some(dir) = scripted_dir {
             registry.register_scripted(dir);
         }

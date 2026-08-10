@@ -25,14 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 42** — persistent goals: the model declares
-> long-running objectives with `manage_goals` (add/complete/pause/
-> resume/list/clear); active goals are injected into the system
-> context every turn and persisted to `goals.jsonl` in the harness
-> dir, so they survive restarts and are shared across instances.
-> Plus Phase 41's harness refinement gate + token-budget compression,
-> Phase 39's memory write safety, Phase 38's LLM failover, Phase 36's
-> session continuity and Phase 35's cross-instance knowledge sync.
+> Status: **Phase 43** — async sub-agent delegation: `delegate`
+> spawns a sub-agent and returns a handle immediately (it runs in the
+> background); `status`/`result`/`list` poll and collect, mirroring
+> prime-agent's `rlm(...)` handle semantics. Plus Phase 42's
+> persistent goals, Phase 41's harness refinement gate +
+> token-budget compression, Phase 39's memory write safety, Phase
+> 38's LLM failover, Phase 36's session continuity and Phase 35's
+> cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -233,8 +233,23 @@ MCP tool list.
 | **40** ✅ | Robustness (tool timeouts + context compression + atomic export) |
 | **41** ✅ | Harness refinement gate (reason-gated edits + audit log; token-budget compression) |
 | **42** ✅ | Persistent goals (manage_goals tool + per-turn context injection + goals.jsonl) |
+| **43** ✅ | Async delegation (spawn → handle → status/result/list registry) |
 
 ## Changelog
+
+### Phase 43 — 2026-08-10
+- **Async sub-agent delegation** (mirrors prime-agent's `rlm(...)`
+  handle semantics): `delegate` gained a registry — `action=spawn`
+  starts the sub-agent and returns a handle (`d00000`) immediately;
+  it keeps running in the background (tokio task) while the main
+  agent works. `action=status` polls running/completed/failed,
+  `action=result` collects the final summary, `action=list`
+  enumerates all sub-agents. The result still never pollutes the
+  main conversation — only the summary text does.
+  - Tests: 113 total — delegate schema (4 actions), registry
+    lifecycle tracking.
+  - E2E: model spawns a sub-agent → handle returned immediately; the
+    next turn polls status and collects the result (echo via bash).
 
 ### Phase 42 — 2026-08-10
 - **Persistent goals** (inspired by prime-agent's `GoalState`):

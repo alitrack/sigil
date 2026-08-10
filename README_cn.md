@@ -23,12 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 42** — 持久目标：模型用 `manage_goals`
-> （add/complete/pause/resume/list/clear）声明长期目标；active 目标
-> 每轮注入系统上下文，并持久化到 harness 目录的 `goals.jsonl`，
-> 重启不丢、多实例共享。另有 Phase 41 的 harness 改进门控 +
-> token 预算压缩、Phase 39 记忆写安全、Phase 38 LLM 故障转移、
-> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
+> 状态：**Phase 43** — 异步子 agent 委托：`delegate` spawn 子 agent
+> 后立即返回 handle（后台运行），`status`/`result`/`list` 轮询与
+> 收集——对标 prime-agent 的 `rlm(...)` handle 语义。另有 Phase 42
+> 持久目标、Phase 41 harness 改进门控 + token 预算压缩、Phase 39
+> 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
+> 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -212,8 +212,20 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **40** ✅ | 健壮性（工具超时 + 上下文压缩 + 原子导出） |
 | **41** ✅ | harness 改进门控（reason 门控编辑 + 审计日志；token 预算压缩） |
 | **42** ✅ | 持久目标（manage_goals 工具 + 每轮上下文注入 + goals.jsonl） |
+| **43** ✅ | 异步委托（spawn → handle → status/result/list 注册表） |
 
 ## 更新日志
+
+### Phase 43 — 2026-08-10
+- **异步子 agent 委托**（对标 prime-agent 的 `rlm(...)` handle
+  语义）：`delegate` 引入注册表——`action=spawn` 启动子 agent 并
+  立即返回 handle（`d00000`），它在后台（tokio task）继续跑，主
+  agent 同时干别的活。`action=status` 轮询 running/completed/failed，
+  `action=result` 收集最终摘要，`action=list` 枚举所有子 agent。
+  结果仍不污染主对话——只有摘要文本进入。
+  - 测试：共 113——delegate schema（4 个 action）、注册表生命周期。
+  - E2E：模型 spawn 子 agent → 立即拿到 handle；下一轮轮询 status
+    并收集结果（bash echo）。
 
 ### Phase 42 — 2026-08-10
 - **持久目标**（借鉴 prime-agent 的 `GoalState`）：`manage_goals`

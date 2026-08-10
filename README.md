@@ -25,13 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 44** — background daemon: `sigil daemon` keeps the
-> agent loop alive on a Unix socket; `sigil attach` / `sigil send`
-> drive it from anywhere, and a client can disconnect mid-run while
-> the task keeps going (herdr's "the runtime your coding agents live
-> on"). The daemon carries multi-turn context across connections and
-> persists every turn to the session file. Plus Phase 43's async
-> delegation, Phase 42's persistent goals, Phase 41's harness
+> Status: **Phase 45** — ratchet in CI + goal turn-budgets: the ratchet
+> now has a deterministic `--check-only` mode (task schema + source
+> anchor drift detection) wired into CI, and goals support an optional
+> `turn_budget` — one LLM call = one turn, auto-pause when exhausted.
+> Before: Phase 44 daemon, Phase 43 async delegation, Phase 42 goals,
+> Phase 41's harness
 > refinement gate + token-budget compression, Phase 39's memory write
 > safety, Phase 38's LLM failover, Phase 36's session continuity and
 > Phase 35's cross-instance knowledge sync.
@@ -237,8 +236,22 @@ MCP tool list.
 | **42** ✅ | Persistent goals (manage_goals tool + per-turn context injection + goals.jsonl) |
 | **43** ✅ | Async delegation (spawn → handle → status/result/list registry) |
 | **44** ✅ | Background daemon (Unix socket agent loop + attach/send + session persistence) |
+| **45** ✅ | Ratchet in CI (--check-only) + goal turn-budgets (auto-pause) |
 
 ## Changelog
+
+### Phase 45 — 2026-08-10
+- **Ratchet in CI**: `ratchet.py --check-only` is a deterministic,
+  no-LLM validation (task schema + source-anchor drift detection) —
+  wired into the CI pipeline. Catches the P44-style failure where a
+  changed source line silently broke a file-anchored assertion.
+- **Goal turn-budgets**: `manage_goals add` accepts an optional
+  `turn_budget` (one LLM call = one turn). Active goals show
+  `(turns N/M)` in the injected block and `manage_goals list`; the
+  goal auto-pauses once the budget is spent and stops being injected.
+  Pre-budget goals.jsonl files load unchanged (serde defaults).
+- 120 tests; ratchet 12/12; E2E: goal-budget flow (add → 2 turns →
+  auto-pause persisted → no further injection) green.
 
 ### Phase 44r — 2026-08-10 (review fixes)
 Systematic review of Phases 41–44 (compression, refinement gate,

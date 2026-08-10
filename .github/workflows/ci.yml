@@ -32,3 +32,15 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release --locked
+
+  ratchet-check:
+    name: Ratchet config & anchor drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate ratchet tasks & source anchors
+        # Deterministic (no LLM): validates the ratchet task schema and
+        # that file-anchored assertions still match the source they pin
+        # (a drifted assertion failed file_tool_read in P44).
+        run: python3 test-tools/ratchet.py --check-only

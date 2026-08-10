@@ -66,6 +66,10 @@ impl Tool for ManageGoalsTool {
                     "type": "string",
                     "description": "For add: one clear sentence describing the goal."
                 },
+                "turn_budget": {
+                    "type": "integer",
+                    "description": "For add (optional): auto-pause the goal after this many agent turns (one LLM call = one turn)."
+                },
                 "id": {
                     "type": "string",
                     "description": "Goal id (shown by 'list') — required for complete/pause/resume."
@@ -96,8 +100,19 @@ impl Tool for ManageGoalsTool {
                     );
                 }
                 let id = format!("g{}", crate::session::chrono_like_timestamp());
+                // Optional turn budget: auto-pause after N agent turns.
+                let budget = args
+                    .get("turn_budget")
+                    .and_then(Value::as_u64)
+                    .filter(|b| *b > 0);
                 self.with_goals(|goals| {
-                    goals.push(GoalState::new(id.clone(), objective.to_string()));
+                    let goal = match budget {
+                        Some(b) => {
+                            GoalState::with_turn_budget(id.clone(), objective.to_string(), b)
+                        }
+                        None => GoalState::new(id.clone(), objective.to_string()),
+                    };
+                    goals.push(goal);
                     Ok(())
                 })?;
                 Ok(ToolOutput {
@@ -157,6 +172,9 @@ impl Tool for ManageGoalsTool {
                         },
                         g.objective
                     ));
+                    if let Some(b) = g.turn_budget {
+                        text.push_str(&format!(" (turns {}/{})", g.turns_used, b));
+                    }
                 }
                 Ok(ToolOutput { text })
             }
@@ -239,6 +257,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(load_goals(&dir)[1].status, GoalStatus::Active);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_with_turn_budget_parses_and_lists() {
+        let (dir, _) = fresh_dir("budget");
+        let goals: Arc<RwLock<Vec<GoalState>>> = Arc::new(RwLock::new(Vec::new()));
+        let tool = ManageGoalsTool {
+            goals_dir: dir.clone(),
+            goals: goals.clone(),
+        };
+
+        let out = tool
+            .run(&json!({
+                "action": "add",
+                "objective": "refactor the core module",
+                "turn_budget": 3,
+            }))
+            .await
+            .unwrap();
+        let _id = out.text.split('\'').nth(1).unwrap().to_string();
+        let on_disk = load_goals(&dir);
+        assert_eq!(on_disk[0].turn_budget, Some(3));
+        assert_eq!(on_disk[0].turns_used, 0);
+
+        // list shows the budget progress.
+        let listed = tool.run(&json!({ "action": "list" })).await.unwrap();
+        assert!(listed.text.contains("(turns 0/3)"), "{}", listed.text);
+
+        // Zero/negative budgets are treated as "no budget".
+        let out = tool
+            .run(&json!({
+                "action": "add",
+                "objective": "another goal without a budget",
+                "turn_budget": 0,
+            }))
+            .await
+            .unwrap();
+        let id2 = out.text.split('\'').nth(1).unwrap().to_string();
+        let on_disk = load_goals(&dir);
+        let g2 = on_disk.iter().find(|g| g.id == id2).unwrap();
+        assert_eq!(g2.turn_budget, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

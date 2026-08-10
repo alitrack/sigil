@@ -263,7 +263,76 @@ TASKS = [
 ]
 
 
+KNOWN_SPECIALS = {"mcp", "acp", "session", "live", "tools", "skilldeps", "memory", "createtool"}
+
+# File-anchored assertions: (task name, repo-relative source path,
+# string that must appear in that file). These pin the ratchet to the
+# actual source — if the source changes, the ratchet must be updated
+# with it (the P44 cli.rs first-line change broke file_tool_read).
+SOURCE_ANCHORS = [
+    ("file_tool_read", "src/cli.rs", "use std::path::PathBuf"),
+]
+
+
+def check_only() -> int:
+    """Deterministic ratchet validation for CI: task schema + source
+    anchors. No LLM, no binary, no network."""
+    failed = 0
+    seen = set()
+    for task in TASKS:
+        name = task.get("name")
+        if not isinstance(name, str) or not name:
+            print(f"FAIL: task missing 'name': {task!r}")
+            failed += 1
+            continue
+        if name in seen:
+            print(f"FAIL: duplicate task name '{name}'")
+            failed += 1
+        seen.add(name)
+        if not isinstance(task.get("prompt"), str):
+            print(f"FAIL: {name}: 'prompt' must be a string")
+            failed += 1
+        asserts = task.get("assert")
+        if not isinstance(asserts, list) or not asserts or not all(
+            isinstance(a, str) and a for a in asserts
+        ):
+            print(f"FAIL: {name}: 'assert' must be a non-empty list of strings")
+            failed += 1
+        special = task.get("special")
+        if special is not None and special not in KNOWN_SPECIALS:
+            print(f"FAIL: {name}: unknown special '{special}'")
+            failed += 1
+    for task_name, path, anchor in SOURCE_ANCHORS:
+        if task_name not in seen:
+            print(f"FAIL: anchor task '{task_name}' not found in TASKS")
+            failed += 1
+            continue
+        if not os.path.exists(path):
+            print(f"FAIL: {task_name}: anchor file '{path}' missing")
+            failed += 1
+            continue
+        with open(path) as f:
+            content = f.read()
+        if anchor not in content:
+            print(
+                f"FAIL: {task_name}: '{anchor}' no longer in {path} — "
+                f"the ratchet assertion drifted from the source; update both"
+            )
+            failed += 1
+    if failed:
+        print(f"RATCHET-CHECK: {len(TASKS) - failed}/{len(TASKS)} tasks valid — {failed} problems")
+        return 1
+    print(f"RATCHET-CHECK: {len(TASKS)}/{len(TASKS)} tasks valid ✅")
+    return 0
+
+
 def main() -> int:
+    # --check-only: deterministic validation runnable in CI (no LLM).
+    # Catches ratchet-drift: task schema mistakes and file-anchored
+    # assertions that no longer match the source they pin (e.g. the
+    # cli.rs first-line change that broke file_tool_read in P44).
+    if "--check-only" in sys.argv:
+        return check_only()
     # Prepare per-task sandboxes. TOOLS is isolated from the real
     # ~/.sigil/tools — model-created tools from previous sessions must
     # never leak into the ratchet (a bad persisted schema would 400

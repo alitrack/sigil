@@ -1,10 +1,10 @@
 //! Persistent goals: the model declares what it is working toward and
 //! sigil keeps active goals visible in every turn's system context.
 //!
-//! Mirrors prime-agent's `GoalState` (objective + status + budget)
-//! minus the per-turn token accounting: sigil's goals are durable
-//! across sessions (`harness_dir/goals.jsonl`) and surfaced to the
-//! model every turn until completed.
+//! Mirrors prime-agent's `GoalState` (objective + status + budget).
+//! The provider reports no token usage, so the budget is counted in
+//! **agent turns** (one LLM call = one turn): an optional `turn_budget`
+//! auto-pauses the goal once its turns are used up.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,13 @@ pub struct GoalState {
     pub status: GoalStatus,
     pub created_ts: String,
     pub updated_ts: String,
+    /// Optional turn budget: the goal auto-pauses once this many agent
+    /// turns have been spent on it (`None` = unlimited).
+    #[serde(default)]
+    pub turn_budget: Option<u64>,
+    /// Agent turns spent on this goal while it was active.
+    #[serde(default)]
+    pub turns_used: u64,
 }
 
 impl GoalState {
@@ -38,8 +45,46 @@ impl GoalState {
             status: GoalStatus::Active,
             created_ts: ts.clone(),
             updated_ts: ts,
+            turn_budget: None,
+            turns_used: 0,
         }
     }
+
+    pub fn with_turn_budget(id: String, objective: String, budget: u64) -> Self {
+        let mut g = Self::new(id, objective);
+        g.turn_budget = Some(budget);
+        g
+    }
+}
+
+/// Spend one turn on every active goal. Returns the number of goals
+/// whose budget became exhausted as a result.
+pub fn bump_turn_usage(goals: &mut [GoalState]) -> usize {
+    let mut exhausted = 0;
+    for g in goals.iter_mut() {
+        if g.status == GoalStatus::Active {
+            g.turns_used += 1;
+            if g.turn_budget.is_some_and(|b| g.turns_used >= b) {
+                exhausted += 1;
+            }
+        }
+    }
+    exhausted
+}
+
+/// Auto-pause active goals whose turn budget is exhausted (so the
+/// model stops being nudged toward a goal that ran out of runway).
+/// Returns how many goals were paused.
+pub fn pause_exhausted(goals: &mut [GoalState]) -> usize {
+    let mut paused = 0;
+    for g in goals.iter_mut() {
+        if g.status == GoalStatus::Active && g.turn_budget.is_some_and(|b| g.turns_used >= b) {
+            g.status = GoalStatus::Paused;
+            g.updated_ts = crate::session::chrono_like_timestamp();
+            paused += 1;
+        }
+    }
+    paused
 }
 
 /// Load goals from `dir/goals.jsonl` (one JSON per line, newest last).
@@ -90,7 +135,11 @@ pub fn active_goals_block(goals: &[GoalState]) -> Option<String> {
     let mut out = String::from(GOALS_MARKER);
     out.push('\n');
     for g in &active {
-        out.push_str(&format!("- `{}`: {}\n", g.id, g.objective));
+        out.push_str(&format!("- `{}`: {}", g.id, g.objective));
+        if let Some(b) = g.turn_budget {
+            out.push_str(&format!(" (turns {}/{})", g.turns_used, b));
+        }
+        out.push('\n');
     }
     out.push_str(
         "Keep working toward these. When one is done, call manage_goals with action=complete on its id.",
@@ -126,6 +175,61 @@ mod tests {
         g.status = GoalStatus::Complete;
         assert!(active_goals_block(&[g]).is_none());
         assert!(active_goals_block(&[]).is_none());
+    }
+
+    #[test]
+    fn turn_budget_bumps_and_auto_pauses() {
+        let g1 = GoalState::with_turn_budget("g1".into(), "ship v2".into(), 2);
+        let g2 = GoalState::new("g2".into(), "unlimited".into());
+        let mut g3 = GoalState::with_turn_budget("g3".into(), "paused early".into(), 5);
+        g3.status = GoalStatus::Paused;
+
+        // Turn 1: both actives bump; budget 2 not yet exhausted.
+        assert_eq!(
+            bump_turn_usage(&mut [g1.clone(), g2.clone(), g3.clone()]),
+            0
+        );
+        let mut all = vec![g1.clone(), g2.clone(), g3.clone()];
+        bump_turn_usage(&mut all);
+        assert_eq!(all[0].turns_used, 1);
+        assert_eq!(all[1].turns_used, 1);
+        assert_eq!(all[2].turns_used, 0, "paused goals don't spend turns");
+        assert_eq!(pause_exhausted(&mut all), 0);
+
+        // While active, a budgeted goal's progress shows in the block.
+        let block = active_goals_block(&all).unwrap();
+        assert!(block.contains("(turns 1/2)"), "{block}");
+        assert!(block.contains("unlimited"));
+
+        // Turn 2: g1 exhausts (2/2) → auto-paused; g2 keeps counting.
+        bump_turn_usage(&mut all);
+        assert_eq!(pause_exhausted(&mut all), 1);
+        assert_eq!(all[0].status, GoalStatus::Paused);
+        assert_eq!(all[1].status, GoalStatus::Active);
+        assert_eq!(all[1].turns_used, 2);
+
+        // Exhausted goals no longer appear in the injected block.
+        let block = active_goals_block(&all).unwrap();
+        assert!(!block.contains("ship v2"));
+        assert!(block.contains("unlimited"));
+    }
+
+    #[test]
+    fn old_goal_lines_without_budget_fields_load() {
+        // Pre-budget goals.jsonl lines must still parse (serde default).
+        let dir = std::env::temp_dir().join(format!("sigil-goals-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("goals.jsonl"),
+            "{\"id\":\"g1\",\"objective\":\"legacy goal\",\"status\":\"active\",\"created_ts\":\"t\",\"updated_ts\":\"t\"}\n",
+        )
+        .unwrap();
+        let loaded = load_goals(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].turn_budget, None);
+        assert_eq!(loaded[0].turns_used, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub struct AgentConfig {
     /// goals are injected into the system context each turn until
     /// completed. `None` disables the goals feature.
     pub goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
+    /// Where `goals.jsonl` lives, for persisting turn-budget
+    /// auto-pauses from the agent loop (same file the tool writes).
+    pub goals_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentConfig {
@@ -343,10 +346,22 @@ pub async fn run_messages(
         // loop re-runs this every iteration, so an already-injected
         // block is *replaced* in place rather than duplicated.
         if let Some(goals) = &config.goals
-            && let Ok(g) = goals.read()
-            && let Some(block) = crate::goals::active_goals_block(&g)
+            && let Ok(mut g) = goals.write()
         {
-            inject_goals_block(&mut messages, &block);
+            // Turn-budget accounting: one LLM call = one turn. Spend a
+            // turn on every active goal, auto-pause the exhausted ones,
+            // and persist (the tool holds the same Arc, so the budget
+            // state stays consistent for `manage_goals list`).
+            let paused =
+                crate::goals::bump_turn_usage(&mut g) + crate::goals::pause_exhausted(&mut g);
+            if paused > 0
+                && let Some(dir) = &config.goals_dir
+            {
+                let _ = crate::goals::save_goals(dir, &g);
+            }
+            if let Some(block) = crate::goals::active_goals_block(&g) {
+                inject_goals_block(&mut messages, &block);
+            }
         }
 
         // Fresh specs every turn: evolution tools may have added tools

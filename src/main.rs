@@ -152,6 +152,9 @@ async fn main() -> Result<()> {
         max_context_messages: 40,
         max_context_tokens: 64_000,
         goals: Some(goals),
+        // Where goals.jsonl lives — the agent loop persists turn-budget
+        // auto-pauses there (same dir the manage_goals tool writes).
+        goals_dir: Some(goals_dir),
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

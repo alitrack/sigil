@@ -316,6 +316,7 @@ mod tests {
                 max_context_messages: 0,
                 max_context_tokens: 0,
                 goals: None,
+                goals_dir: None,
             },
             delegates: Arc::new(DelegateRegistry::default()),
         };

@@ -25,10 +25,17 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 48** — external research landing: parallel tool
-> execution, reactive compaction retry, planning checkpoints and
-> sub-agent report templates (from OpenHands + smolagents).
-> Before: Phase 47 CLI consistency, Phase 46 daemon UX polish, Phase 45
+> Status: **Phase 49** — structured run results: `run_messages` now
+> returns a `RunResult` (output + steps + state) instead of a bare
+> string; step-budget exhaustion no longer aborts the turn — the loop
+> runs one final tool-less call (smolagents' `provide_final_answer`)
+> for a wrap-up summary tagged `StepLimitReached`, and the daemon's
+> `done` frame carries the state. Also fixed a daemon crash on
+> multi-byte log truncation (UTF-8 char-boundary panic).
+> Before: Phase 48 external research landing (parallel tool execution,
+> reactive compaction retry, planning checkpoints, sub-agent report
+> templates) + 48r daemon deadlock fix, Phase 47 CLI consistency,
+> Phase 46 daemon UX polish, Phase 45
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -272,6 +279,27 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 49 — 2026-08-11 (structured run results + UTF-8 log fix)
+- `run_messages` now returns `RunResult { output, steps, state }`
+  (borrowed from smolagents' `RunResult`) instead of a bare String —
+  callers can tell a normal answer from a budget-exhausted run
+  without parsing error text.
+- **Step budget no longer aborts the turn** (smolagents'
+  `provide_final_answer`): when `max_steps` is hit, the loop runs one
+  final *tool-less* LLM call asking for a wrap-up summary and returns
+  it tagged `RunState::StepLimitReached`. Previously this was
+  `bail!` — REPL showed an error and the daemon's `done` frame was
+  never sent.
+- The daemon's `done` frame now carries a `state` field (`"ok"` /
+  `"step_limit"`); the REPL prints a yellow notice when the answer is
+  a step-limit summary.
+- Fixed a daemon crash on multi-byte log truncation: the "user turn"
+  / "turn done" preview sliced bytes with `&s[..len.min(40)]`,
+  panicking when 40 landed inside a UTF-8 char (Chinese text). Now
+  truncated char-safe via `truncate_log`.
+- 126 tests; clippy 0; fmt clean; ratchet 12/12; E2E: daemon send in
+  Chinese no longer crashes and the answer round-trips.
 
 ### Phase 47 — 2026-08-10 (CLI consistency)
 - **Pipe mode honors `--resume`**: `sigil prompt --resume latest "…"`

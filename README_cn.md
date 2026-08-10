@@ -23,9 +23,14 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 48** — 外部调研落地：并行工具执行、反应式压缩重试、
-> 规划检查点、子 agent 报告模板（来自 OpenHands + smolagents）。
-> 此前：Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
+> 状态：**Phase 49** — 结构化运行结果：`run_messages` 返回
+> `RunResult`（output + steps + state）而非裸字符串；步数预算用尽不再
+> 中止回合——循环追加一次无工具调用（smolagents `provide_final_answer`）
+> 产出收尾总结并标记 `StepLimitReached`，daemon 的 `done` 帧携带 state。
+> 另修复 daemon 多字节日志截断崩溃（UTF-8 字符边界 panic）。
+> 此前：Phase 48 外部调研落地（并行工具执行、
+> 反应式压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
+> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
 > ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
 > Phase 42 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
@@ -245,6 +250,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 49 — 2026-08-11（结构化运行结果 + UTF-8 日志修复）
+- `run_messages` 现返回 `RunResult { output, steps, state }`
+  （借鉴 smolagents 的 `RunResult`）而非裸 String——调用方能直接
+  区分正常回答与预算用尽，无需解析错误文本。
+- **步数预算不再中止回合**（smolagents `provide_final_answer`）：
+  `max_steps` 用尽时循环追加一次**无工具** LLM 调用索取收尾总结，
+  以 `RunState::StepLimitReached` 标记返回。此前是 `bail!`——
+  REPL 显示错误、daemon 的 `done` 帧从不发送。
+- daemon 的 `done` 帧新增 `state` 字段（`"ok"` / `"step_limit"`）；
+  REPL 在答案是步数总结时打印黄色提示。
+- 修复 daemon 多字节日志截断崩溃：「user turn」/「turn done」
+  预览用 `&s[..len.min(40)]` 字节切片，40 落在 UTF-8 字符中间时
+  panic（中文文本）。改用 `truncate_log` 字符安全截断。
+- 126 测试；clippy 0；fmt 干净；ratchet 12/12；E2E：中文 daemon
+  send 不再崩溃、答案完整往返。
 
 ### Phase 47 — 2026-08-10（CLI 一致性）
 - **pipe 模式支持 `--resume`**：`sigil prompt --resume latest "…"`

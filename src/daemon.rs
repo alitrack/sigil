@@ -156,7 +156,7 @@ async fn handle_connection(
                 if text.trim().is_empty() {
                     continue;
                 }
-                eprintln!("  [daemon] user turn: {:?}", &text[..text.len().min(40)]);
+                eprintln!("  [daemon] user turn: {:?}", truncate_log(&text, 40));
                 let _guard = state.loop_lock.lock().await;
                 // Append the user turn (session + in-memory history).
                 crate::session::append(
@@ -191,7 +191,7 @@ async fn handle_connection(
                         let _ = tx2.send(format!("{}\n", json!({"type": "delta", "text": d})));
                     }
                 };
-                let answer = run_messages(
+                let result = run_messages(
                     provider.as_ref(),
                     &mut tools,
                     config,
@@ -202,28 +202,39 @@ async fn handle_connection(
                 .await;
                 eprintln!(
                     "  [daemon] turn done: {:?}",
-                    answer
+                    result
                         .as_ref()
-                        .map(|s| &s[..s.len().min(40)])
-                        .unwrap_or("ERR")
+                        .map(|r| truncate_log(&r.output, 40))
+                        .unwrap_or_else(|_| "ERR".to_string())
                 );
 
-                match answer {
-                    Ok(answer) => {
+                match result {
+                    Ok(result) => {
                         {
                             let mut messages = state.messages.lock().await;
-                            messages.push(ChatMessage::assistant(answer.clone()));
+                            messages.push(ChatMessage::assistant(result.output.clone()));
                         }
                         crate::session::append(
                             sessions_dir,
                             &state.session_id,
                             &Turn {
                                 role: "assistant".into(),
-                                text: answer.clone(),
+                                text: result.output.clone(),
                                 ts: None,
                             },
                         )?;
-                        let _ = tx.send(format!("{}\n", json!({"type": "done", "text": answer})));
+                        let state_tag = match result.state {
+                            crate::agent::RunState::StepLimitReached => "step_limit",
+                            crate::agent::RunState::Success => "ok",
+                        };
+                        let _ = tx.send(format!(
+                            "{}\n",
+                            json!({
+                                "type": "done",
+                                "text": result.output,
+                                "state": state_tag,
+                            })
+                        ));
                     }
                     Err(e) => {
                         let _ = tx.send(format!(
@@ -300,6 +311,13 @@ pub async fn attach(socket_path: &Path) -> Result<()> {
     }
     stdin_task.abort();
     Ok(())
+}
+
+/// Truncate a string for log previews without panicking on a UTF-8
+/// char boundary (byte slicing `&s[..n]` panics when `n` lands inside
+/// a multi-byte char, e.g. Chinese text longer than the cap).
+fn truncate_log(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }
 
 /// One-shot send: send one message, print the streamed output and the

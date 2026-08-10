@@ -263,7 +263,7 @@ pub async fn run(
                 }
             }
         };
-        let answer = match crate::agent::run_messages(
+        let result = match crate::agent::run_messages(
             provider,
             tools,
             config,
@@ -273,13 +273,24 @@ pub async fn run(
         )
         .await
         {
-            Ok(a) => a,
+            Ok(r) => r,
             Err(e) => {
                 let msg = crate::ui::RED.paint(&format!("✗ error: {e}"), &stderr);
                 eprintln!("{msg}");
                 continue;
             }
         };
+        if result.state == crate::agent::RunState::StepLimitReached {
+            let msg = crate::ui::YELLOW.paint(
+                &format!(
+                    "⚠ step limit reached after {} steps — answer is a wrap-up summary",
+                    result.steps
+                ),
+                &stderr,
+            );
+            eprintln!("\n{msg}");
+        }
+        let answer = result.output;
         crate::session::append(
             sessions_dir,
             &session_id,

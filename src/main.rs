@@ -349,7 +349,7 @@ async fn main() -> Result<()> {
                 }
                 None => vec![crate::llm::ChatMessage::user(prompt)],
             };
-            let _answer = agent::run_messages(
+            let _result = agent::run_messages(
                 provider_arc.as_ref(),
                 &mut tools,
                 &agent_config,

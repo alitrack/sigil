@@ -295,7 +295,34 @@ pub async fn run_turn(
         ChatMessage::system(config.system_prompt_for(user_prompt)),
         ChatMessage::user(user_prompt),
     ];
-    run_messages(provider, tools, config, &messages, None, None).await
+    Ok(run_messages(provider, tools, config, &messages, None, None)
+        .await?
+        .output)
+}
+
+/// Outcome state of an agent loop run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunState {
+    /// The agent answered normally.
+    Success,
+    /// `max_steps` was exhausted; the loop asked the model for a
+    /// wrap-up summary instead of aborting mid-work.
+    StepLimitReached,
+}
+
+/// Structured result of a `run_messages` run — the answer text plus
+/// run metadata (borrowed from smolagents' `RunResult`: output +
+/// steps + state). Callers (REPL / daemon / delegate) no longer have
+/// to guess whether a run ended by answering or by exhausting its
+/// step budget: the state is explicit, and a budget-exhausted run is
+/// *not* an error (the model still produced a summary answer).
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    /// Final answer text (or the wrap-up summary on step-limit).
+    pub output: String,
+    /// Number of agent-loop iterations consumed.
+    pub steps: u32,
+    pub state: RunState,
 }
 
 /// The core agent loop over a pre-built message list
@@ -308,7 +335,7 @@ pub async fn run_messages(
     messages: &[ChatMessage],
     approver: Option<&Approver>,
     stream_cb: Option<&StreamCb>,
-) -> Result<String> {
+) -> Result<RunResult> {
     let mut messages = messages.to_vec();
 
     let breaker = safety::CircuitBreaker::new();
@@ -376,7 +403,22 @@ pub async fn run_messages(
         let specs = tools.specs();
 
         if config.max_steps > 0 && step >= config.max_steps {
-            anyhow::bail!("step limit ({}) reached", config.max_steps);
+            // Step budget exhausted (borrowed from smolagents'
+            // `provide_final_answer`): don't bail with whatever text
+            // happened to be streaming — run one final, tool-less LLM
+            // call asking for a wrap-up summary so the caller always
+            // gets a real answer, tagged with StepLimitReached.
+            let summary = provide_final_answer(provider, config, &messages, stream_cb).await;
+            return Ok(RunResult {
+                output: summary.unwrap_or_else(|e| {
+                    format!(
+                        "step limit ({}) reached — summary unavailable ({e})",
+                        config.max_steps
+                    )
+                }),
+                steps: step,
+                state: RunState::StepLimitReached,
+            });
         }
         step += 1;
 
@@ -461,7 +503,11 @@ pub async fn run_messages(
                 } else {
                     text
                 };
-                return Ok(answer.trim().to_string());
+                return Ok(RunResult {
+                    output: answer.trim().to_string(),
+                    steps: step,
+                    state: RunState::Success,
+                });
             }
             messages.push(ChatMessage::assistant_with_tools(
                 &complete.text,
@@ -566,8 +612,55 @@ pub async fn run_messages(
         }
 
         // No tool call — this is the final answer.
-        return Ok(text.trim().to_string());
+        return Ok(RunResult {
+            output: text.trim().to_string(),
+            steps: step,
+            state: RunState::Success,
+        });
     }
+}
+
+/// Final tool-less LLM call after the step budget is exhausted
+/// (smolagents' `provide_final_answer`). Asks the model to wrap up
+/// its progress so far into a summary answer, using the transcript
+/// accumulated in the loop. Deliberately passes no tools — the run
+/// must end, not extend itself.
+async fn provide_final_answer(
+    provider: &dyn LlmProvider,
+    config: &AgentConfig,
+    messages: &[ChatMessage],
+    stream_cb: Option<&StreamCb>,
+) -> Result<String> {
+    let mut msgs = messages.to_vec();
+    msgs.push(ChatMessage::system(
+        "Step budget exhausted. Do not call any tools. \
+         Summarize your progress so far and give your best final answer now.",
+    ));
+    let req = ChatRequest {
+        model: config.model.clone(),
+        messages: msgs,
+        tools: vec![],
+        stream: true,
+        temperature: None,
+    };
+    let mut stream = provider.chat_stream(req).await.context("final summary")?;
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading final summary")?;
+        if !chunk.thinking {
+            text.push_str(&chunk.delta);
+            if let Some(cb) = stream_cb {
+                cb(Some(&chunk.delta));
+            }
+        }
+        if chunk.done {
+            break;
+        }
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("final summary came back empty");
+    }
+    Ok(text.trim().to_string())
 }
 
 /// Classify a provider error: can compaction recover from it? OpenHands
@@ -782,7 +875,8 @@ mod parallel_tests {
         let answer = run_messages(&provider, &mut tools, &config, &msgs, None, None)
             .await
             .expect("compaction retry succeeds");
-        assert_eq!(answer, "AFTER-RETRY");
+        assert_eq!(answer.output, "AFTER-RETRY");
+        assert_eq!(answer.state, RunState::Success);
         // First stream failed, second succeeded.
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(provider.seen_compacted.load(Ordering::SeqCst), 1);
@@ -882,7 +976,8 @@ mod parallel_tests {
         )
         .await
         .expect("turn succeeds");
-        assert_eq!(answer, "PLANNED-DONE");
+        assert_eq!(answer.output, "PLANNED-DONE");
+        assert_eq!(answer.state, RunState::Success);
         let checkpoints = provider.checkpoint_at.lock().unwrap().clone();
         // Only step 0 (first iteration) carries the checkpoint: step 1's
         // request had it stripped, and there is no step 2 in this run.
@@ -964,7 +1059,8 @@ mod parallel_tests {
         )
         .await
         .expect("turn succeeds");
-        assert_eq!(answer, "DONE");
+        assert_eq!(answer.output, "DONE");
+        assert_eq!(answer.state, RunState::Success);
 
         // Both tools ran: two recorded start instants.
         let recorded = starts.lock().unwrap();
@@ -1001,7 +1097,76 @@ mod parallel_tests {
         )
         .await
         .expect("unknown tool must not abort the turn");
-        assert!(answer.contains("RECOVERED"));
+        assert!(answer.output.contains("RECOVERED"));
+    }
+
+    /// Always asks for tools, so the loop can only end via the step
+    /// budget — which must yield a wrap-up summary, not an error.
+    #[derive(Debug)]
+    struct EndlessToolProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmProvider for EndlessToolProvider {
+        fn name(&self) -> &str {
+            "endless-tools-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            // The final (tool-less) call is provide_final_answer: it
+            // must return a plain summary, not request more tools.
+            let is_summary = req.tools.is_empty();
+            let delta = if is_summary {
+                "WRAP-UP-SUMMARY".to_string()
+            } else {
+                String::new()
+            };
+            Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                crate::llm::provider::ChatChunk {
+                    delta,
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: !is_summary,
+                },
+            )])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-endless".into(),
+                    name: "fast_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn step_limit_returns_wrap_up_summary_not_error() {
+        let starts: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(FastTool(starts.clone())));
+
+        let provider = EndlessToolProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let mut config = test_config();
+        config.max_steps = 3;
+        let result = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("keep going")],
+            None,
+            None,
+        )
+        .await
+        .expect("step limit is a normal result, not an error");
+        assert_eq!(result.state, RunState::StepLimitReached);
+        assert_eq!(result.output, "WRAP-UP-SUMMARY");
+        // 3 budgeted loop iterations + 1 final summary call.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     }
 
     /// Emits [unknown_tool, fast_tool] then checks the model received

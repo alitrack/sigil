@@ -50,6 +50,46 @@ pub fn default_tools_dir() -> PathBuf {
         .join("tools")
 }
 
+/// Sanitize a model-written `-- schema:` value before it is advertised
+/// to the LLM endpoint.
+///
+/// The endpoint requires a JSON object schema; anything else 400s every
+/// call that advertises the tool. Instead of rejecting the whole schema
+/// outright, we repair what we can:
+/// - top-level must be an object, else fall back to the safe default;
+/// - a missing top-level `type` is legal JSON Schema — default to
+///   `"object"` (the endpoint assumes object parameters);
+/// - a `type` that is not `"object"` (e.g. `"string"`) falls back to the
+///   safe default (a non-object parameter schema is not a valid tool);
+/// - `properties` / `required` that are not an object / array are
+///   dropped so a malformed substructure never reaches the endpoint.
+fn sanitize_schema(v: Value) -> Value {
+    let mut obj = match v.as_object() {
+        Some(o) => o.clone(),
+        None => return json!({ "type": "object", "properties": {} }),
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        // Missing type: legal, default to object.
+        None => {
+            obj.insert("type".into(), json!("object"));
+        }
+        Some("object") => {}
+        // A non-object top-level type is not a valid tool schema.
+        Some(_) => return json!({ "type": "object", "properties": {} }),
+    }
+    if let Some(props) = obj.get("properties")
+        && !props.is_object()
+    {
+        obj.remove("properties");
+    }
+    if let Some(req) = obj.get("required")
+        && !req.is_array()
+    {
+        obj.remove("required");
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// A tool implemented in Lua.
 pub struct LuaTool {
     name: String,
@@ -76,11 +116,13 @@ impl LuaTool {
                 {
                     // A model-written schema must be a JSON object schema;
                     // a malformed one (e.g. missing the top-level `type`)
-                    // would 400 every LLM call that advertises this tool —
-                    // fall back to the safe default instead.
-                    if v.get("type").and_then(Value::as_str) == Some("object") {
-                        schema = v;
-                    }
+                    // would 400 every LLM call that advertises this tool.
+                    // Sanitize instead of rejecting outright: keep valid
+                    // object schemas (a missing `type` is legal JSON
+                    // Schema — default it to "object"), and drop invalid
+                    // substructures (e.g. `properties` that is not an
+                    // object) so they never reach the LLM endpoint.
+                    schema = sanitize_schema(v);
                 }
             }
         }
@@ -148,12 +190,12 @@ mod tests {
 
     #[test]
     fn malformed_schema_falls_back_to_default() {
-        // A model-written `-- schema:` missing the top-level `type` must
+        // A model-written `-- schema:` that is not an object schema must
         // not leak into the LLM advert (it would 400 every call that
         // advertises this tool). It falls back to the safe default.
         let path = tmp_file(
             "bad_schema.lua",
-            "-- schema: {\"name\":\"greet\",\"parameters\":{\"type\":\"object\"}}\nreturn function(args) return 'hi' end\n",
+            "-- schema: [1,2,3]\nreturn function(args) return 'hi' end\n",
         );
         let tool = LuaTool::new("bad_schema", &path, lua_runtime()).unwrap();
         let params = tool.parameters();
@@ -168,6 +210,68 @@ mod tests {
             "-- schema: {\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}\nreturn function(args) return 'hi' end\n",
         );
         let tool = LuaTool::new("good_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(params.get("properties").is_some());
+        assert_eq!(
+            params.pointer("/properties/x/type").and_then(Value::as_str),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn schema_without_type_defaults_to_object() {
+        // `-- schema: {"properties": {...}}` without a top-level `type`
+        // is legal JSON Schema — the properties must be kept, with the
+        // type defaulted to "object" (the endpoint assumes object
+        // parameters). Previously this valid schema was dropped.
+        let path = tmp_file(
+            "notype_schema.lua",
+            "-- schema: {\"properties\":{\"x\":{\"type\":\"string\"}}}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("notype_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert_eq!(
+            params.pointer("/properties/x/type").and_then(Value::as_str),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn malformed_substructures_are_dropped() {
+        // `properties` that is not an object (e.g. a string) must not
+        // reach the LLM endpoint — it is dropped, the rest is kept.
+        let path = tmp_file(
+            "badprops_schema.lua",
+            "-- schema: {\"type\":\"object\",\"properties\":\"nope\"}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("badprops_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(params.get("properties").is_none());
+
+        // Same for `required` that is not an array.
+        let path = tmp_file(
+            "badreq_schema.lua",
+            "-- schema: {\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":\"x\"}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("badreq_schema", &path, lua_runtime()).unwrap();
+        let params = tool.parameters();
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(params.get("required").is_none());
+        assert!(params.get("properties").is_some());
+    }
+
+    #[test]
+    fn non_object_top_level_type_falls_back() {
+        // A schema typed as something other than an object (e.g. a
+        // string) is not a valid tool parameter schema.
+        let path = tmp_file(
+            "string_schema.lua",
+            "-- schema: {\"type\":\"string\"}\nreturn function(args) return 'hi' end\n",
+        );
+        let tool = LuaTool::new("string_schema", &path, lua_runtime()).unwrap();
         let params = tool.parameters();
         assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
         assert!(params.get("properties").is_some());

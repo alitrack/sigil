@@ -218,6 +218,13 @@ TASKS = [
         "prompt": "我要开发一个 Rust 功能。先回答：根据你加载的技能，你需要注意哪些基础规则（不是 Rust 专属规则）？",
         "assert": ["base", "先读", "文件"],
         "special": "skilldeps",
+        # The model sometimes answers with Rust-only rules and never
+        # references the base skill's content (sampling randomness —
+        # observed in the Phase 48r regression check). Retry with an
+        # explicit pointer to the base skill so the dependency-inline
+        # check stays deterministic despite LLM variance.
+        "retries": 2,
+        "retry_prompt": "再次回答，这次请先列出你加载的技能名。其中有一个 base 技能（基础规则），请引用它的内容回答：开发 Rust 功能前你需要注意哪些基础规则？",
     },
     {
         "name": "live_prompt_edit",

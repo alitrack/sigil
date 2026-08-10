@@ -23,17 +23,20 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 52** — local/global 双轨第二步（scope 策略）：配置了
-> 会话局部层时，improve_harness **默认 scope=local**——实验落在会话层，
-> 全局写入成为显式的跨会话决策（提示模型把 global 留给持久通用改进）。
-> 此前：Phase 51 双轨本身（--local-harness-dir 合并视图 + scope 参数）、
-> Phase 50 Lua 沙箱加固（io/os 不再暴露、require 白名单、host.date
-> 替代 os.date）、Phase 49 结构化运行结果（RunResult +
-> provide_final_answer）、Phase 48 外部调研落地（并行工具执行、反应式
-> 压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
-> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
-> ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
-> Phase 42 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39
+> 状态：**Phase 53** — 子任务 resume + delegate 注册表持久化：子代理
+> 状态落盘为 `~/.sigil/delegates/<id>/meta.json`（或 `--delegates-dir`），
+> 启动时从磁盘恢复——子代理跨进程存活；`delegate` 工具新增
+> `action=resume`——用新指令延续已结束/失败的子代理，把原任务 + 最终
+> 报告作为上下文回喂（OpenHands partial-result 模式），并记录血缘
+> （list 显示 "resumed from <id>"）。此前：Phase 52 scope 策略（有
+> local 层时 improve_harness 默认 scope=local）、Phase 51 双轨本身
+> （--local-harness-dir 合并视图 + scope 参数）、Phase 50 Lua 沙箱
+> 加固、Phase 49 结构化运行结果（RunResult + provide_final_answer）、
+> Phase 48 外部调研落地（并行工具执行、反应式压缩重试、规划检查点、
+> 子 agent 报告模板）+ 48r daemon 死锁修复、Phase 47 CLI 一致性、
+> Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI + goal turn 预算、
+> Phase 44 daemon、Phase 43 异步委托、Phase 42 持久目标、Phase 41
+> 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
 > 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
@@ -251,6 +254,18 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 53 — 2026-08-11（子任务 resume + delegate 注册表持久化）
+- 子代理状态落盘为 `~/.sigil/delegates/<id>/meta.json`（或
+  `--delegates-dir`；原子写 tmp+rename），每次 insert/update 都持久化，
+  启动时从磁盘恢复——子代理跨进程存活，新 handle id 重新索引到已恢复
+  id 之上。
+- `delegate` 新增 `resume` 动作（id + task）：用新指令延续已结束/失败
+  的子代理；原任务 + 上次运行的最终报告/错误作为上下文回喂
+  （OpenHands partial-result 模式）。运行中的子代理拒绝 resume；
+  未知 id 清晰报错。`list` 显示血缘（"resumed from <id>"）。
+- 3 个新测试：meta.json 持久化；磁盘恢复 + handle 重新索引；resume
+  拒绝运行中/未知 id。
 
 ### Phase 52 — 2026-08-11（local/global 双轨第二步：scope 策略）
 - 配置了会话局部层（--local-harness-dir）时，improve_harness

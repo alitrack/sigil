@@ -57,6 +57,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub sessions_dir: Option<String>,
 
+    /// Directory where sub-agent delegate state is persisted
+    /// (default: ~/.sigil/delegates/). Each sub-agent gets a
+    /// `<id>/meta.json`; the registry is recovered from here on
+    /// startup, so delegates survive process restarts and can be
+    /// resumed.
+    #[arg(long, global = true)]
+    pub delegates_dir: Option<String>,
+
     /// List saved sessions and exit.
     #[arg(long, global = true)]
     pub list_sessions: bool,

@@ -25,19 +25,22 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 52** — local/global dual-track, step 2 (scope
-> strategy): with a local harness layer configured, improve_harness
-> **defaults to scope=local** — experiments land in the session layer
-> and global writes become the explicit cross-session decision (the
-> model is told to reserve global for durable, generally-useful
-> improvements). Previous: Phase 51 the dual-track itself
-> (--local-harness-dir merged view + scope parameter), Phase 50 Lua
-> sandbox hardening (io/os no longer exposed; require allowlist;
-> host.date), Phase 49 structured run results (RunResult +
-> provide_final_answer), Phase 48 parallel tools + reactive compaction +
-> planning checkpoints + delegate report templates, 48r daemon deadlock
-> fix, Phase 47 CLI consistency, Phase 46 daemon UX, Phase 45 ratchet in
-> CI.
+> Status: **Phase 53** — sub-agent resume + delegate registry
+> persistence: delegate state is now persisted as
+> `~/.sigil/delegates/<id>/meta.json` (or `--delegates-dir`) and
+> recovered on startup, so sub-agents survive process restarts; the
+> `delegate` tool gains `action=resume` — continuing a
+> finished/failed sub-agent with a new instruction, feeding the
+> original task + its final report back as context (the OpenHands
+> partial-result pattern) and recording the lineage (list shows
+> "resumed from <id>"). Previous: Phase 52 scope strategy (local
+> harness layer → improve_harness defaults to scope=local), Phase 51
+> the dual-track itself (--local-harness-dir merged view + scope
+> parameter), Phase 50 Lua sandbox hardening, Phase 49 structured run
+> results (RunResult + provide_final_answer), Phase 48 parallel tools +
+> reactive compaction + planning checkpoints + delegate report
+> templates, 48r daemon deadlock fix, Phase 47 CLI consistency, Phase
+> 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -281,6 +284,20 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 53 — 2026-08-11 (sub-agent resume + delegate registry persistence)
+- Delegate state is persisted as `~/.sigil/delegates/<id>/meta.json`
+  (or `--delegates-dir`; atomic tmp+rename) on every insert/update and
+  recovered on startup — sub-agents survive process restarts, and the
+  next handle id is re-indexed above recovered ones.
+- New `delegate` action `resume` (id + task): continues a
+  finished/failed sub-agent with a new instruction; the original task
+  and the earlier run's final report/error are fed back as context
+  (the OpenHands partial-result pattern). Running sub-agents are
+  refused; unknown ids error clearly. `list` shows the lineage
+  ("resumed from <id>").
+- 3 new tests: meta.json persistence; registry recovery from disk +
+  handle re-indexing; resume rejects running/unknown ids.
 
 ### Phase 52 — 2026-08-11 (local/global dual-track, step 2: scope strategy)
 - With a local layer configured (--local-harness-dir), improve_harness

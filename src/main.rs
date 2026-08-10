@@ -171,6 +171,12 @@ async fn main() -> Result<()> {
         provider_arc.clone(),
         tools.clone_shallow(),
         agent_config.clone(),
+        Some(
+            cli.delegates_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(tools::delegate::default_delegates_dir),
+        ),
     )));
 
     if cli.list_sessions {

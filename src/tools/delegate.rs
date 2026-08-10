@@ -108,6 +108,7 @@ mod tests {
                 max_inline_skills: 0,
                 sync_dir: None,
                 max_context_messages: 0,
+                max_context_tokens: 0,
             },
         };
         assert_eq!(tool.name(), "delegate");

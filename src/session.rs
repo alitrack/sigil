@@ -150,7 +150,7 @@ pub fn latest(sessions_dir: &Path) -> std::io::Result<Option<String>> {
 
 /// Compact timestamp: YYYYMMDD-HHMMSS-nnnnnnnnn (nanosecond precision
 /// so sessions started in the same second never collide).
-fn chrono_like_timestamp() -> String {
+pub fn chrono_like_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

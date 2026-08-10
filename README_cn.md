@@ -23,9 +23,10 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 40** — 健壮性：`bash`/`git` 工具 60s 超时（杀进程、
-> 作为普通工具输出报告给模型，不再挂死循环）；长 REPL 会话超过
-> 40 条消息时折叠为紧凑摘要；`session export` 原子写入。另有
+> 状态：**Phase 41** — harness 改进门控：`improve_harness` 写入现在
+> 必须有证据型 `reason` 并通过确定性质量门（拒绝空/相同/过短编辑）；
+> 被接受的编辑记入 `refinements.jsonl` 审计。上下文压缩新增 token
+> 预算（chars/4 启发式，默认 64k）并把读/写文件路径带进摘要。另有
 > Phase 39 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与
 > Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
@@ -209,8 +210,28 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **38** ✅ | LLM 故障转移（端点链：瞬时故障重试下一端点，4xx 中止） |
 | **39** ✅ | 记忆写安全（remember/delete 置于跨进程锁下） |
 | **40** ✅ | 健壮性（工具超时 + 上下文压缩 + 原子导出） |
+| **41** ✅ | harness 改进门控（reason 门控编辑 + 审计日志；token 预算压缩） |
 
 ## 更新日志
+
+### Phase 41 — 2026-08-10
+- **harness 改进门控**（借鉴 prime-agent 的 `/refine`）：
+  `improve_harness` 写入（`edit_prompt`/`add_skill`）现在必须有
+  `reason` 字段——一句话说明该改动为何是持久、有普遍价值的改进——
+  并过确定性质量门：空内容、与当前相同的内容、过短的 prompt
+  （< 100 字符）、无头技能、重复技能都在写入前被拒。每次被接受的
+  编辑追加到 `harness_dir/refinements.jsonl`（ts/action/name/reason/
+  result）审计，在既有目录锁内。
+- **token 预算压缩**。`compact_messages_with_budget` 在消息数预算
+  之上新增 chars/4 token 预算（默认 64k）：保留尾部从最新往回走、
+  累加 token 估算确定。摘要现在还记录 `Files read:`/`Files
+  modified:`（从 `read_file`/`write_file` 工具调用提取），压缩后
+  模型仍知道碰过哪些文件（prime-agent 用 `CompactionEntry.details`
+  做同样的事）。
+  - 测试：共 107——token 预算压缩、文件操作追踪、门控（缺 reason/
+    noop 重写/噪音形状/审计日志）。
+  - E2E：模型无 `reason` 调 `improve_harness` 被拒且 prompt 文件
+    原样；带 `reason` 时 skill 写入且 `refinements.jsonl` 增长。
 
 ### Phase 40 — 2026-08-10
 - **工具超时**。`bash`/`git` 原来跑 `tokio::process::Command` 无

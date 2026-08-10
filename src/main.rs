@@ -134,8 +134,10 @@ async fn main() -> Result<()> {
         // sigil process edits the harness dir.
         sync_dir: cli.harness_dir.as_deref().map(std::path::PathBuf::from),
         // Context budget: fold old turns into a summary when the
-        // transcript exceeds 40 messages (long REPL sessions).
+        // transcript exceeds 40 messages or ~64k tokens (long REPL
+        // sessions; deepseek-v4-flash context is 64k).
         max_context_messages: 40,
+        max_context_tokens: 64_000,
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

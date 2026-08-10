@@ -192,7 +192,8 @@ async fn improve_harness_edits_prompt() {
     let out = tool
         .run(&json!({
             "action": "edit_prompt",
-            "content": "original prompt\n\nAlways answer in Chinese."
+            "content": "original prompt\n\nAlways answer in Chinese.\n\nThis prompt is padded out well beyond one hundred characters so the quality gate accepts it as a substantial full-prompt replacement.",
+            "reason": "user asked for Chinese answers in every session"
         }))
         .await
         .unwrap();
@@ -220,7 +221,8 @@ async fn improve_harness_adds_and_lists_skills() {
         .run(&json!({
             "action": "add_skill",
             "name": "my-skill",
-            "content": "> A reusable procedure\n\n1. step one\n2. step two"
+            "content": "> A reusable procedure\n\n1. step one\n2. step two\n3. this body is padded out beyond the minimum length comfortably",
+            "reason": "the workflow repeats across sessions"
         }))
         .await
         .unwrap();
@@ -232,7 +234,8 @@ async fn improve_harness_adds_and_lists_skills() {
         .run(&json!({
             "action": "add_skill",
             "name": "../../bad!name",
-            "content": "> x\n\nbody"
+            "content": "> x\n\nbody padded out beyond the minimum length comfortably for the gate",
+            "reason": "same reason"
         }))
         .await
         .unwrap();
@@ -250,7 +253,8 @@ async fn improve_harness_adds_and_lists_skills() {
         .run(&json!({
             "action": "add_skill",
             "name": "dep-skill",
-            "content": "> Dep skill\n> depends_on: my-skill\n\nbody"
+            "content": "> Dep skill\n> depends_on: my-skill\n\nbody padded beyond the minimum length comfortably for the gate",
+            "reason": "dependency reuse"
         }))
         .await
         .unwrap();
@@ -297,7 +301,11 @@ async fn edit_prompt_updates_live_prompt_state() {
         prompt_state: Some(state.clone()),
     };
     let out = tool
-        .run(&json!({ "action": "edit_prompt", "content": "brand new prompt" }))
+        .run(&json!({
+            "action": "edit_prompt",
+            "content": "brand new prompt that is comfortably longer than one hundred characters so the quality gate accepts this full-prompt replacement as substantial",
+            "reason": "live-state propagation test"
+        }))
         .await
         .unwrap();
     assert!(out.text.contains("live"));
@@ -305,7 +313,158 @@ async fn edit_prompt_updates_live_prompt_state() {
     // The shared state now carries the new prompt — the agent loop
     // picks it up without a restart.
     let s = state.read().unwrap();
-    assert_eq!(s.system_prompt, "brand new prompt");
+    assert_eq!(
+        s.system_prompt,
+        "brand new prompt that is comfortably longer than one hundred characters so the quality gate accepts this full-prompt replacement as substantial"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn refinement_gate_rejects_missing_reason() {
+    let dir = fresh_dir("ahe-noreason");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "original prompt").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        prompt_state: None,
+    };
+    // No reason → rejected before any write.
+    let err = tool
+        .run(&json!({
+            "action": "edit_prompt",
+            "content": "A brand new full system prompt that is definitely longer than one hundred characters so length alone would not stop it"
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("requires 'reason'"), "got: {err}");
+    // The prompt file is untouched.
+    assert_eq!(
+        std::fs::read_to_string(harness.join("system_prompt.md")).unwrap(),
+        "original prompt"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn refinement_gate_rejects_noop_rewrites() {
+    let dir = fresh_dir("ahe-noop");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    let prompt = "A reasonably long original system prompt that clears the one hundred character minimum by a comfortable margin for the gate test";
+    std::fs::write(harness.join("system_prompt.md"), prompt).unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        prompt_state: None,
+    };
+    // Identical content (just whitespace difference) → rejected.
+    let err = tool
+        .run(&json!({
+            "action": "edit_prompt",
+            "content": format!("  {prompt}  "),
+            "reason": "test noop"
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("identical"), "got: {err}");
+
+    // Same-skill identical rewrite → rejected.
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    let skill = "> A skill description\n\nbody body body body body body body body";
+    std::fs::write(harness.join("skills").join("s.md"), skill).unwrap();
+    let err = tool
+        .run(&json!({
+            "action": "add_skill",
+            "name": "s",
+            "content": skill,
+            "reason": "test noop"
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("identical content"), "got: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn refinement_gate_rejects_noise_and_bad_shape() {
+    let dir = fresh_dir("ahe-noise");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "original prompt").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        prompt_state: None,
+    };
+    // Too short to be a full prompt replacement.
+    let err = tool
+        .run(&json!({
+            "action": "edit_prompt",
+            "content": "hi",
+            "reason": "test"
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("too short"), "got: {err}");
+
+    // Skill without the required '> desc' header.
+    let err = tool
+        .run(&json!({
+            "action": "add_skill",
+            "name": "bad",
+            "content": "no header here but otherwise long enough to pass the length gate easily yes indeed",
+            "reason": "test"
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("'> short description'"),
+        "got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn accepted_edits_are_audited_in_refinements_jsonl() {
+    let dir = fresh_dir("ahe-audit");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "original prompt").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        prompt_state: None,
+    };
+    tool.run(&json!({
+        "action": "edit_prompt",
+        "content": "A brand new full system prompt that is comfortably over one hundred characters so the quality gate happily accepts it for the audit test",
+        "reason": "audit test"
+    }))
+    .await
+    .unwrap();
+    tool.run(&json!({
+        "action": "add_skill",
+        "name": "audit-skill",
+        "content": "> Audit skill\n\nbody padded out beyond the minimum length comfortably for the gate",
+        "reason": "audit test"
+    }))
+    .await
+    .unwrap();
+
+    let log = std::fs::read_to_string(harness.join("refinements.jsonl")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "two accepted edits → two log lines: {log}");
+    assert!(lines[0].contains("\"action\":\"edit_prompt\""));
+    assert!(lines[0].contains("\"reason\":\"audit test\""));
+    assert!(lines[1].contains("\"action\":\"add_skill\""));
+    assert!(lines[1].contains("\"name\":\"audit-skill\""));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -25,12 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 40** — robustness: `bash`/`git` tools now time out
-> after 60s (killed, reported to the model instead of hanging the
-> loop); long REPL transcripts are folded into a compact summary when
-> they exceed 40 messages; `session export` writes atomically. Plus
-> Phase 39's memory write safety, Phase 38's LLM failover, Phase 36's
-> session continuity and Phase 35's cross-instance knowledge sync.
+> Status: **Phase 41** — harness refinement gate: `improve_harness`
+> writes now require an evidence-backed `reason` and pass deterministic
+> quality gates (no empty/identical/too-short edits); accepted edits
+> are audited in `refinements.jsonl`. Context compression gained a
+> token budget (chars/4 heuristic, 64k default) and tracks
+> read/write file paths into the summary. Plus Phase 39's memory
+> write safety, Phase 38's LLM failover, Phase 36's session continuity
+> and Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -229,8 +231,33 @@ MCP tool list.
 | **38** ✅ | LLM failover (endpoint chain: transient retry, 4xx abort) |
 | **39** ✅ | Memory write safety (remember/delete under cross-process lock) |
 | **40** ✅ | Robustness (tool timeouts + context compression + atomic export) |
+| **41** ✅ | Harness refinement gate (reason-gated edits + audit log; token-budget compression) |
 
 ## Changelog
+
+### Phase 41 — 2026-08-10
+- **Harness refinement gate** (inspired by prime-agent's `/refine`):
+  `improve_harness` writes (`edit_prompt` / `add_skill`) now require a
+  `reason` field — one sentence of evidence why the change is a
+  durable, generally-useful improvement — and pass deterministic
+  quality gates: empty content, identical-to-current rewrites,
+  too-short prompts (< 100 chars), header-less skills and duplicate
+  skills are all rejected before any write. Every accepted edit is
+  appended to `harness_dir/refinements.jsonl` (ts / action / name /
+  reason / result) for audit, inside the existing directory lock.
+- **Token-budget compression**. `compact_messages_with_budget` adds a
+  chars/4 token budget (default 64k) on top of the message-count
+  budget: the kept tail is chosen by walking backwards accumulating
+  token estimates. The summary now also tracks `Files read:` /
+  `Files modified:` from `read_file`/`write_file` tool calls, so a
+  compressed session tells the model which files it touched
+  (prime-agent tracks the same via `CompactionEntry.details`).
+  - Tests: 107 total — token-budget compression, file-op tracking,
+    refinement gate (missing reason / noop rewrite / noise shape /
+    audit log).
+  - E2E: a model calling `improve_harness` without `reason` is
+    rejected and the prompt file stays untouched; with `reason` the
+    skill is written and `refinements.jsonl` grows.
 
 ### Phase 40 — 2026-08-10
 - **Tool timeouts**. `bash` and `git` ran `tokio::process::Command`

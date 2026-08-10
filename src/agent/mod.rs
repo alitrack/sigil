@@ -43,6 +43,12 @@ pub struct AgentConfig {
     /// long REPL sessions don't grow the context without bound.
     /// `0` disables compression.
     pub max_context_messages: usize,
+    /// Token budget for the transcript per turn (chars/4 heuristic,
+    /// same shape as the context-window-based budgets used by
+    /// prime-agent's compaction). When the estimated transcript size
+    /// exceeds this, the oldest turns are folded like
+    /// `max_context_messages`. `0` disables the token budget.
+    pub max_context_tokens: usize,
 }
 
 impl AgentConfig {
@@ -87,15 +93,99 @@ impl AgentConfig {
 ///
 /// Returns the transcript unchanged when `max == 0` or the length is
 /// already within budget.
+#[cfg(test)]
 pub fn compact_messages(messages: &[ChatMessage], max: usize) -> Vec<ChatMessage> {
-    if max == 0 || messages.len() <= max || max < 3 {
+    compact_messages_with_budget(messages, max, 0)
+}
+
+/// Rough token estimate for a text (chars/4, conservative).
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() / 4).max(1)
+}
+
+/// Token estimate for one message, including tool-call payloads.
+pub fn estimate_message_tokens(m: &ChatMessage) -> usize {
+    let mut t = estimate_tokens(&m.content);
+    if let Some(calls) = &m.tool_calls {
+        for c in calls {
+            t += estimate_tokens(&c.name);
+            t += estimate_tokens(&c.arguments.to_string());
+        }
+    }
+    t
+}
+
+/// Extract `read_file` / `write_file` paths from assistant tool calls
+/// in a message slice, deduplicated in order of first use. Kept so the
+/// compaction summary can tell the model which files it touched — the
+/// one thing a naive excerpt fold loses (prime-agent tracks the same
+/// via `CompactionEntry.details`).
+fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
+    let mut read: Vec<String> = Vec::new();
+    let mut modified: Vec<String> = Vec::new();
+    for m in messages {
+        let Some(calls) = &m.tool_calls else { continue };
+        for c in calls {
+            let Some(path) = c.arguments.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let path = path.to_string();
+            match c.name.as_str() {
+                "read_file" if !read.contains(&path) => read.push(path),
+                "write_file" if !modified.contains(&path) => modified.push(path),
+                _ => {}
+            }
+        }
+    }
+    (read, modified)
+}
+
+/// [`compact_messages`] with a token budget: compress when the
+/// estimated transcript size exceeds `max_tokens` (chars/4 heuristic)
+/// OR the message count exceeds `max_msgs`. Either budget may be `0`
+/// to disable that axis. The kept tail is chosen by walking backwards
+/// from the newest message, accumulating tokens until the token budget
+/// (or message budget) is met, then extended forward to the nearest
+/// safe cut boundary.
+pub fn compact_messages_with_budget(
+    messages: &[ChatMessage],
+    max_msgs: usize,
+    max_tokens: usize,
+) -> Vec<ChatMessage> {
+    // No budget configured → never compress.
+    if max_msgs == 0 && max_tokens == 0 {
         return messages.to_vec();
     }
-    // Reserve one slot for the summary; keep the newest `max - 2`
-    // messages verbatim (index `cut` onward).
-    let keep = max - 2;
-    let mut cut = messages.len().saturating_sub(keep);
-    // Advance to the first safe boundary at-or-after `cut`.
+    if messages.len() < 3 {
+        return messages.to_vec();
+    }
+    // Already within every configured budget?
+    let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
+    let within_msgs = max_msgs == 0 || messages.len() <= max_msgs;
+    let within_tokens = max_tokens == 0 || total_tokens <= max_tokens;
+    if within_msgs && within_tokens {
+        return messages.to_vec();
+    }
+
+    // Walk backwards, accumulating token estimates, until the token
+    // budget or the message budget (minus the summary slot) is met.
+    let keep_count = max_msgs.saturating_sub(2).max(2);
+    let mut cut = 1usize;
+    let mut acc = 0usize;
+    for i in (1..messages.len()).rev() {
+        acc += estimate_message_tokens(&messages[i]);
+        let count_over = messages.len() - i >= keep_count;
+        let tokens_over = max_tokens > 0 && acc > max_tokens;
+        if count_over || tokens_over {
+            cut = i;
+            break;
+        }
+    }
+    if cut <= 1 {
+        // Nothing safe to trim — keep everything.
+        return messages.to_vec();
+    }
+    // Extend forward to the first safe boundary at-or-after `cut`.
     while cut < messages.len() {
         let safe = matches!(messages[cut].role, Role::User)
             || (matches!(messages[cut].role, Role::Assistant)
@@ -110,6 +200,16 @@ pub fn compact_messages(messages: &[ChatMessage], max: usize) -> Vec<ChatMessage
         return messages.to_vec();
     }
 
+    // Build the summary: file operations the model touched (the most
+    // valuable thing to preserve) + role-tagged one-line excerpts.
+    let (files_read, files_modified) = extract_file_ops(&messages[1..cut]);
+    let mut summary = String::from("[earlier conversation compressed]");
+    if !files_read.is_empty() {
+        summary.push_str(&format!("\nFiles read: {}", files_read.join(", ")));
+    }
+    if !files_modified.is_empty() {
+        summary.push_str(&format!("\nFiles modified: {}", files_modified.join(", ")));
+    }
     let mut excerpts: Vec<String> = Vec::new();
     for m in &messages[1..cut] {
         let first = m
@@ -128,12 +228,11 @@ pub fn compact_messages(messages: &[ChatMessage], max: usize) -> Vec<ChatMessage
         };
         excerpts.push(format!("{tag}: {first}"));
     }
-    let mut out = Vec::with_capacity(max);
+    summary.push_str(&format!("\n{}", excerpts.join(" | ")));
+
+    let mut out = Vec::with_capacity(max_msgs.max(8));
     out.push(messages[0].clone());
-    out.push(ChatMessage::system(format!(
-        "[earlier conversation compressed] {}",
-        excerpts.join(" | ")
-    )));
+    out.push(ChatMessage::system(summary));
     out.extend_from_slice(&messages[cut..]);
     out
 }
@@ -204,8 +303,12 @@ pub async fn run_messages(
 
         // Context budget: fold the oldest turns into a compact summary
         // when the transcript outgrew the window (long REPL sessions).
-        if config.max_context_messages > 0 {
-            messages = compact_messages(&messages, config.max_context_messages);
+        if config.max_context_messages > 0 || config.max_context_tokens > 0 {
+            messages = compact_messages_with_budget(
+                &messages,
+                config.max_context_messages,
+                config.max_context_tokens,
+            );
         }
 
         // Fresh specs every turn: evolution tools may have added tools
@@ -393,5 +496,84 @@ mod compact_tests {
         let c = compact_messages(&m, 8);
         assert_eq!(c[0].content, "SYS");
         assert_eq!(c[0].role, Role::System);
+    }
+
+    #[test]
+    fn compact_token_budget_triggers_and_respects_budget() {
+        // 1 system + 20 turns of moderately long text (~40+ chars each
+        // line → ~10+ tokens/message → well over 200 total).
+        let mut m = vec![ChatMessage::system("SYS")];
+        for i in 0..20 {
+            m.push(ChatMessage::user(format!(
+                "user-{i} this line is padded out to be reasonably long for token estimation purposes"
+            )));
+            m.push(ChatMessage::assistant(format!(
+                "assistant-{i} the reply is also padded to be long enough that the budget matters"
+            )));
+        }
+        let total = m.iter().map(estimate_message_tokens).sum::<usize>();
+        assert!(total > 200, "test transcript too small: {total}");
+        // Tight token budget → compress; kept tail must fit the budget
+        // plus the safe-boundary slack.
+        let c = compact_messages_with_budget(&m, 0, 200);
+        assert!(c.len() < m.len(), "expected compression");
+        // Summary + kept tail: kept tail alone respects the budget.
+        let kept_tail: usize = c[2..].iter().map(estimate_message_tokens).sum();
+        assert!(
+            kept_tail <= 260,
+            "kept tail {kept_tail} tokens exceeds budget with slack"
+        );
+        // No budget configured → no-op even for a huge transcript.
+        assert_eq!(compact_messages_with_budget(&m, 0, 0).len(), m.len());
+    }
+
+    #[test]
+    fn compact_summary_tracks_file_operations() {
+        // Old turn with read_file + write_file must surface the paths
+        // in the summary so the model knows what it touched.
+        let m = vec![
+            ChatMessage::system("SYS"),
+            ChatMessage::user("task"),
+            ChatMessage::assistant_with_tools(
+                "read then write",
+                vec![
+                    crate::llm::provider::ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "src/main.rs"}),
+                    },
+                    crate::llm::provider::ToolCall {
+                        id: "c2".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({"path": "src/config.rs"}),
+                    },
+                ],
+            ),
+            ChatMessage::tool_result("ok", "c1"),
+            ChatMessage::tool_result("ok", "c2"),
+            ChatMessage::user("newest-request"),
+        ];
+        let c = compact_messages_with_budget(&m, 0, 5);
+        let summary = c
+            .iter()
+            .find(|m| m.role == Role::System && m.content.contains("compressed"))
+            .expect("summary present");
+        assert!(
+            summary.content.contains("Files read: src/main.rs"),
+            "missing read file in summary: {}",
+            summary.content
+        );
+        assert!(
+            summary.content.contains("Files modified: src/config.rs"),
+            "missing modified file in summary: {}",
+            summary.content
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_chars_over_four() {
+        assert_eq!(estimate_tokens(""), 1);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
     }
 }

@@ -181,6 +181,40 @@ pub struct ImproveHarnessTool {
     pub prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
 }
 
+/// Require an evidence-backed `reason` for a harness write (the
+/// refinement gate). The model must justify why the change is a
+/// durable, generally-useful improvement — mirrors prime-agent's
+/// `/refine` review gate, minus the extra LLM round-trip.
+fn gated_reason(args: &Value) -> anyhow::Result<&str> {
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "improve_harness requires 'reason': explain in one sentence why this change is a durable, evidence-backed improvement (noise edits are rejected)"
+            )
+        })?;
+    Ok(reason)
+}
+
+/// Append one refinement event to `harness_dir/refinements.jsonl`
+/// (append-only audit log, inside the harness dir lock so concurrent
+/// instances never interleave).
+fn record_refinement(harness_dir: &std::path::Path, event: &Value) {
+    use std::io::Write;
+    let path = harness_dir.join("refinements.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = serde_json::to_string(event).unwrap_or_default();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 #[async_trait]
 impl Tool for ImproveHarnessTool {
     fn name(&self) -> &str {
@@ -192,7 +226,12 @@ impl Tool for ImproveHarnessTool {
          'edit_prompt' (replace system_prompt.md — content is the new full \
          prompt), 'add_skill' (create a skill markdown file whose first \
          line is '> short description', reusable by future sessions), \
-         'list_skills' (list existing skills). Use sparingly for durable, \
+         'list_skills' (list existing skills). \
+         Every write REQUIRES a 'reason' field: one sentence of evidence \
+         why this change is a durable, generally-useful improvement. \
+         Noise edits (empty/identical content, too-short prompts) are \
+         rejected, and every accepted edit is appended to \
+         refinements.jsonl for audit. Use sparingly for durable, \
          generally-useful improvements; the harness persists across \
          sessions."
     }
@@ -213,6 +252,10 @@ impl Tool for ImproveHarnessTool {
                 "name": {
                     "type": "string",
                     "description": "For add_skill: skill file name (no extension)."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "REQUIRED for edit_prompt/add_skill: one sentence of evidence why this change is a durable improvement. Rejected if missing."
                 }
             },
             "required": ["action"]
@@ -234,9 +277,30 @@ impl Tool for ImproveHarnessTool {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("edit_prompt requires 'content'"))?;
+                // Refinement gate: evidence-backed edits only. A reason
+                // is required so harness changes are auditable and
+                // reviewable (mirrors prime-agent's /refine review).
+                let reason = gated_reason(args)?;
                 let path = self.harness_dir.join("system_prompt.md");
+                let old = std::fs::read_to_string(&path).unwrap_or_default();
+                // Quality gate: a full prompt replacement must actually
+                // change something and stay substantial.
+                if content.trim().is_empty() {
+                    anyhow::bail!("edit_prompt: content is empty");
+                }
+                if content.chars().count() < 100 {
+                    anyhow::bail!(
+                        "edit_prompt: content too short ({} chars, min 100) — a full system prompt is needed; small tweaks belong in the 'reason' or a skill",
+                        content.chars().count()
+                    );
+                }
+                if old.trim() == content.trim() {
+                    anyhow::bail!(
+                        "edit_prompt: content identical to the current prompt — no change. If you meant a small tweak, say what changed in 'reason'"
+                    );
+                }
                 // Snapshot the current prompt before replacing it.
-                if let Ok(old) = std::fs::read_to_string(&path) {
+                if !old.is_empty() {
                     crate::harness::versions::backup_and_prune(
                         &self.harness_dir,
                         "prompt",
@@ -250,6 +314,15 @@ impl Tool for ImproveHarnessTool {
                 {
                     s.system_prompt = content.to_string();
                 }
+                record_refinement(
+                    &self.harness_dir,
+                    &json!({
+                        "ts": crate::session::chrono_like_timestamp(),
+                        "action": "edit_prompt",
+                        "reason": reason,
+                        "result": "ok",
+                    }),
+                );
                 Ok(ToolOutput {
                     text: format!(
                         "system_prompt.md updated ({} chars). It is live — the very next turn uses it.",
@@ -266,6 +339,8 @@ impl Tool for ImproveHarnessTool {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("add_skill requires 'content'"))?;
+                // Refinement gate: evidence-backed edits only.
+                let reason = gated_reason(args)?;
                 // Constrain the name to a safe file stem (drop unsafe).
                 let safe: String = name
                     .chars()
@@ -277,6 +352,30 @@ impl Tool for ImproveHarnessTool {
                 let skills_dir = self.harness_dir.join("skills");
                 std::fs::create_dir_all(&skills_dir)?;
                 let path = skills_dir.join(format!("{safe}.md"));
+                // Quality gate: a skill needs a description header, a
+                // real body, and must not be a no-op rewrite.
+                if content.trim().is_empty() {
+                    anyhow::bail!("add_skill: content is empty");
+                }
+                if content.chars().count() < 50 {
+                    anyhow::bail!(
+                        "add_skill: content too short ({} chars, min 50)",
+                        content.chars().count()
+                    );
+                }
+                let first_line = content.lines().next().unwrap_or("");
+                if !first_line.starts_with("> ") {
+                    anyhow::bail!(
+                        "add_skill: content must start with '> short description' as its first line"
+                    );
+                }
+                if let Ok(existing) = std::fs::read_to_string(&path)
+                    && existing.trim() == content.trim()
+                {
+                    anyhow::bail!(
+                        "add_skill: skill '{safe}' already exists with identical content — no change"
+                    );
+                }
                 // Snapshot the previous version if this skill exists.
                 if let Ok(old) = std::fs::read_to_string(&path) {
                     crate::harness::versions::backup_and_prune(
@@ -299,6 +398,16 @@ impl Tool for ImproveHarnessTool {
                 // not a reason to reject the skill).
                 let all_skills = crate::harness::load_skills(&skills_dir);
                 let cycles = crate::harness::find_dependency_cycles(&all_skills);
+                record_refinement(
+                    &self.harness_dir,
+                    &json!({
+                        "ts": crate::session::chrono_like_timestamp(),
+                        "action": "add_skill",
+                        "name": safe,
+                        "reason": reason,
+                        "result": "ok",
+                    }),
+                );
                 let mut text = format!(
                     "skill '{safe}' written to {}. It is live — relevant prompts inline it from the very next turn.",
                     path.display()

@@ -186,6 +186,7 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
         max_inline_skills: 2,
         sync_dir: None,
         max_context_messages: 0,
+        max_context_tokens: 0,
     };
 
     // Math prompt → skill index + math skill inlined after the base.

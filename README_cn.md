@@ -23,10 +23,10 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 36** — 会话续接：`session list` 现在显示轮数 + 首条
-> 用户消息摘要 + 最后活动时间（最新在前）；`--resume latest` /
-> `/session latest` 直接续接最近会话，不再手抄 id。另有 Phase 35 的
-> 跨实例知识同步（每轮指纹重载）。管道模式、
+> 状态：**Phase 38** — LLM 故障转移：provider 持端点链（主 +
+> `[llm] fallbacks` / `SIGIL_FALLBACK_BASE_URL`）；瞬时故障（网络错误、
+> 5xx、429）带退避重试下一端点，4xx 客户端错误立即中止。另有
+> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -204,8 +204,35 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **34** ✅ | 技能按需加载（紧凑常驻索引，正文按需读取） |
 | **35** ✅ | 跨实例知识同步（每轮 harness 指纹检查 → 热重载） |
 | **36** ✅ | 会话续接（`session list` 摘要 + `--resume latest`） |
+| **37** ✅ | ratchet LLM 方差容忍（任务级重试 + retry_prompt 强制话术） |
+| **38** ✅ | LLM 故障转移（端点链：瞬时故障重试下一端点，4xx 中止） |
 
 ## 更新日志
+
+### Phase 38 — 2026-08-10
+- **LLM 故障转移**。OpenAI 兼容 provider 现在持端点链：主端点 +
+  可选 fallback。瞬时故障（连接错误、5xx、429）带小退避（300ms×序号）
+  重试下一端点；4xx 客户端错误（坏 schema、认证失败、未知模型）立即
+  中止——重试另一端点无济于事。配置：config.toml 的
+  `[llm] fallbacks = [{ base_url, api_key }]` 或
+  `SIGIL_FALLBACK_BASE_URL`（逗号分隔）。
+  - `OpenAiProvider::with_fallbacks(config, fallbacks)`（取代 `new`）；
+    `PostError::{Fatal, Transient}` 分类；`post_with_fallback` 链循环
+    带逐端点 stderr 提示。
+  - 测试：`falls_back_to_second_endpoint_when_primary_is_down`、
+    `falls_back_on_server_error_but_not_on_client_error`、
+    `all_endpoints_down_reports_each_failure`（本地 TCP 假端点，
+    零网络）。共 92 项。
+  - E2E：主端点死 + cc-switch fallback → 模型正常回答且 stderr 出现
+    `[sigil] primary endpoint failed`；主端点活 → 无提示。
+
+### Phase 37 — 2026-08-10
+- **ratchet LLM 方差容忍**。`live_prompt_edit` 偶发失败：模型口头说
+  完成但没调工具（采样随机性，Phase 34/36 各遇一次）。不放松断言，
+  改为 LLM 驱动任务支持按任务重试：`retries: N` + `retry_prompt`
+  （显式「你必须实际调用工具」话术）。主循环断言失败或超时才重试；
+  live 任务每次重试前恢复 baseline `system_prompt.md`。模型一次通过
+  时无感；采样方差时自动兜住。
 
 ### Phase 36 — 2026-08-10
 - **会话续接**。`session list` 现在为每个会话渲染摘要（轮数、首条

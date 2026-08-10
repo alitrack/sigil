@@ -89,10 +89,13 @@ mod tests {
     fn delegate_schema_is_valid() {
         let tool = DelegateTool {
             provider: Arc::new(
-                crate::llm::openai::OpenAiProvider::new(crate::llm::openai::OpenAiConfig {
-                    base_url: "http://localhost:1/v1".into(),
-                    api_key: "x".into(),
-                })
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
                 .unwrap(),
             ),
             registry: ToolRegistry::default(),

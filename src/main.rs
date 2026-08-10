@@ -47,10 +47,20 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    let provider = OpenAiProvider::new(OpenAiConfig {
-        base_url: config.base_url.clone(),
-        api_key: config.api_key.clone(),
-    })?;
+    let provider = OpenAiProvider::with_fallbacks(
+        OpenAiConfig {
+            base_url: config.base_url.clone(),
+            api_key: config.api_key.clone(),
+        },
+        config
+            .fallbacks
+            .iter()
+            .map(|f| OpenAiConfig {
+                base_url: f.base_url.clone(),
+                api_key: f.api_key.clone(),
+            })
+            .collect(),
+    )?;
 
     // Harness bundle: system prompt + skills from disk (editable).
     // Loaded before the tools so the evolution tools can share the

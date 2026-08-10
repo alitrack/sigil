@@ -25,11 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 36** — session continuity: `session list` now shows
-> turn count + first-user-turn preview + last activity (newest first);
-> `--resume latest` / `/session latest` continue the most recent session
-> instead of hunting for ids. Plus Phase 35's cross-instance knowledge
-> sync (per-turn fingerprint reload).
+> Status: **Phase 38** — LLM failover: the provider holds an endpoint
+> chain (primary + `[llm] fallbacks` / `SIGIL_FALLBACK_BASE_URL`); on
+> transient failures (network error, 5xx, 429) it retries the next
+> endpoint with backoff, while 4xx client errors abort immediately.
+> Plus Phase 36's session continuity and Phase 35's cross-instance
+> knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -224,8 +225,39 @@ MCP tool list.
 | **34** ✅ | On-demand skill loading (compact always-on index, bodies read on demand) |
 | **35** ✅ | Cross-instance knowledge sync (per-turn harness fingerprint → live reload) |
 | **36** ✅ | Session continuity (`session list` summaries + `--resume latest`) |
+| **37** ✅ | Ratchet LLM-variance tolerance (per-task retries + retry_prompt) |
+| **38** ✅ | LLM failover (endpoint chain: transient retry, 4xx abort) |
 
 ## Changelog
+
+### Phase 38 — 2026-08-10
+- **LLM failover**. The OpenAI-compatible provider now holds an endpoint
+  chain: the primary plus optional fallbacks. On transient failures
+  (connection error, 5xx, 429) it retries the next endpoint with a
+  small backoff (300ms × index); 4xx client errors (bad schema, auth,
+  unknown model) abort immediately — retrying another endpoint would
+  not help. Configure via `[llm] fallbacks = [{ base_url, api_key }]`
+  in config.toml or `SIGIL_FALLBACK_BASE_URL` (comma-separated).
+  - `OpenAiProvider::with_fallbacks(config, fallbacks)` (replaces `new`);
+    `PostError::{Fatal, Transient}` classification; `post_with_fallback`
+    chain loop with per-endpoint stderr notice.
+  - Tests: `falls_back_to_second_endpoint_when_primary_is_down`,
+    `falls_back_on_server_error_but_not_on_client_error`,
+    `all_endpoints_down_reports_each_failure` (local TCP fake
+    endpoints, no network). 92 total.
+  - E2E: dead primary + cc-switch fallback → model answers with the
+    `[sigil] primary endpoint failed` notice; live primary → no notice.
+
+### Phase 37 — 2026-08-10
+- **Ratchet LLM-variance tolerance**. `live_prompt_edit` occasionally
+  fails because the model *claims* completion without calling the tool
+  (sampling randomness, seen in Phases 34/36). Instead of relaxing
+  assertions, LLM-driven tasks now support per-task retries:
+  `retries: N` + `retry_prompt` with explicit "you MUST call the tool"
+  phrasing. The main loop retries on assertion miss or timeout; live
+  tasks restore the baseline `system_prompt.md` before each retry.
+  Invisible when the model passes first try; absorbs sampling variance
+  when it doesn't.
 
 ### Phase 36 — 2026-08-10
 - **Session continuity**. `session list` now renders a summary per

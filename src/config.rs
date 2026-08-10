@@ -7,6 +7,11 @@
 //! model = "deepseek-v4-flash"
 //! base_url = "http://127.0.0.1:15722/v1"
 //! api_key = "sk-..."
+//! # Optional: fallback endpoints tried in order when the primary
+//! # fails transiently (network error / 5xx / 429). 4xx aborts.
+//! fallbacks = [
+//!   { base_url = "http://10.0.0.5:38440/v1", api_key = "..." },
+//! ]
 //!
 //! [agent]
 //! max_steps = 10
@@ -33,6 +38,17 @@ struct LlmConfig {
     model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
+    /// Fallback endpoints (base_url + api_key) tried in order after the
+    /// primary on transient failures.
+    fallbacks: Vec<FallbackConfig>,
+}
+
+/// One fallback endpoint. Mirror of the primary `base_url`/`api_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FallbackConfig {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -69,6 +85,9 @@ pub struct Config {
     pub max_steps: u32,
     /// MCP servers to connect at startup.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Fallback LLM endpoints (base_url + api_key), tried in order
+    /// after the primary on transient failures.
+    pub fallbacks: Vec<FallbackConfig>,
 }
 
 impl Config {
@@ -90,7 +109,7 @@ impl Config {
             .unwrap_or_else(|| "http://127.0.0.1:15722/v1".to_string());
         let api_key = env::var("SIGIL_API_KEY")
             .ok()
-            .or(file_cfg.llm.api_key)
+            .or(file_cfg.llm.api_key.clone())
             .unwrap_or_else(|| "EMPTY".to_string());
         let system_prompt = env::var("SIGIL_SYSTEM_PROMPT")
             .ok()
@@ -98,6 +117,25 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
         let max_steps = file_cfg.agent.max_steps.unwrap_or(0);
         let mcp_servers = file_cfg.mcp.servers;
+        // Fallback endpoints: env overrides file (comma-separated list
+        // of base_urls; api_key shared with the primary unless the file
+        // specifies per-fallback keys).
+        let fallbacks = if let Ok(env_fbs) = env::var("SIGIL_FALLBACK_BASE_URL") {
+            env_fbs
+                .split(',')
+                .map(|u| FallbackConfig {
+                    base_url: u.trim().to_string(),
+                    api_key: file_cfg
+                        .llm
+                        .api_key
+                        .clone()
+                        .unwrap_or_else(|| "EMPTY".into()),
+                })
+                .filter(|f| !f.base_url.is_empty())
+                .collect()
+        } else {
+            file_cfg.llm.fallbacks
+        };
 
         Ok(Self {
             model,
@@ -106,6 +144,7 @@ impl Config {
             system_prompt,
             max_steps,
             mcp_servers,
+            fallbacks,
         })
     }
 

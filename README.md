@@ -264,6 +264,14 @@ Four mechanisms borrowed from the research round landed:
   tags; `delegate result` labels the parsed structure.
 - 125 tests; ratchet 12/12; E2E: parallel turn writes two files,
   delegate report carries the sub-agent's answer + steps.
+- **Daemon stress round** (c3): 16 concurrent senders, reconnect
+  keeps the session context, RSS flat over turns — and it caught a
+  real deadlock: the daemon's per-connection delta writer used a
+  blocking std mpsc `recv()` inside a tokio task, occupying one
+  worker per connection and freezing the whole daemon once
+  connections outnumbered workers (N=8 on an 8-core box, while N≤6
+  passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
+  (async `recv().await`); N=16 now passes 16/16.
 
 ### Phase 47 — 2026-08-10 (CLI consistency)
 - **Pipe mode honors `--resume`**: `sigil prompt --resume latest "…"`

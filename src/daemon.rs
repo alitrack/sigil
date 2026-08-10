@@ -129,12 +129,16 @@ async fn handle_connection(
     let (reader, writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    // Stream deltas to the socket via a std channel (the agent loop's
-    // stream callback is synchronous; a writer task drains it).
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Stream deltas to the socket via a channel (the agent loop's
+    // stream callback is synchronous; a writer task drains it). Must
+    // be an ASYNC channel: a blocking std mpsc recv() inside the
+    // writer task would occupy a tokio worker per connection and
+    // deadlock once connections outnumber workers (the whole daemon
+    // froze at N=8 concurrent sends on an 8-core box).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let writer_task = tokio::spawn(async move {
         let mut writer = writer;
-        while let Ok(line) = rx.recv() {
+        while let Some(line) = rx.recv().await {
             if writer.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
@@ -152,6 +156,7 @@ async fn handle_connection(
                 if text.trim().is_empty() {
                     continue;
                 }
+                eprintln!("  [daemon] user turn: {:?}", &text[..text.len().min(40)]);
                 let _guard = state.loop_lock.lock().await;
                 // Append the user turn (session + in-memory history).
                 crate::session::append(
@@ -195,6 +200,13 @@ async fn handle_connection(
                     Some(&stream_cb),
                 )
                 .await;
+                eprintln!(
+                    "  [daemon] turn done: {:?}",
+                    answer
+                        .as_ref()
+                        .map(|s| &s[..s.len().min(40)])
+                        .unwrap_or("ERR")
+                );
 
                 match answer {
                     Ok(answer) => {

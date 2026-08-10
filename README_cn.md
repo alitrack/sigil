@@ -239,6 +239,12 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   `delegate result` 标注解析结构。
 - 125 测试；ratchet 12/12；E2E：并行 turn 写两个文件、delegate
   报告携带子 agent 答案与步骤。
+- **Daemon 压力测试轮**（c3）：16 并发发送、断线重连保持会话上下文、
+  多轮 RSS 平稳——并抓到一个真实死锁：daemon 每连接 delta 写入任务
+  在 tokio task 内用阻塞式 std mpsc `recv()`，每连接占用一个 worker，
+  连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
+  N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
+  （异步 `recv().await`）；N=16 现 16/16 全过。
 
 ### Phase 47 — 2026-08-10（CLI 一致性）
 - **pipe 模式支持 `--resume`**：`sigil prompt --resume latest "…"`

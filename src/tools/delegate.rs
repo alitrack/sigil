@@ -62,25 +62,18 @@ pub struct DelegateRegistry {
 }
 
 impl DelegateRegistry {
-    fn insert(&self, state: DelegateState) {
-        if let Ok(mut s) = self.states.try_lock() {
-            s.insert(state.id.clone(), state);
-        }
+    async fn insert(&self, state: DelegateState) {
+        self.states.lock().await.insert(state.id.clone(), state);
     }
 
-    fn update<F: FnOnce(&mut DelegateState)>(&self, id: &str, f: F) {
-        if let Ok(mut s) = self.states.try_lock()
-            && let Some(st) = s.get_mut(id)
-        {
+    async fn update<F: FnOnce(&mut DelegateState)>(&self, id: &str, f: F) {
+        if let Some(st) = self.states.lock().await.get_mut(id) {
             f(st);
         }
     }
 
-    fn snapshot(&self) -> Vec<DelegateState> {
-        self.states
-            .try_lock()
-            .map(|s| s.values().cloned().collect())
-            .unwrap_or_default()
+    async fn snapshot(&self) -> Vec<DelegateState> {
+        self.states.lock().await.values().cloned().collect()
     }
 }
 
@@ -162,15 +155,17 @@ impl Tool for DelegateTool {
                 let name = task.chars().take(40).collect::<String>();
                 let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
                 let ts = crate::session::chrono_like_timestamp();
-                self.delegates.insert(DelegateState {
-                    id: id.clone(),
-                    name,
-                    status: DelegateStatus::Running,
-                    started_ts: ts.clone(),
-                    finished_ts: None,
-                    result: None,
-                    error: None,
-                });
+                self.delegates
+                    .insert(DelegateState {
+                        id: id.clone(),
+                        name,
+                        status: DelegateStatus::Running,
+                        started_ts: ts.clone(),
+                        finished_ts: None,
+                        result: None,
+                        error: None,
+                    })
+                    .await;
 
                 let provider = self.provider.clone();
                 let mut sub_tools = self.registry.clone_shallow();
@@ -184,16 +179,24 @@ impl Tool for DelegateTool {
                     // stands). The result lands in the registry.
                     let outcome = run_turn(provider.as_ref(), &mut sub_tools, &config, &task).await;
                     match outcome {
-                        Ok(answer) => delegates.update(&spawn_id, |st| {
-                            st.status = DelegateStatus::Completed;
-                            st.finished_ts = Some(crate::session::chrono_like_timestamp());
-                            st.result = Some(answer);
-                        }),
-                        Err(e) => delegates.update(&spawn_id, |st| {
-                            st.status = DelegateStatus::Failed;
-                            st.finished_ts = Some(crate::session::chrono_like_timestamp());
-                            st.error = Some(e.to_string());
-                        }),
+                        Ok(answer) => {
+                            delegates
+                                .update(&spawn_id, |st| {
+                                    st.status = DelegateStatus::Completed;
+                                    st.finished_ts = Some(crate::session::chrono_like_timestamp());
+                                    st.result = Some(answer);
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            delegates
+                                .update(&spawn_id, |st| {
+                                    st.status = DelegateStatus::Failed;
+                                    st.finished_ts = Some(crate::session::chrono_like_timestamp());
+                                    st.error = Some(e.to_string());
+                                })
+                                .await;
+                        }
                     }
                 });
 
@@ -208,7 +211,7 @@ impl Tool for DelegateTool {
                     .get("id")
                     .and_then(Value::as_str)
                     .context("delegate status requires 'id'")?;
-                let states = self.delegates.snapshot();
+                let states = self.delegates.snapshot().await;
                 let st = states
                     .iter()
                     .find(|s| s.id == id)
@@ -234,7 +237,7 @@ impl Tool for DelegateTool {
                     .get("id")
                     .and_then(Value::as_str)
                     .context("delegate result requires 'id'")?;
-                let states = self.delegates.snapshot();
+                let states = self.delegates.snapshot().await;
                 let st = states
                     .iter()
                     .find(|s| s.id == id)
@@ -258,7 +261,7 @@ impl Tool for DelegateTool {
                 }
             }
             "list" => {
-                let states = self.delegates.snapshot();
+                let states = self.delegates.snapshot().await;
                 if states.is_empty() {
                     return Ok(ToolOutput {
                         text: "no sub-agents running or finished".to_string(),
@@ -334,17 +337,64 @@ mod tests {
             finished_ts: None,
             result: None,
             error: None,
-        });
-        let snap = reg.snapshot();
+        })
+        .await;
+        let snap = reg.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].status, DelegateStatus::Running);
 
         reg.update("d00000", |st| {
             st.status = DelegateStatus::Completed;
             st.result = Some("done".into());
-        });
-        let snap = reg.snapshot();
+        })
+        .await;
+        let snap = reg.snapshot().await;
         assert_eq!(snap[0].status, DelegateStatus::Completed);
         assert_eq!(snap[0].result.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn registry_survives_concurrent_subagent_updates() {
+        // Many sub-agents finishing at once (each takes the registry
+        // lock briefly) must all land their results — no silent drop.
+        let reg = Arc::new(DelegateRegistry::default());
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let reg = reg.clone();
+            tasks.push(tokio::spawn(async move {
+                let id = format!("d{i:05}");
+                reg.insert(DelegateState {
+                    id: id.clone(),
+                    name: format!("task-{i}"),
+                    status: DelegateStatus::Running,
+                    started_ts: "t".into(),
+                    finished_ts: None,
+                    result: None,
+                    error: None,
+                })
+                .await;
+                // Simulate the sub-agent finishing right away.
+                reg.update(&id, |st| {
+                    st.status = DelegateStatus::Completed;
+                    st.result = Some(format!("result-{i}"));
+                })
+                .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let snap = reg.snapshot().await;
+        assert_eq!(snap.len(), 8, "every sub-agent must land in the registry");
+        let mut ids: Vec<&str> = snap.iter().map(|s| s.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "d00000", "d00001", "d00002", "d00003", "d00004", "d00005", "d00006", "d00007"
+            ]
+        );
+        assert!(snap.iter().all(|s| s.status == DelegateStatus::Completed));
+        assert!(snap.iter().all(|s| s.result.is_some()));
     }
 }

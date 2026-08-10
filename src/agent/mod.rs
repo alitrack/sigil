@@ -241,6 +241,27 @@ pub fn compact_messages_with_budget(
     out
 }
 
+/// Inject (or refresh) the goals block into a message list. The agent
+/// loop calls this every iteration; the block is keyed by
+/// [`crate::goals::GOALS_MARKER`], so repeated calls replace the
+/// previous block in place instead of stacking duplicates.
+fn inject_goals_block(messages: &mut Vec<ChatMessage>, block: &str) {
+    let existing = messages
+        .iter()
+        .position(|m| m.role == Role::System && m.content.starts_with(crate::goals::GOALS_MARKER));
+    match existing {
+        Some(i) => messages[i] = ChatMessage::system(block),
+        None => {
+            let pos = messages
+                .iter()
+                .position(|m| m.role == Role::System)
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            messages.insert(pos, ChatMessage::system(block));
+        }
+    }
+}
+
 /// Approval callback: given a tool call that the gate rejected in
 /// non-interactive mode, decide whether the human allows it anyway.
 /// Returns true to run it (interactive override).
@@ -318,17 +339,14 @@ pub async fn run_messages(
         // Persistent goals: inject active goals into the system context
         // so the model keeps working toward them this turn. Inserted
         // right after the first system message (the main prompt /
-        // compaction summary) so it is never folded away.
+        // compaction summary) so it is never folded away. The agent
+        // loop re-runs this every iteration, so an already-injected
+        // block is *replaced* in place rather than duplicated.
         if let Some(goals) = &config.goals
             && let Ok(g) = goals.read()
             && let Some(block) = crate::goals::active_goals_block(&g)
         {
-            let pos = messages
-                .iter()
-                .position(|m| m.role == Role::System)
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            messages.insert(pos, ChatMessage::system(block));
+            inject_goals_block(&mut messages, &block);
         }
 
         // Fresh specs every turn: evolution tools may have added tools
@@ -475,6 +493,26 @@ mod compact_tests {
             .find(|m| m.role == Role::System && m.content.contains("compressed"));
         assert!(summary.is_some(), "missing compression summary");
         assert!(summary.unwrap().content.contains("user-0"));
+    }
+
+    #[test]
+    fn goals_injection_replaces_not_duplicates() {
+        let mut m = vec![ChatMessage::system("SYS"), ChatMessage::user("user-1")];
+        // First injection: inserted after the first system message.
+        inject_goals_block(&mut m, "## Active goals\n- g1: ship it");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].content, "## Active goals\n- g1: ship it");
+        // Second iteration of the agent loop: replaces in place.
+        inject_goals_block(&mut m, "## Active goals\n- g1: ship it\n- g2: new goal");
+        assert_eq!(m.len(), 3, "must not stack duplicate goals blocks");
+        assert_eq!(
+            m[1].content,
+            "## Active goals\n- g1: ship it\n- g2: new goal"
+        );
+        // Third iteration with no goals: block stays replaced, not stacked.
+        inject_goals_block(&mut m, "## Active goals\n- g2: new goal");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].content, "## Active goals\n- g2: new goal");
     }
 
     #[test]

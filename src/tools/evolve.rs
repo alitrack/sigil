@@ -199,9 +199,9 @@ fn gated_reason(args: &Value) -> anyhow::Result<&str> {
     Ok(reason)
 }
 
-/// Append one refinement event to `harness_dir/refinements.jsonl`
-/// (append-only audit log, inside the harness dir lock so concurrent
-/// instances never interleave).
+/// Append one refinement event to `harness_dir/refinements.jsonl`.
+/// Append-only (O_APPEND) so concurrent instances never interleave
+/// lines.
 fn record_refinement(harness_dir: &std::path::Path, event: &Value) {
     use std::io::Write;
     let path = harness_dir.join("refinements.jsonl");

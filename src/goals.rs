@@ -72,6 +72,11 @@ pub fn save_goals(dir: &std::path::Path, goals: &[GoalState]) -> anyhow::Result<
     })
 }
 
+/// Marker prefix of the injected goals block. `agent::run_messages`
+/// uses it to *replace* any previously injected block instead of
+/// appending a duplicate each loop iteration.
+pub const GOALS_MARKER: &str = "## Active goals";
+
 /// Format active goals as a system-context block, or `None` when there
 /// are no active goals (nothing to inject).
 pub fn active_goals_block(goals: &[GoalState]) -> Option<String> {
@@ -82,7 +87,8 @@ pub fn active_goals_block(goals: &[GoalState]) -> Option<String> {
     if active.is_empty() {
         return None;
     }
-    let mut out = String::from("## Active goals\n");
+    let mut out = String::from(GOALS_MARKER);
+    out.push('\n');
     for g in &active {
         out.push_str(&format!("- `{}`: {}\n", g.id, g.objective));
     }

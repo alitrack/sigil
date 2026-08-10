@@ -52,8 +52,12 @@ pub async fn serve(
     sessions_dir: &Path,
     resume: Option<&str>,
 ) -> Result<()> {
-    // Session: resume an existing one or start fresh.
+    // Session: resume an existing one or start fresh. `latest`
+    // resolves to the most recently active session (same as the REPL).
     let session_id = match resume {
+        Some("latest") => crate::session::latest(sessions_dir)?.ok_or_else(|| {
+            anyhow::anyhow!("no sessions yet — start a new daemon without --resume")
+        })?,
         Some(id) if !id.is_empty() => {
             // Validate the session loads before serving.
             crate::session::load(sessions_dir, id)
@@ -68,8 +72,8 @@ pub async fn serve(
         session_id,
     });
     // Load the resumed history into the shared state.
-    if resume.is_some() {
-        let turns = crate::session::load(sessions_dir, &state.session_id)?;
+    let turns = crate::session::load(sessions_dir, &state.session_id)?;
+    if !turns.is_empty() {
         let mut messages = state.messages.lock().await;
         messages.extend(turns_to_messages(turns));
     }

@@ -218,6 +218,24 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 
 ## 更新日志
 
+### Phase 44r — 2026-08-10（review 修复）
+对 Phase 41–44（压缩、改进门控、持久目标、异步委托、daemon）做
+系统化 review，发现并修复 3 个真实 bug + 1 处文档修正：
+- **goals 每轮重复注入**：注入在 agent 循环内无条件执行，多工具
+  轮每迭代堆叠一条 `## Active goals` system 消息。现以
+  `GOALS_MARKER` 为键——重复注入**原位替换**前一块
+  （`inject_goals_block`，已加回归测试）。
+- **delegate 注册表静默丢更新**：`insert`/`update`/`snapshot` 用
+  `try_lock()` 且锁竞争时丢弃结果——子 agent 完成恰逢主 agent
+  轮询时会永久丢失结果。改为 `lock().await`（async 方法，
+  8 并发子 agent 更新回归测试）。
+- **daemon `--resume latest` 未解析**：daemon 直接加载名为
+  "latest" 的会话（报错）。现解析为最近活动的会话，与 REPL
+  一致（E2E：daemon#1 → 42，`--resume latest` 重启 → 43）。
+- `record_refinement` 文档修正（O_APPEND 追加而非目录锁）。
+- 117 测试；ratchet 12/12；E2E：goals 流程、delegate 流程、
+  daemon resume——全绿。
+
 ### Phase 44 — 2026-08-10
 - **后台 daemon**（herdr 启发："the runtime your coding agents live
   on"）：`sigil daemon` 在 Unix socket（默认 `~/.sigil/daemon.sock`）

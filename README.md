@@ -240,6 +240,29 @@ MCP tool list.
 
 ## Changelog
 
+### Phase 44r — 2026-08-10 (review fixes)
+Systematic review of Phases 41–44 (compression, refinement gate,
+goals, async delegation, daemon). Three real bugs found and fixed,
+plus one doc correction:
+- **Goals duplicated every agent-loop iteration**: the injection ran
+  unconditionally inside the tool loop, so a multi-tool turn stacked
+  an extra `## Active goals` system message per iteration. Now
+  keyed by `GOALS_MARKER` — re-injection *replaces* the previous
+  block in place (`inject_goals_block`, regression-tested).
+- **Delegate registry silently dropped updates**: `insert`/`update`/
+  `snapshot` used `try_lock()` and discarded the result on lock
+  contention — a sub-agent finishing while the main agent polled
+  could lose its result forever. Now `lock().await` (async methods,
+  regression-tested with 8 concurrent sub-agent updates).
+- **Daemon `--resume latest` not resolved**: the daemon loaded a
+  session literally named "latest" (error). Now resolves to the most
+  recently active session, matching the REPL (E2E: daemon#1 → 42,
+  restart with `--resume latest` → 43).
+- `record_refinement` doc corrected (append-only via O_APPEND, not
+  the dir lock).
+- 117 tests; ratchet 12/12; E2E: goals flow, delegate flow, daemon
+  resume — all green.
+
 ### Phase 44 — 2026-08-10
 - **Background daemon** (herdr-inspired: "the runtime your coding
   agents live on"): `sigil daemon` serves the agent loop on a Unix

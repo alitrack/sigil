@@ -86,9 +86,15 @@ pub async fn serve(
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding daemon socket {}", socket_path.display()))?;
     eprintln!(
-        "sigil daemon: listening on {} (session {})",
+        "sigil daemon: listening on {} (pid {}, session {})",
         socket_path.display(),
+        std::process::id(),
         state.session_id
+    );
+    eprintln!("  attach:  sigil attach --socket {}", socket_path.display());
+    eprintln!(
+        "  send:    sigil send \"message\" --socket {}",
+        socket_path.display()
     );
 
     loop {
@@ -224,21 +230,34 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Interactive attach: read stdin lines, send them, print streamed
-/// output until `done`.
+/// Interactive attach: a persistent session. Send lines, watch the
+/// streamed output; after each turn the prompt comes back so you can
+/// keep chatting (one daemon session, multi-turn context). `/quit`
+/// (or Ctrl-D) exits; `/help` lists the local commands.
 pub async fn attach(socket_path: &Path) -> Result<()> {
     let stream = UnixStream::connect(socket_path)
         .await
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
+        .with_context(|| friendly_connect_error(socket_path))?;
     eprintln!("sigil attach: connected to {}", socket_path.display());
+    eprintln!("type /help for commands, /quit to exit");
 
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    // Writer task: stdin -> socket.
+    // Writer task: stdin -> socket. Local commands are handled here so
+    // they never reach the daemon.
     let stdin_task = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut stdin_lines = BufReader::new(stdin).lines();
         while let Ok(Some(line)) = stdin_lines.next_line().await {
+            match line.trim() {
+                "/quit" | "/exit" | "/q" => break,
+                "/help" | "/h" => {
+                    eprintln!("commands: /quit — leave; /help — this list");
+                    eprintln!("anything else is sent to the daemon as a message");
+                    continue;
+                }
+                _ => {}
+            }
             let msg = json!({"type": "user", "text": line});
             if writer
                 .write_all(format!("{msg}\n").as_bytes())
@@ -251,6 +270,8 @@ pub async fn attach(socket_path: &Path) -> Result<()> {
         }
     });
 
+    // Read loop: stream deltas; after `done` the turn finished — loop
+    // back to the prompt instead of exiting (multi-turn session).
     while let Ok(Some(line)) = lines.next_line().await {
         let v: Value = serde_json::from_str(&line).unwrap_or_default();
         match v["type"].as_str() {
@@ -258,13 +279,9 @@ pub async fn attach(socket_path: &Path) -> Result<()> {
                 print!("{}", v["text"].as_str().unwrap_or(""));
                 let _ = std::io::stdout().flush();
             }
-            Some("done") => {
-                println!();
-                break;
-            }
+            Some("done") => println!(),
             Some("error") => {
                 eprintln!("daemon error: {}", v["text"].as_str().unwrap_or("?"));
-                break;
             }
             _ => {}
         }
@@ -274,17 +291,37 @@ pub async fn attach(socket_path: &Path) -> Result<()> {
 }
 
 /// One-shot send: send one message, print the streamed output and the
-/// final answer.
-pub async fn send_once(socket_path: &Path, text: &str) -> Result<String> {
+/// final answer. `timeout_secs` bounds the wait (0 = wait forever).
+pub async fn send_once(socket_path: &Path, text: &str, timeout_secs: u64) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path)
         .await
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
+        .with_context(|| friendly_connect_error(socket_path))?;
     let msg = json!({"type": "user", "text": text});
     stream.write_all(format!("{msg}\n").as_bytes()).await?;
     let (reader, _) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut out = String::new();
-    while let Ok(Some(line)) = lines.next_line().await {
+    // Read until `done`, optionally bounded by the caller's timeout.
+    let deadline = if timeout_secs > 0 {
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+    loop {
+        let line = match deadline {
+            Some(dl) => match tokio::time::timeout_at(dl, lines.next_line()).await {
+                Ok(Ok(Some(l))) => l,
+                Ok(Ok(None)) => break, // daemon closed without `done`
+                Ok(Err(_)) => break,
+                Err(_) => anyhow::bail!(
+                    "timed out after {timeout_secs}s waiting for the daemon's reply (the turn keeps running in the daemon — attach or send again to see it)"
+                ),
+            },
+            None => match lines.next_line().await {
+                Ok(Some(l)) => l,
+                _ => break,
+            },
+        };
         let v: Value = serde_json::from_str(&line).unwrap_or_default();
         match v["type"].as_str() {
             Some("delta") => out.push_str(v["text"].as_str().unwrap_or("")),
@@ -294,6 +331,16 @@ pub async fn send_once(socket_path: &Path, text: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// A friendlier error when the socket isn't there: the daemon is
+/// probably just not running.
+fn friendly_connect_error(socket_path: &Path) -> String {
+    format!(
+        "connecting to {}: is the daemon running? start it with `sigil daemon --socket {}`",
+        socket_path.display(),
+        socket_path.display()
+    )
 }
 
 /// Turn a loaded session's turns into agent messages (used by `serve`
@@ -351,7 +398,7 @@ mod tests {
             writer.write_all(reply.as_bytes()).await.unwrap();
         });
 
-        let answer = send_once(&sock, "hi there").await.unwrap();
+        let answer = send_once(&sock, "hi there", 10).await.unwrap();
         assert_eq!(answer, "hello world");
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);

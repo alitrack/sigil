@@ -93,6 +93,9 @@ pub enum Command {
         /// Socket path (default: ~/.sigil/daemon.sock).
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Seconds to wait for the daemon's reply (0 = wait forever).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
     },
 
     /// Serve as an MCP (Model Context Protocol) server on stdio —

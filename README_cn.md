@@ -23,12 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 45** — ratchet 进 CI + goal turn 预算：ratchet 新增
-> 确定性 `--check-only` 模式（任务 schema + 源码锚点漂移检测）并挂入
-> CI；goals 支持可选 `turn_budget`（一次 LLM 调用 = 一 turn，用尽
-> 自动 pause）。此前：Phase 44 daemon、Phase 43 异步委托、Phase 42
-> 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39 记忆写安全、
-> Phase 38 LLM 故障转移、
+> 状态：**Phase 46** — daemon 体验打磨：`attach` 现在是持久多轮会话
+> （`/quit` 退出），`send --timeout` 限制等待，死 socket 错误会提示
+> 如何启动 daemon。此前：Phase 45 ratchet 进 CI + goal turn 预算、
+> Phase 44 daemon、Phase 43 异步委托、Phase 42 持久目标、Phase 41
+> 改进门控 + token 预算压缩、Phase 39 记忆写安全、Phase 38 LLM
+> 故障转移、
 > Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
@@ -216,8 +216,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **43** ✅ | 异步委托（spawn → handle → status/result/list 注册表） |
 | **44** ✅ | 后台 daemon（Unix socket agent 循环 + attach/send + 会话持久化） |
 | **45** ✅ | ratchet 进 CI（--check-only）+ goal turn 预算（自动 pause） |
+| **46** ✅ | daemon 体验打磨（attach 持久会话 + /quit、send --timeout、友好错误） |
 
 ## 更新日志
+
+### Phase 46 — 2026-08-10（daemon 体验打磨）
+- **`attach` 现在是持久会话**：与 daemon 多轮对话——每轮结束后
+  提示符回来。`/quit`（或 Ctrl-D）退出，`/help` 列出命令；本地
+  命令不会发给 daemon（此前 `/quit` 会被当成 user 消息）。
+- **`send --timeout <秒>`**：限制等待 daemon 回复的时长（默认
+  300，0 = 永久）；超时错误提示「turn 仍在 daemon 中运行，
+  可再 attach/send 查看」。
+- **daemon 启动横幅**显示 pid、socket 路径与可直接复制的
+  attach/send 命令；连接死 socket 时提示「is the daemon running?
+  start it with `sigil daemon …`」。
+- 120 测试；ratchet 12/12；E2E：attach 多轮（42 → 43）、/quit
+  干净退出、daemon 关闭后的友好错误——全绿。
 
 ### Phase 45 — 2026-08-10
 - **ratchet 进 CI**：`ratchet.py --check-only` 是确定性、无 LLM 的

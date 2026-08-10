@@ -25,12 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 45** — ratchet in CI + goal turn-budgets: the ratchet
-> now has a deterministic `--check-only` mode (task schema + source
-> anchor drift detection) wired into CI, and goals support an optional
-> `turn_budget` — one LLM call = one turn, auto-pause when exhausted.
-> Before: Phase 44 daemon, Phase 43 async delegation, Phase 42 goals,
-> Phase 41's harness
+> Status: **Phase 46** — daemon UX polish: `attach` is now a persistent
+> multi-turn session (`/quit` to leave), `send --timeout` bounds the
+> wait, and dead-socket errors tell you how to start the daemon.
+> Before: Phase 45 ratchet-in-CI + goal turn-budgets, Phase 44 daemon,
+> Phase 43 async delegation, Phase 42 goals, Phase 41's harness
 > refinement gate + token-budget compression, Phase 39's memory write
 > safety, Phase 38's LLM failover, Phase 36's session continuity and
 > Phase 35's cross-instance knowledge sync.
@@ -237,8 +236,22 @@ MCP tool list.
 | **43** ✅ | Async delegation (spawn → handle → status/result/list registry) |
 | **44** ✅ | Background daemon (Unix socket agent loop + attach/send + session persistence) |
 | **45** ✅ | Ratchet in CI (--check-only) + goal turn-budgets (auto-pause) |
+| **46** ✅ | Daemon UX polish (persistent attach session + /quit, send --timeout, friendly errors) |
 
 ## Changelog
+
+### Phase 46 — 2026-08-10 (daemon UX polish)
+- **`attach` is now a persistent session**: multi-turn chat with the
+  daemon — after each turn the prompt comes back. `/quit` (or Ctrl-D)
+  exits, `/help` lists commands; local commands never reach the daemon.
+- **`send --timeout <secs>`**: bounds the wait for the daemon's reply
+  (default 300, 0 = forever); on timeout the error notes the turn
+  keeps running in the daemon.
+- **Daemon startup banner** shows pid, socket path and ready-to-use
+  `attach`/`send` commands; connecting to a dead socket now prints
+  "is the daemon running? start it with `sigil daemon …`".
+- 120 tests; ratchet 12/12; E2E: attach multi-turn (42 → 43),
+  /quit exit, friendly down-daemon error — green.
 
 ### Phase 45 — 2026-08-10
 - **Ratchet in CI**: `ratchet.py --check-only` is a deterministic,

@@ -185,16 +185,20 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
         max_inline_skills: 2,
     };
 
-    // Math prompt → math skill inlined after the base prompt.
+    // Math prompt → skill index + math skill inlined after the base.
     let p = cfg.system_prompt_for("answer this math question");
     assert!(p.starts_with("base"));
+    assert!(p.contains("# Available skills"));
     assert!(p.contains("<skill name=\"math-notes\">"));
 
-    // Unrelated prompt → no inlining (no overlap).
+    // Unrelated prompt → index still present (on-demand loading: the
+    // model must know the library exists), but no body inlined.
     let p = cfg.system_prompt_for("please deploy the service");
-    assert_eq!(p, "base");
+    assert!(p.starts_with("base"));
+    assert!(p.contains("# Available skills"));
+    assert!(!p.contains("<skill name=\"math-notes\">"));
 
-    // max_inline_skills = 0 → no inlining at all.
+    // max_inline_skills = 0 → no skills section at all.
     let mut cfg2 = cfg.clone();
     cfg2.max_inline_skills = 0;
     assert_eq!(cfg2.system_prompt_for("answer this math question"), "base");
@@ -224,4 +228,42 @@ fn load_skills_parses_depends_on_from_disk() {
     assert!(out.contains("<skill name=\"report\">"));
     assert!(out.contains("<skill name=\"format\">"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn skills_index_only_lists_names_no_bodies() {
+    use crate::harness::Skill;
+    let skills = vec![
+        Skill {
+            name: "lua-ffi".into(),
+            description: "wrap C libraries with LuaJIT FFI".into(),
+            body: "> wrap C\nSECRET-BODY-1 use ffi.cdef".into(),
+            path: std::path::PathBuf::from("lua-ffi.md"),
+            depends_on: vec![],
+        },
+        Skill {
+            name: "git-workflow".into(),
+            description: "commit and push workflows".into(),
+            body: "> git\nSECRET-BODY-2 commit, push, revert".into(),
+            path: std::path::PathBuf::from("git-workflow.md"),
+            depends_on: vec![],
+        },
+    ];
+
+    let idx = crate::harness::Harness::skills_index_only_from(&skills);
+    // Names + descriptions present...
+    assert!(idx.contains("**lua-ffi** — wrap C libraries with LuaJIT FFI"));
+    assert!(idx.contains("**git-workflow** — commit and push workflows"));
+    // ...but NO bodies (on-demand loading: index stays cheap).
+    assert!(!idx.contains("SECRET-BODY-1"));
+    assert!(!idx.contains("SECRET-BODY-2"));
+    assert!(!idx.contains("<skill name="));
+    // The model is told how to load a body on demand.
+    assert!(idx.to_lowercase().contains("on demand"));
+}
+
+#[test]
+fn empty_skills_index_is_empty() {
+    let idx = crate::harness::Harness::skills_index_only_from(&[]);
+    assert!(idx.is_empty());
 }

@@ -37,14 +37,19 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     /// System prompt for a specific user prompt: base prompt plus the
-    /// most relevant skills inlined (keyword-overlap ranked). Reads the
-    /// *live* state, so harness edits apply immediately.
+    /// most relevant skills inlined (keyword-overlap ranked), plus a
+    /// compact index of every skill so the model knows what else is
+    /// available and can load any body on demand. Reads the *live*
+    /// state, so harness edits apply immediately.
     pub fn system_prompt_for(&self, prompt: &str) -> String {
         let state = self.prompt_state.read().unwrap_or_else(|e| e.into_inner());
         if state.skills.is_empty() || self.max_inline_skills == 0 {
             state.system_prompt.clone()
         } else {
             let mut p = state.system_prompt.clone();
+            p.push_str(&crate::harness::Harness::skills_index_only_from(
+                &state.skills,
+            ));
             p.push_str(&crate::harness::inline_skills_for(
                 prompt,
                 &state.skills,

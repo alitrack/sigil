@@ -25,9 +25,10 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 33** — ratchet battery +12: ACP protocol e2e, session
-> export/import, scripted-tool schema hardening (malformed model-written
-> schemas fall back to the safe default instead of 400-ing every LLM call).
+> Status: **Phase 34** — on-demand skill loading: a compact name +
+> description index of every skill is always in the system prompt, so the
+> model knows the full library and reads any body on demand; only the
+> relevant top-N bodies are inlined per turn.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -219,8 +220,24 @@ MCP tool list.
 | **31** ✅ | Timestamped turns + `session export --since` (time-filtered transcripts) |
 | **32** ✅ | Cross-process dir locks (advisory `.sigil.lock` on evolution writes) |
 | **33** ✅ | Ratchet +2 (ACP e2e, session export/import) + scripted-tool schema hardening |
+| **34** ✅ | On-demand skill loading (compact always-on index, bodies read on demand) |
 
 ## Changelog
+
+### Phase 34 — 2026-08-10
+- **On-demand skill loading**. The system prompt now always carries a
+  compact index of every skill (name + description only, no bodies), so
+  the model knows the full library exists and reads any skill's body on
+  demand via `read_file` / `list_skills`. Per-turn relevance-ranked
+  inlining of the top-N bodies is unchanged. The index stays cheap no
+  matter how large the library grows — bodies are only ever loaded when
+  they are actually inlined or explicitly read.
+  - `Harness::skills_index_only_from(&[Skill])` renders the index
+    (empty when no skills); wired into `AgentConfig::system_prompt_for`.
+  - Tests: `skills_index_only_lists_names_no_bodies` (index has names +
+    descriptions, never bodies), `empty_skills_index_is_empty`, plus the
+    per-prompt test now asserts the index is always present while only
+    relevant bodies are inlined.
 
 ### Phase 33 — 2026-08-10
 - **Ratchet battery grown to 12 tasks**: new `acp_server_tool_use`

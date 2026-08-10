@@ -94,6 +94,28 @@ impl Harness {
         })
     }
 
+    /// Render a compact index of all skills (name + description only,
+    /// no bodies) so the model knows the full library exists and can
+    /// read any skill's body on demand via read_file / list_skills.
+    /// This is the "on-demand loading" half: index stays cheap no matter
+    /// how large the library grows; only the relevant top-N bodies are
+    /// actually inlined per turn. Takes `&[Skill]` so the agent loop can
+    /// feed its live `PromptState` directly.
+    pub fn skills_index_only_from(skills: &[Skill]) -> String {
+        if skills.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("\n\n# Available skills\n\n");
+        for s in skills {
+            out.push_str(&format!("- **{}** — {}\n", s.name, s.description));
+        }
+        out.push_str(
+            "Read a skill's full content on demand with read_file \
+             (or list_skills for names + descriptions).\n",
+        );
+        out
+    }
+
     /// Render the skills section for the system prompt (all skills
     /// inline). Superseded at runtime by `inline_skills_for` (dynamic
     /// per-turn selection); kept for tests and completeness.

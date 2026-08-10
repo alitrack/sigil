@@ -23,9 +23,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 33** — ratchet 电池扩到 12 项：ACP 协议 e2e、会话导出/
-> 导入、脚本化工具 schema 加固（模型写坏 schema 时回退安全默认值，不再
-> 400 掉所有 LLM 调用）。管道模式、
+> 状态：**Phase 34** — 技能按需加载：系统提示词常驻全量技能的紧凑索引
+> （名+描述，不含 body），模型知道全库存在、按需用 read_file/list_skills
+> 读取正文；每轮仍只内联相关性 top-N 的正文。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -200,8 +200,20 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **31** ✅ | 轮次时间戳 + `session export --since`（按时间过滤转录） |
 | **32** ✅ | 跨进程目录锁（自进化写入加 advisory `.sigil.lock`） |
 | **33** ✅ | Ratchet +2（ACP e2e、会话导出/导入）+ 脚本化工具 schema 加固 |
+| **34** ✅ | 技能按需加载（紧凑常驻索引，正文按需读取） |
 
 ## 更新日志
+
+### Phase 34 — 2026-08-10
+- **技能按需加载**。系统提示词现在常驻全量技能的紧凑索引（名+描述，
+  不含 body），模型知道全库存在、按需用 `read_file` / `list_skills`
+  读取任意正文。每轮按相关性 top-N 内联正文的逻辑不变。索引随技能库
+  增长保持廉价——正文只在实际被内联或显式读取时才加载。
+  - `Harness::skills_index_only_from(&[Skill])` 渲染索引（无技能时为空）；
+    接入 `AgentConfig::system_prompt_for`。
+  - 测试：`skills_index_only_lists_names_no_bodies`（索引只有名+描述、
+    永不含正文）、`empty_skills_index_is_empty`，per-prompt 测试现在
+    断言索引始终存在而只有相关正文被内联。
 
 ### Phase 33 — 2026-08-10
 - **Ratchet 电池扩到 12 项**：新增 `acp_server_tool_use`（按真实协议驱动

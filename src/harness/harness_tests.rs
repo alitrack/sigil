@@ -181,8 +181,10 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
         prompt_state: std::sync::Arc::new(std::sync::RwLock::new(PromptState {
             system_prompt: "base".into(),
             skills,
+            fingerprint: None,
         })),
         max_inline_skills: 2,
+        sync_dir: None,
     };
 
     // Math prompt → skill index + math skill inlined after the base.
@@ -266,4 +268,73 @@ fn skills_index_only_lists_names_no_bodies() {
 fn empty_skills_index_is_empty() {
     let idx = crate::harness::Harness::skills_index_only_from(&[]);
     assert!(idx.is_empty());
+}
+
+#[test]
+fn sync_prompt_state_reloads_after_external_edit() {
+    // Simulates two instances sharing one harness dir: "instance B"
+    // edits system_prompt.md + adds a skill; "instance A" (already
+    // running, state cached) picks the change up via sync_prompt_state.
+    let dir = std::env::temp_dir().join(format!("sigil-sync-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let skills = dir.join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(dir.join("system_prompt.md"), "prompt v1").unwrap();
+
+    // Instance A loads the harness and caches the initial state.
+    let h = crate::harness::Harness::load(Some(&dir)).unwrap();
+    let state = std::sync::RwLock::new(crate::harness::PromptState {
+        system_prompt: h.system_prompt.clone(),
+        skills: h.skills.clone(),
+        fingerprint: None,
+    });
+
+    // First sync: no fingerprint yet → loads, no error.
+    let changed = crate::harness::sync_prompt_state(&state, &dir).unwrap();
+    assert!(changed);
+    assert_eq!(state.read().unwrap().system_prompt, "prompt v1");
+
+    // No changes → no reload.
+    let changed = crate::harness::sync_prompt_state(&state, &dir).unwrap();
+    assert!(!changed);
+
+    // "Instance B" edits the prompt and adds a skill.
+    std::fs::write(dir.join("system_prompt.md"), "prompt v2").unwrap();
+    std::fs::write(skills.join("new.md"), "> new skill\n\nbody").unwrap();
+
+    let changed = crate::harness::sync_prompt_state(&state, &dir).unwrap();
+    assert!(changed);
+    let s = state.read().unwrap();
+    assert_eq!(s.system_prompt, "prompt v2");
+    assert!(s.skills.iter().any(|sk| sk.name == "new"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn harness_fingerprint_changes_with_content() {
+    let dir = std::env::temp_dir().join(format!("sigil-fp-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let skills = dir.join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(dir.join("system_prompt.md"), "v1").unwrap();
+
+    let f1 = crate::harness::harness_fingerprint(&dir);
+    // Content change → fingerprint changes.
+    std::fs::write(dir.join("system_prompt.md"), "v2 — different").unwrap();
+    let f2 = crate::harness::harness_fingerprint(&dir);
+    assert_ne!(f1, f2);
+
+    // Skill add → fingerprint changes.
+    std::fs::write(skills.join("a.md"), "> a\n").unwrap();
+    let f3 = crate::harness::harness_fingerprint(&dir);
+    assert_ne!(f2, f3);
+
+    // Identical state → same fingerprint (order-independent).
+    std::fs::write(skills.join("b.md"), "> b\n").unwrap();
+    let f4 = crate::harness::harness_fingerprint(&dir);
+    let f4_again = crate::harness::harness_fingerprint(&dir);
+    assert_eq!(f4, f4_again);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

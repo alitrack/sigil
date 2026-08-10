@@ -55,6 +55,10 @@ pub struct Harness {
 pub struct PromptState {
     pub system_prompt: String,
     pub skills: Vec<Skill>,
+    /// Fingerprint of the harness dir at last load; `None` = never
+    /// synced. Cross-instance sync compares this against the current
+    /// disk state and reloads when another process edited the files.
+    pub fingerprint: Option<u64>,
 }
 
 pub fn default_harness_dir() -> PathBuf {
@@ -279,6 +283,67 @@ pub fn load_skills(dir: &Path) -> Vec<Skill> {
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// Cheap fingerprint of a harness dir: mtime+size of system_prompt.md
+/// plus every skill file. Stat-only (no content reads), so it can run
+/// every turn. Two instances sharing a dir detect each other's edits by
+/// comparing fingerprints.
+pub fn harness_fingerprint(dir: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn bump(h: &mut DefaultHasher, path: &Path) {
+        if let Ok(md) = std::fs::metadata(path) {
+            if let Ok(m) = md.modified() {
+                m.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+                    .hash(h);
+            }
+            md.len().hash(h);
+        }
+    }
+
+    let mut h = DefaultHasher::default();
+    bump(&mut h, &dir.join("system_prompt.md"));
+    if let Ok(entries) = std::fs::read_dir(dir.join("skills")) {
+        // Sort names so the fingerprint is order-independent.
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for n in &names {
+            n.hash(&mut h);
+            bump(&mut h, &dir.join("skills").join(n));
+        }
+    }
+    h.finish()
+}
+
+/// Reload the harness (system prompt + skills) into `state` if the
+/// harness dir changed on disk since the last sync. Returns true when a
+/// reload happened. Cheap when nothing changed: one fingerprint (a few
+/// stats) per call.
+pub fn sync_prompt_state(
+    state: &std::sync::RwLock<PromptState>,
+    dir: &Path,
+) -> std::io::Result<bool> {
+    let fp = harness_fingerprint(dir);
+    let current = state.read().map(|s| s.fingerprint).unwrap_or(None);
+    if current == Some(fp) {
+        return Ok(false);
+    }
+    let harness = Harness::load(Some(dir))
+        .map_err(|e| std::io::Error::other(format!("reloading harness: {e}")))?;
+    if let Ok(mut s) = state.write() {
+        s.system_prompt = harness.system_prompt;
+        s.skills = harness.skills;
+        s.fingerprint = Some(fp);
+    }
+    Ok(true)
 }
 
 /// Parse the `> description` header from a skill file.

@@ -33,6 +33,10 @@ pub struct AgentConfig {
     /// Max skills inlined per turn (relevance-ranked). Ignored when
     /// the state has no skills.
     pub max_inline_skills: usize,
+    /// Optional harness dir for cross-instance sync: each loop
+    /// iteration reloads the prompt state when the dir changed on disk
+    /// (another sigil process edited it). `None` = no sync.
+    pub sync_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentConfig {
@@ -117,6 +121,13 @@ pub async fn run_messages(
     let mut step: u32 = 0;
 
     loop {
+        // Cross-instance sync: if another sigil process edited the
+        // harness dir since our last turn, reload the prompt state so
+        // this instance sees the change (cheap fingerprint when idle).
+        if let Some(dir) = &config.sync_dir {
+            let _ = crate::harness::sync_prompt_state(&config.prompt_state, dir);
+        }
+
         // Fresh specs every turn: evolution tools may have added tools
         // mid-run, and the model should see them on the next turn.
         let specs = tools.specs();

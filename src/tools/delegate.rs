@@ -103,6 +103,7 @@ mod tests {
                     crate::harness::PromptState::default(),
                 )),
                 max_inline_skills: 0,
+                sync_dir: None,
             },
         };
         assert_eq!(tool.name(), "delegate");

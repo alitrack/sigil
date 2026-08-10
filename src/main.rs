@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
     let prompt_state = std::sync::Arc::new(std::sync::RwLock::new(harness::PromptState {
         system_prompt: harness.system_prompt.clone(),
         skills: harness.skills.clone(),
+        fingerprint: None,
     }));
 
     // Tools: native + scripted Lua + memory + MCP.
@@ -119,6 +120,9 @@ async fn main() -> Result<()> {
         // Dynamic skill selection: inline at most 3 relevant skills
         // per turn (keyword-overlap ranked).
         max_inline_skills: 3,
+        // Cross-instance sync: reload the prompt state when another
+        // sigil process edits the harness dir.
+        sync_dir: cli.harness_dir.as_deref().map(std::path::PathBuf::from),
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

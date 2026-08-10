@@ -25,10 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 34** — on-demand skill loading: a compact name +
-> description index of every skill is always in the system prompt, so the
-> model knows the full library and reads any body on demand; only the
-> relevant top-N bodies are inlined per turn.
+> Status: **Phase 35** — cross-instance knowledge sync: each agent loop
+> iteration fingerprints the harness dir (stat-only) and reloads the
+> prompt state when another sigil process edited it, so a running REPL /
+> MCP server picks up skills & prompt written by a concurrent instance —
+> no restart needed. Memory is already shared (file-backed reads).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -221,8 +222,27 @@ MCP tool list.
 | **32** ✅ | Cross-process dir locks (advisory `.sigil.lock` on evolution writes) |
 | **33** ✅ | Ratchet +2 (ACP e2e, session export/import) + scripted-tool schema hardening |
 | **34** ✅ | On-demand skill loading (compact always-on index, bodies read on demand) |
+| **35** ✅ | Cross-instance knowledge sync (per-turn harness fingerprint → live reload) |
 
 ## Changelog
+
+### Phase 35 — 2026-08-10
+- **Cross-instance knowledge sync**. A running agent loop now
+  fingerprints its harness dir every iteration (stat-only: mtime + size
+  of `system_prompt.md` and each `skills/*.md`, sorted for
+  order-independence) and reloads the live prompt state when another
+  sigil process edited it — a concurrent REPL, MCP server or pipe job's
+  `improve_harness` / `skill_rollback` is visible on the very next turn,
+  no restart. Memory was already shared (every call reads the file).
+  - `harness::harness_fingerprint(dir) -> u64` (cheap, deterministic,
+    order-independent) + `harness::sync_prompt_state(&RwLock<PromptState>,
+    dir) -> io::Result<bool>` (reloads only on change).
+  - `AgentConfig.sync_dir` wired in `run_messages` loop head; set from
+    `--harness-dir` in main.
+  - Tests: `sync_prompt_state_reloads_after_external_edit` (prompt edit
+    + skill add picked up; idle = no reload),
+    `harness_fingerprint_changes_with_content` (content/skill-add
+    change it; identical state is stable). 86 total.
 
 ### Phase 34 — 2026-08-10
 - **On-demand skill loading**. The system prompt now always carries a

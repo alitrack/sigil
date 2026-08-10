@@ -290,6 +290,7 @@ async fn edit_prompt_updates_live_prompt_state() {
     let state = std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
         system_prompt: "old prompt".into(),
         skills: vec![],
+        fingerprint: None,
     }));
     let tool = ImproveHarnessTool {
         harness_dir: dir.clone(),

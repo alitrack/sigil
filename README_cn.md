@@ -23,9 +23,10 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 34** — 技能按需加载：系统提示词常驻全量技能的紧凑索引
-> （名+描述，不含 body），模型知道全库存在、按需用 read_file/list_skills
-> 读取正文；每轮仍只内联相关性 top-N 的正文。管道模式、
+> 状态：**Phase 35** — 跨实例知识同步：agent 循环每轮对 harness 目录做
+> 轻量指纹检查（仅 stat），另一个 sigil 进程改动后自动重载提示词与技能
+> ——运行中的 REPL/MCP server 无需重启即感知并发实例的写入。记忆本就
+> 共享（每次调用读文件）。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -201,8 +202,25 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **32** ✅ | 跨进程目录锁（自进化写入加 advisory `.sigil.lock`） |
 | **33** ✅ | Ratchet +2（ACP e2e、会话导出/导入）+ 脚本化工具 schema 加固 |
 | **34** ✅ | 技能按需加载（紧凑常驻索引，正文按需读取） |
+| **35** ✅ | 跨实例知识同步（每轮 harness 指纹检查 → 热重载） |
 
 ## 更新日志
+
+### Phase 35 — 2026-08-10
+- **跨实例知识同步**。运行中的 agent 循环每轮对 harness 目录做指纹
+  检查（仅 stat：`system_prompt.md` 与各 `skills/*.md` 的 mtime+大小，
+  排序保证顺序无关），检测到另一个 sigil 进程改动后自动重载实时提示词
+  状态——并发 REPL、MCP server 或管道任务的 `improve_harness` /
+  `skill_rollback` 在下一轮立即可见，无需重启。记忆本就共享（每次调用
+  读文件）。
+  - `harness::harness_fingerprint(dir) -> u64`（廉价、确定性、顺序无关）+
+    `harness::sync_prompt_state(&RwLock<PromptState>, dir) ->
+    io::Result<bool>`（仅变化时重载）。
+  - `AgentConfig.sync_dir` 接入 `run_messages` 循环开头；main 从
+    `--harness-dir` 注入。
+  - 测试：`sync_prompt_state_reloads_after_external_edit`（提示词编辑 +
+    新增技能被感知；空闲不重载）、`harness_fingerprint_changes_with_content`
+    （内容/新增技能改变指纹；相同状态稳定）。共 86 项。
 
 ### Phase 34 — 2026-08-10
 - **技能按需加载**。系统提示词现在常驻全量技能的紧凑索引（名+描述，

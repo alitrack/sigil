@@ -289,22 +289,6 @@ pub async fn run_turn(
     run_messages(provider, tools, config, &messages, None, None).await
 }
 
-/// [`run_turn`] with optional interactive approver and stream callback.
-pub async fn run_turn_with_approver(
-    provider: &dyn LlmProvider,
-    tools: &mut ToolRegistry,
-    config: &AgentConfig,
-    user_prompt: &str,
-    approver: Option<&Approver>,
-    stream_cb: Option<&StreamCb>,
-) -> Result<String> {
-    let messages = vec![
-        ChatMessage::system(config.system_prompt_for(user_prompt)),
-        ChatMessage::user(user_prompt),
-    ];
-    run_messages(provider, tools, config, &messages, approver, stream_cb).await
-}
-
 /// The core agent loop over a pre-built message list
 /// (system prompt + any prior turns + the new user message). The REPL
 /// uses this to keep true multi-turn context across turns and sessions.

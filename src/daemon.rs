@@ -75,7 +75,7 @@ pub async fn serve(
     let turns = crate::session::load(sessions_dir, &state.session_id)?;
     if !turns.is_empty() {
         let mut messages = state.messages.lock().await;
-        messages.extend(turns_to_messages(turns));
+        messages.extend(crate::session::turns_to_messages(turns));
     }
 
     if let Some(parent) = socket_path.parent() {
@@ -343,18 +343,6 @@ fn friendly_connect_error(socket_path: &Path) -> String {
     )
 }
 
-/// Turn a loaded session's turns into agent messages (used by `serve`
-/// when resuming).
-fn turns_to_messages(turns: Vec<Turn>) -> Vec<ChatMessage> {
-    turns
-        .into_iter()
-        .map(|t| match t.role.as_str() {
-            "assistant" => ChatMessage::assistant(t.text),
-            _ => ChatMessage::user(t.text),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,19 +352,18 @@ mod tests {
         let turns = vec![
             Turn {
                 role: "user".into(),
-                text: "hi".into(),
+                text: "hello".into(),
                 ts: None,
             },
             Turn {
                 role: "assistant".into(),
-                text: "hello".into(),
+                text: "hi".into(),
                 ts: None,
             },
         ];
-        let msgs = turns_to_messages(turns);
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].content, "hi");
-        assert_eq!(msgs[1].content, "hello");
+        let msgs = crate::session::turns_to_messages(turns);
+        assert_eq!(msgs[0].role, crate::llm::Role::User);
+        assert_eq!(msgs[1].role, crate::llm::Role::Assistant);
     }
 
     #[tokio::test]

@@ -25,12 +25,13 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 46** — daemon UX polish: `attach` is now a persistent
-> multi-turn session (`/quit` to leave), `send --timeout` bounds the
-> wait, and dead-socket errors tell you how to start the daemon.
-> Before: Phase 45 ratchet-in-CI + goal turn-budgets, Phase 44 daemon,
-> Phase 43 async delegation, Phase 42 goals, Phase 41's harness
-> refinement gate + token-budget compression, Phase 39's memory write
+> Status: **Phase 47** — CLI consistency: pipe mode now honors
+> `--resume latest` (loads the session transcript as context) and
+> `session list` shows last-activity timestamps.
+> Before: Phase 46 daemon UX polish, Phase 45 ratchet-in-CI + goal
+> turn-budgets, Phase 44 daemon, Phase 43 async delegation, Phase 42
+> goals, Phase 41's harness refinement gate + token-budget
+> compression, Phase 39's memory write
 > safety, Phase 38's LLM failover, Phase 36's session continuity and
 > Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
@@ -237,8 +238,24 @@ MCP tool list.
 | **44** ✅ | Background daemon (Unix socket agent loop + attach/send + session persistence) |
 | **45** ✅ | Ratchet in CI (--check-only) + goal turn-budgets (auto-pause) |
 | **46** ✅ | Daemon UX polish (persistent attach session + /quit, send --timeout, friendly errors) |
+| **47** ✅ | CLI consistency (pipe --resume latest works, session list timestamps) |
 
 ## Changelog
+
+### Phase 47 — 2026-08-10 (CLI consistency)
+- **Pipe mode honors `--resume`**: `sigil prompt --resume latest "…"`
+  loads the most recent session's transcript as context and appends
+  the new prompt (previously `--resume` was silently ignored in pipe
+  mode). `latest` resolves like the REPL/daemon; the resumed session
+  id and turn count are printed to stderr.
+- **`session list` shows last-activity timestamps** (YYYY-DDD-HHMMSS,
+  newest first), alongside turn count and first-message preview —
+  picking a session to resume is now easy.
+- `turns_to_messages` moved to session.rs (shared by REPL, daemon and
+  pipe); the now-dead `run_turn_with_approver` wrapper removed.
+- 120 tests; ratchet 12/12; E2E: daemon writes a session → pipe
+  `--resume latest` answers from that context (42), no-resume run
+  doesn't.
 
 ### Phase 46 — 2026-08-10 (daemon UX polish)
 - **`attach` is now a persistent session**: multi-turn chat with the

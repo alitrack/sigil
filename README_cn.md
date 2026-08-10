@@ -23,13 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 46** — daemon 体验打磨：`attach` 现在是持久多轮会话
-> （`/quit` 退出），`send --timeout` 限制等待，死 socket 错误会提示
-> 如何启动 daemon。此前：Phase 45 ratchet 进 CI + goal turn 预算、
-> Phase 44 daemon、Phase 43 异步委托、Phase 42 持久目标、Phase 41
-> 改进门控 + token 预算压缩、Phase 39 记忆写安全、Phase 38 LLM
-> 故障转移、
-> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
+> 状态：**Phase 47** — CLI 一致性：pipe 模式现在支持 `--resume
+> latest`（加载会话转录作为上下文），`session list` 显示最后活动
+> 时间戳。此前：Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI +
+> goal turn 预算、Phase 44 daemon、Phase 43 异步委托、Phase 42 持久
+> 目标、Phase 41 改进门控 + token 预算压缩、Phase 39 记忆写安全、
+> Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35 跨实例知识
+> 同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -217,8 +217,21 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **44** ✅ | 后台 daemon（Unix socket agent 循环 + attach/send + 会话持久化） |
 | **45** ✅ | ratchet 进 CI（--check-only）+ goal turn 预算（自动 pause） |
 | **46** ✅ | daemon 体验打磨（attach 持久会话 + /quit、send --timeout、友好错误） |
+| **47** ✅ | CLI 一致性（pipe --resume latest 生效、session list 时间戳） |
 
 ## 更新日志
+
+### Phase 47 — 2026-08-10（CLI 一致性）
+- **pipe 模式支持 `--resume`**：`sigil prompt --resume latest "…"`
+  加载最近会话的完整转录作为上下文并追加新 prompt（此前 pipe 模式
+  静默忽略 `--resume`）。`latest` 解析与 REPL/daemon 一致；恢复的
+  会话 id 与轮数打印到 stderr。
+- **`session list` 显示最后活动时间戳**（YYYY-DDD-HHMMSS，最新在
+  前），连同轮数与首条消息预览——挑选要续接的会话一目了然。
+- `turns_to_messages` 移到 session.rs（REPL/daemon/pipe 共享）；
+  删除已无调用点的 `run_turn_with_approver` 包装。
+- 120 测试；ratchet 12/12；E2E：daemon 写会话 → pipe
+  `--resume latest` 从该上下文回答（42），无 resume 则答不出。
 
 ### Phase 46 — 2026-08-10（daemon 体验打磨）
 - **`attach` 现在是持久会话**：与 daemon 多轮对话——每轮结束后

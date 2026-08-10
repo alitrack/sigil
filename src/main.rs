@@ -217,10 +217,15 @@ async fn main() -> Result<()> {
                         println!("no sessions");
                     } else {
                         for s in sessions {
+                            let when = s
+                                .last_ts
+                                .as_deref()
+                                .map(|t| &t[..t.len().min(17)])
+                                .unwrap_or("?");
                             if s.preview.is_empty() {
-                                println!("{} — {} turns", s.id, s.turns);
+                                println!("{when}  {}  {} turns", s.id, s.turns);
                             } else {
-                                println!("{} — {} turns — {}", s.id, s.turns, s.preview);
+                                println!("{when}  {}  {} turns  {}", s.id, s.turns, s.preview);
                             }
                         }
                     }
@@ -307,6 +312,11 @@ async fn main() -> Result<()> {
         }
         _ => {
             let prompt = cli::prompt_from(sub_prompt)?;
+            let sessions_dir = cli
+                .sessions_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(session::default_sessions_dir);
             // Pipe mode with live streaming to stdout.
             let stream_cb = |delta: Option<&str>| {
                 if let Some(d) = delta {
@@ -314,11 +324,35 @@ async fn main() -> Result<()> {
                     let _ = std::io::stdout().flush();
                 }
             };
-            let _answer = agent::run_turn_with_approver(
+            // `--resume <id>` (or `latest`) continues an existing
+            // session: load its transcript as the conversation context
+            // and append this prompt, exactly like the REPL/daemon.
+            let run_msgs = match cli.resume.as_deref() {
+                Some(r) => {
+                    let id = if r == "latest" {
+                        match session::latest(&sessions_dir)? {
+                            Some(id) => id,
+                            None => {
+                                eprintln!("  no sessions yet — starting a new one");
+                                session::start(&sessions_dir)?
+                            }
+                        }
+                    } else {
+                        r.to_string()
+                    };
+                    let turns = session::load(&sessions_dir, &id)?;
+                    eprintln!("  (resumed session {id} — {} turns)", turns.len());
+                    let mut msgs = session::turns_to_messages(turns);
+                    msgs.push(crate::llm::ChatMessage::user(prompt));
+                    msgs
+                }
+                None => vec![crate::llm::ChatMessage::user(prompt)],
+            };
+            let _answer = agent::run_messages(
                 provider_arc.as_ref(),
                 &mut tools,
                 &agent_config,
-                &prompt,
+                &run_msgs,
                 None,
                 Some(&stream_cb),
             )

@@ -148,6 +148,18 @@ pub fn latest(sessions_dir: &Path) -> std::io::Result<Option<String>> {
     Ok(summaries(sessions_dir)?.into_iter().next().map(|s| s.id))
 }
 
+/// Turn a loaded session's turns into agent messages (resume paths:
+/// REPL, daemon, pipe mode).
+pub fn turns_to_messages(turns: Vec<Turn>) -> Vec<crate::llm::ChatMessage> {
+    turns
+        .into_iter()
+        .map(|t| match t.role.as_str() {
+            "assistant" => crate::llm::ChatMessage::assistant(t.text),
+            _ => crate::llm::ChatMessage::user(t.text),
+        })
+        .collect()
+}
+
 /// Compact timestamp: YYYYMMDD-HHMMSS-nnnnnnnnn (nanosecond precision
 /// so sessions started in the same second never collide).
 pub fn chrono_like_timestamp() -> String {

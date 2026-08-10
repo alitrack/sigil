@@ -9,9 +9,15 @@
 //! Example tool (`~/.sigil/tools/date.lua`):
 //! ```lua
 //! return function(args)
-//!     return os.date("%Y-%m-%d %H:%M:%S")
+//!     return host.date("%Y-%m-%d %H:%M:%S")
 //! end
 //! ```
+//!
+//! Sandbox: the `io` / `os` standard libraries are NOT available —
+//! scripts use `host` helpers (read_file, write_file, env, list_dir,
+//! cwd, json_encode, json_decode, date) for anything privileged, and
+//! `require` only loads built-in modules (ffi, string, table, math,
+//! bit, jit, coroutine).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

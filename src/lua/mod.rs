@@ -23,15 +23,18 @@ impl LuaRuntime {
     /// Create a LuaJIT state with a restricted, tool-friendly environment.
     /// `ffi` stays enabled (that's the point); `io`/`os` are NOT exposed
     /// to scripted tools — host helpers (read_file, write_file, ...) are
-    /// the safe boundary instead. (Phase-3 approval gate hooks in here.)
+    /// the safe boundary instead, and `require` is wrapped in an
+    /// allowlist (borrowed from smolagents' `authorized_imports`) so a
+    /// script can only pull in built-in modules, never `io`/`os` or
+    /// anything off the filesystem. (Phase-3 approval gate hooks in here.)
     pub fn new() -> Result<Self> {
-        // Open the full LuaJIT standard library *except* the unsafe
-        // `debug` module (rejected by mlua's safe new_with). `ffi` is
-        // included — it is excluded from the default safe subset and is
-        // the entire point of the vendored LuaJIT build.
+        // Standard library *without* the unsafe `io` and `os` modules
+        // (file/process access — scripts must go through host helpers)
+        // and without `debug` (rejected by mlua's safe new_with).
+        // `ffi` is included — it is excluded from the default safe
+        // subset and is the entire point of the vendored LuaJIT build.
         use mlua::StdLib as S;
-        let stdlib =
-            S::TABLE | S::IO | S::OS | S::STRING | S::MATH | S::PACKAGE | S::FFI | S::BIT | S::JIT;
+        let stdlib = S::TABLE | S::STRING | S::MATH | S::PACKAGE | S::FFI | S::BIT | S::JIT;
         // SAFETY: mlua's safe `new_with` refuses the `ffi` standard
         // library (it's classified unsafe because Lua scripts could
         // load arbitrary C libraries). sigil *wants* exactly that —
@@ -39,6 +42,28 @@ impl LuaRuntime {
         // (LuaJIT FFI). We are the host; we accept the risk. All other
         // safety properties of mlua still hold.
         let lua = unsafe { Lua::unsafe_new_with(stdlib, mlua::LuaOptions::default()) };
+        // Restricted `require`: only allowlisted built-in modules may be
+        // loaded (smolagents' `authorized_imports` pattern). Without
+        // this, `require` can walk the filesystem loaders and load
+        // arbitrary Lua from disk — a file-read side channel.
+        {
+            let real_require: mlua::Function = lua.globals().get("require").map_err(lua_err)?;
+            let wrapped = lua
+                .create_function(move |_lua, name: String| {
+                    const ALLOWED: &[&str] =
+                        &["ffi", "string", "table", "math", "bit", "jit", "coroutine"];
+                    if !ALLOWED.contains(&name.as_str()) {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "unauthorized require('{name}'): only built-in modules are \
+                             allowed (ffi, string, table, math, bit, jit, coroutine). \
+                             File access goes through host helpers."
+                        )));
+                    }
+                    real_require.call::<mlua::Value>(name)
+                })
+                .map_err(lua_err)?;
+            lua.globals().set("require", wrapped).map_err(lua_err)?;
+        }
         // Expose a minimal `host` table with safe helpers.
         let host = lua.create_table().map_err(lua_err)?;
         host.set(
@@ -110,6 +135,42 @@ impl LuaRuntime {
                     .map_err(|e| mlua::Error::RuntimeError(format!("json_decode: {e}")))?;
                 lua.to_value(&json)
                     .map_err(|e| mlua::Error::RuntimeError(format!("json_decode: {e}")))
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+        host.set(
+            "date",
+            lua.create_function(|_lua, fmt: Option<String>| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs();
+                let days = secs / 86_400;
+                let rem = secs % 86_400;
+                let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+                // Civil date from days-since-epoch (Howard Hinnant's
+                // algorithm — no chrono dependency needed).
+                let z = days as i64 + 719_468;
+                let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+                let doe = (z - era * 146_097) as u64;
+                let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+                let mon = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+                let y = (yoe + era as u64 * 400 + (if mon <= 2 { 1 } else { 0 })) as u32;
+                let out = match fmt.as_deref() {
+                    Some(f) if !f.is_empty() => f.to_string(),
+                    _ => "%Y-%m-%d %H:%M:%S".to_string(),
+                };
+                Ok(out
+                    .replace("%Y", &format!("{y:04}"))
+                    .replace("%m", &format!("{mon:02}"))
+                    .replace("%d", &format!("{d:02}"))
+                    .replace("%H", &format!("{h:02}"))
+                    .replace("%M", &format!("{mi:02}"))
+                    .replace("%S", &format!("{s:02}")))
             })
             .map_err(lua_err)?,
         )
@@ -244,5 +305,58 @@ return tostring(libc.strlen('hello'))
         // a sorted array.
         let out = rt.run("return #host.list_dir(host.cwd()) > 0").unwrap();
         assert_eq!(out, "true");
+    }
+
+    #[test]
+    fn io_and_os_not_exposed() {
+        // The sandbox contract: scripts go through host helpers, so the
+        // raw `io` / `os` standard libraries must be absent (they would
+        // bypass the host boundary and the approval gate).
+        let rt = LuaRuntime::new().unwrap();
+        let io = rt.run("return io").unwrap();
+        assert_eq!(io, "null");
+        let os = rt.run("return os").unwrap();
+        assert_eq!(os, "null");
+    }
+
+    #[test]
+    fn require_allowlist_blocks_dangerous_modules() {
+        // authorized_imports (smolagents pattern): only built-in modules
+        // are require-able; `io` / `os` / anything off the filesystem
+        // must be rejected with a clear error.
+        let rt = LuaRuntime::new().unwrap();
+        let err = rt.run("return require('io')").unwrap_err();
+        // `{err:#}` (not to_string) because run() wraps errors with
+        // context; the chain must contain the allowlist message.
+        assert!(format!("{err:#}").contains("unauthorized require('io')"));
+        let err2 = rt.run("return require('os')").unwrap_err();
+        assert!(format!("{err2:#}").contains("unauthorized require('os')"));
+    }
+
+    #[test]
+    fn require_allowlist_still_loads_ffi() {
+        // The core feature survives the allowlist: ffi must remain
+        // require-able.
+        let rt = LuaRuntime::new().unwrap();
+        let out = rt
+            .run("local ffi = require('ffi'); return type(ffi)")
+            .unwrap();
+        assert_eq!(out, "\"table\"");
+    }
+
+    #[test]
+    fn host_date_formats_civil_date() {
+        // host.date replaces os.date — default format and a custom one.
+        let rt = LuaRuntime::new().unwrap();
+        let out = rt.run("return host.date('%Y-%m-%d')").unwrap();
+        // 8 digits, dashed, e.g. "2026-08-11" — matches ^\d{4}-\d{2}-\d{2}$
+        let unquoted = out.trim_matches('"');
+        assert_eq!(
+            unquoted.len(),
+            10,
+            "date must be YYYY-MM-DD, got {unquoted}"
+        );
+        assert_eq!(unquoted.chars().filter(|c| *c == '-').count(), 2);
+        assert!(unquoted.chars().all(|c| c.is_ascii_digit() || c == '-'));
     }
 }

@@ -251,6 +251,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
 
+### Phase 50 — 2026-08-11（Lua 沙箱加固：authorized_imports 白名单）
+- **`io`/`os` 标准库不再暴露给脚本工具**——此前 stdlib 开着
+  `S::IO | S::OS`（注释声称 "NOT exposed" 但实际可用），脚本可绕过
+  host 边界直接 `io.open` 任意文件 / `os.execute` 任意命令。现在
+  文件/环境/时间全部走 `host` 辅助函数。
+- **`require` 白名单**（smolagents `authorized_imports` 同款语义）：
+  只放行内建模块 `ffi/string/table/math/bit/jit/coroutine`；未授权
+  模块（如 `require('io')`）报明确错误，不再可能从文件系统加载 Lua
+  文件（原 `require` 可走 loaders 读任意 .lua——文件读取侧信道）。
+- **新增 `host.date(fmt)`** 替代 `os.date`：civil-date 算法（Howard
+  Hinnant，无 chrono 依赖），支持 `%Y %m %d %H %M %S` 占位符；
+  `test-tools/whoami.lua` 已迁移。
+- `create_lua_tool` 的工具描述同步告知模型沙箱边界。
+- 测试 +4：`io_and_os_not_exposed`、`require_allowlist_blocks_dangerous_modules`、
+  `require_allowlist_still_loads_ffi`、`host_date_formats_civil_date`。
+
 ### Phase 49 — 2026-08-11（结构化运行结果 + UTF-8 日志修复）
 - `run_messages` 现返回 `RunResult { output, steps, state }`
   （借鉴 smolagents 的 `RunResult`）而非裸 String——调用方能直接

@@ -25,17 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 49** — structured run results: `run_messages` now
-> returns a `RunResult` (output + steps + state) instead of a bare
-> string; step-budget exhaustion no longer aborts the turn — the loop
-> runs one final tool-less call (smolagents' `provide_final_answer`)
-> for a wrap-up summary tagged `StepLimitReached`, and the daemon's
-> `done` frame carries the state. Also fixed a daemon crash on
-> multi-byte log truncation (UTF-8 char-boundary panic).
-> Before: Phase 48 external research landing (parallel tool execution,
-> reactive compaction retry, planning checkpoints, sub-agent report
-> templates) + 48r daemon deadlock fix, Phase 47 CLI consistency,
-> Phase 46 daemon UX polish, Phase 45
+> Status: **Phase 50** — Lua sandbox hardening: the `io`/`os`
+> standard libraries are no longer exposed to scripted tools (host
+> helpers are the only file/env/date boundary, with a new `host.date`
+> replacing `os.date`), and `require` is wrapped in an allowlist
+> (smolagents `authorized_imports` pattern) so only built-in modules
+> load. Previously: Phase 49 structured run results (`RunResult` +
+> `provide_final_answer` step-limit wrap-up), Phase 48r ratchet
+> hardening, Phase 48 external research landing, Phase 47 CLI
+> consistency, Phase 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -279,6 +277,26 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 50 — 2026-08-11 (Lua sandbox hardening: authorized_imports)
+- The `io`/`os` standard libraries are **no longer exposed to scripted
+  tools**. The stdlib previously included `S::IO | S::OS` (the doc
+  comment claimed "NOT exposed" but they were live), letting scripts
+  bypass the host boundary with raw `io.open` / `os.execute`. File,
+  env, and date access now all go through `host` helpers.
+- **`require` allowlist** (smolagents' `authorized_imports` pattern):
+  only built-in modules load (`ffi`/`string`/`table`/`math`/`bit`/
+  `jit`/`coroutine`); anything else (e.g. `require('io')`) errors with
+  a clear message — and the filesystem loaders can no longer read
+  arbitrary `.lua` files off disk (a file-read side channel before).
+- **New `host.date(fmt)`** replaces `os.date`: Howard Hinnant's civil
+  date algorithm (no chrono dependency), `%Y %m %d %H %M %S`
+  placeholders. `test-tools/whoami.lua` migrated.
+- `create_lua_tool`'s description now tells the model the sandbox
+  boundary.
+- Tests +4: `io_and_os_not_exposed`,
+  `require_allowlist_blocks_dangerous_modules`,
+  `require_allowlist_still_loads_ffi`, `host_date_formats_civil_date`.
 
 ### Phase 49 — 2026-08-11 (structured run results + UTF-8 log fix)
 - `run_messages` now returns `RunResult { output, steps, state }`

@@ -133,6 +133,9 @@ async fn main() -> Result<()> {
         // Cross-instance sync: reload the prompt state when another
         // sigil process edits the harness dir.
         sync_dir: cli.harness_dir.as_deref().map(std::path::PathBuf::from),
+        // Context budget: fold old turns into a summary when the
+        // transcript exceeds 40 messages (long REPL sessions).
+        max_context_messages: 40,
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

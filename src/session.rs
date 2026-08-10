@@ -217,10 +217,19 @@ pub fn export_session(
         turns,
     };
     let json = serde_json::to_string_pretty(&archive)?;
+    // Atomic write: write to a temp file in the same directory, then
+    // rename over the target. A crash mid-write leaves the old file
+    // intact instead of a truncated export (and the temp file is
+    // cleaned up on error).
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(out_path, json)?;
+    let tmp = out_path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    if let Err(e) = fs::rename(&tmp, out_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(archive)
 }
 
@@ -372,6 +381,8 @@ mod tests {
         assert_eq!(archive.turns.len(), 2);
         assert_eq!(archive.source_id, id);
         assert!(out.exists());
+        // Atomic write leaves no temp file behind.
+        assert!(!dir.join("archive.json.tmp").exists(), "tmp file leaked");
 
         // Import into the same dir → NEW session id, same turns.
         let new_id = import_session(&dir, &out).unwrap();

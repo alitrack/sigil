@@ -25,11 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 39** — memory write safety: `remember`/`delete` now
-> run their read-modify-write under the cross-process directory lock
-> (Phase 32), so concurrent sigil instances can't lose each other's
-> facts. Plus Phase 38's LLM failover, Phase 36's session continuity
-> and Phase 35's cross-instance knowledge sync.
+> Status: **Phase 40** — robustness: `bash`/`git` tools now time out
+> after 60s (killed, reported to the model instead of hanging the
+> loop); long REPL transcripts are folded into a compact summary when
+> they exceed 40 messages; `session export` writes atomically. Plus
+> Phase 39's memory write safety, Phase 38's LLM failover, Phase 36's
+> session continuity and Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -227,8 +228,36 @@ MCP tool list.
 | **37** ✅ | Ratchet LLM-variance tolerance (per-task retries + retry_prompt) |
 | **38** ✅ | LLM failover (endpoint chain: transient retry, 4xx abort) |
 | **39** ✅ | Memory write safety (remember/delete under cross-process lock) |
+| **40** ✅ | Robustness (tool timeouts + context compression + atomic export) |
 
 ## Changelog
+
+### Phase 40 — 2026-08-10
+- **Tool timeouts**. `bash` and `git` ran `tokio::process::Command`
+  with no wall-clock budget — a model asking for `sleep 10000` (or a
+  hung git fetch) hung the agent loop forever. Both now go through
+  `run_with_timeout` (60s budget, `kill_on_drop` so no orphan keeps
+  running) and a timeout is reported to the model as a normal tool
+  output (`[bash: command timed out after 60s — process killed]`),
+  letting the loop continue. Scripted Lua tools already had a similar
+  timeout; this closes the native-tool gap.
+- **Context compression**. REPL sessions grew the transcript without
+  bound — every turn re-sent the whole history. `compact_messages`
+  folds the oldest turns into one deterministic summary `system`
+  message (role-tagged one-line excerpts, no LLM call) once the
+  transcript exceeds `max_context_messages` (default 40, `0` disables).
+  Cutting only happens at safe boundaries (a `user` or tool-free
+  `assistant` message), so the kept tail never orphans a `tool` result
+  from its tool-call message.
+- **Atomic session export**. `session export` wrote the archive with a
+  plain `fs::write` — a crash mid-write left a truncated file. It now
+  writes to `<name>.json.tmp` then renames over the target (atomic on
+  the same filesystem), cleaning the temp file on error.
+  - Tests: `run_with_timeout_returns_output_for_fast_command`,
+    `run_with_timeout_kills_slow_command`, `compact_*` ×4, tmp-leak
+    assertion in export roundtrip. 100 total.
+  - E2E: bash `sleep 120` returns the timeout note in ~60s without
+    hanging; export roundtrip valid JSON, no `.tmp` leftover.
 
 ### Phase 39 — 2026-08-10
 - **Memory write safety**. `remember` and `delete` were plain

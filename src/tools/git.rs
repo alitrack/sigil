@@ -6,11 +6,15 @@ use serde_json::{Value, json};
 use super::{Tool, ToolOutput};
 
 /// Run `git <args>` in the current directory, capture combined output.
+/// Bounded by the same 60s budget as `bash` — a hung git fetch can't
+/// hang the agent loop.
 async fn git(args: &[&str]) -> anyhow::Result<String> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args);
+    let output = match super::bash::run_with_timeout(cmd, super::bash::CMD_TIMEOUT).await? {
+        Some(o) => o,
+        None => return Ok("(git: command timed out after 60s — killed)".into()),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut text = stdout.trim().to_string();

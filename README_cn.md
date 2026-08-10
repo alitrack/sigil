@@ -23,10 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 39** — 记忆写安全：`remember`/`delete` 的读-改-写
-> 全程置于跨进程目录锁（Phase 32）下，并发 sigil 实例不再互相覆盖
-> 事实。另有 Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
-> 跨实例知识同步。管道模式、
+> 状态：**Phase 40** — 健壮性：`bash`/`git` 工具 60s 超时（杀进程、
+> 作为普通工具输出报告给模型，不再挂死循环）；长 REPL 会话超过
+> 40 条消息时折叠为紧凑摘要；`session export` 原子写入。另有
+> Phase 39 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与
+> Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -207,8 +208,31 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **37** ✅ | ratchet LLM 方差容忍（任务级重试 + retry_prompt 强制话术） |
 | **38** ✅ | LLM 故障转移（端点链：瞬时故障重试下一端点，4xx 中止） |
 | **39** ✅ | 记忆写安全（remember/delete 置于跨进程锁下） |
+| **40** ✅ | 健壮性（工具超时 + 上下文压缩 + 原子导出） |
 
 ## 更新日志
+
+### Phase 40 — 2026-08-10
+- **工具超时**。`bash`/`git` 原来跑 `tokio::process::Command` 无
+  墙上时钟预算——模型要 `sleep 10000`（或卡死的 git fetch）会永久
+  挂死 agent 循环。两者现在都走 `run_with_timeout`（60s 预算，
+  `kill_on_drop` 防孤儿进程），超时作为普通工具输出报告给模型
+  （`[bash: command timed out after 60s — process killed]`），循环
+  继续。脚本 Lua 工具本有类似超时；此改动补齐原生工具缺口。
+- **上下文压缩**。REPL 会话 transcript 无限增长——每轮都重发整个
+  历史。`compact_messages` 在 transcript 超过
+  `max_context_messages`（默认 40，`0` 禁用）时把最老轮次折叠成
+  一条确定性摘要 `system` 消息（带 role 标记的单行摘录，不调
+  LLM）。切割只发生在安全边界（`user` 或无 tool_calls 的
+  `assistant` 消息），保留区不会出现孤儿 `tool` 结果。
+- **原子会话导出**。`session export` 原本用裸 `fs::write`——中途
+  崩溃留下截断文件。现在先写 `<name>.json.tmp` 再 rename 覆盖目标
+  （同文件系统原子），出错时清理临时文件。
+  - 测试：`run_with_timeout_returns_output_for_fast_command`、
+    `run_with_timeout_kills_slow_command`、`compact_*` ×4、导出
+    roundtrip 加 tmp 无泄漏断言。共 100 项。
+  - E2E：bash `sleep 120` ~60s 返回超时提示且不挂死；导出 roundtrip
+    合法 JSON、无 `.tmp` 残留。
 
 ### Phase 39 — 2026-08-10
 - **记忆写安全**。`remember` 和 `delete` 原本是裸的读-改-写

@@ -115,7 +115,7 @@ impl ToolRegistry {
 
     #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
-        Self::with_tools(None, None, None, None)
+        Self::with_tools(None, None, None, None, None)
     }
 
     /// Native tools plus any Lua scripted tools found on disk.
@@ -132,6 +132,7 @@ impl ToolRegistry {
         harness_dir: Option<&Path>,
         prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
         goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
+        local_harness_dir: Option<&Path>,
     ) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
@@ -168,6 +169,7 @@ impl ToolRegistry {
             .unwrap_or_else(harness::default_harness_dir);
         registry.register(Arc::new(evolve::ImproveHarnessTool {
             harness_dir: harness_dir.clone(),
+            local_dir: local_harness_dir.map(Path::to_path_buf),
             prompt_state: prompt_state.clone(),
         }));
         // Persistent goals: the model declares long-running objectives;

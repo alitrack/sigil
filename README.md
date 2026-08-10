@@ -25,15 +25,18 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 50** — Lua sandbox hardening: the `io`/`os`
-> standard libraries are no longer exposed to scripted tools (host
-> helpers are the only file/env/date boundary, with a new `host.date`
-> replacing `os.date`), and `require` is wrapped in an allowlist
-> (smolagents `authorized_imports` pattern) so only built-in modules
-> load. Previously: Phase 49 structured run results (`RunResult` +
-> `provide_final_answer` step-limit wrap-up), Phase 48r ratchet
-> hardening, Phase 48 external research landing, Phase 47 CLI
-> consistency, Phase 46 daemon UX, Phase 45 ratchet in CI.
+> Status: **Phase 51** — improve_harness local/global dual-track
+> (first step): a `--local-harness-dir` creates a merged harness view
+> (local system_prompt.md overrides global, local skills shadow
+> same-named global ones); improve_harness gains a `scope` parameter
+> (global default | local) so the model can run session-local
+> experiments that never touch the shared harness, with per-layer
+> refinements.jsonl audit. Previous: Phase 50 Lua sandbox hardening
+> (io/os no longer exposed; require allowlist; host.date), Phase 49
+> structured run results (RunResult + provide_final_answer), Phase 48
+> parallel tools + reactive compaction + planning checkpoints + delegate
+> report templates, 48r daemon deadlock fix, Phase 47 CLI consistency,
+> Phase 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -277,6 +280,22 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 51 — 2026-08-11 (improve_harness local/global dual-track, step 1)
+- `--local-harness-dir` loads a **merged view** of global + session-local
+  harness layers: a local `system_prompt.md` overrides the global one;
+  local skills **shadow** same-named global skills (others merge).
+  `Harness::load_with_local` does the merge.
+- `improve_harness` gains a `scope` parameter (`global` default | `local`):
+  local writes land in the session-local dir (own dir lock + own
+  refinements.jsonl audit, events carry a scope field) — the global
+  harness stays untouched, so the model can run session experiments
+  (borrowed from prime-agent's Continual Harness local/global dual-track).
+- PromptState refreshes to the merged view after writes (load_with_local
+  reload) — live on the very next turn.
+- 6 new tests: merge semantics (prompt override / skill shadow / no-local
+  fallback) + scope=local write & isolation + missing-local-dir rejection
+  + merged-view refresh.
 
 ### Phase 50 — 2026-08-11 (Lua sandbox hardening: authorized_imports)
 - The `io`/`os` standard libraries are **no longer exposed to scripted

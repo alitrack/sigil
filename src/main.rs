@@ -66,8 +66,13 @@ async fn main() -> Result<()> {
 
     // Harness bundle: system prompt + skills from disk (editable).
     // Loaded before the tools so the evolution tools can share the
-    // live prompt state with the agent loop.
-    let harness = harness::Harness::load(cli.harness_dir.as_deref().map(std::path::Path::new))?;
+    // live prompt state with the agent loop. A --local-harness-dir
+    // creates a merged view (local shadows global) — the session's
+    // private experiment surface.
+    let harness = harness::Harness::load_with_local(
+        cli.harness_dir.as_deref().map(std::path::Path::new),
+        cli.local_harness_dir.as_deref().map(std::path::Path::new),
+    )?;
     let prompt_state = std::sync::Arc::new(std::sync::RwLock::new(harness::PromptState {
         system_prompt: harness.system_prompt.clone(),
         skills: harness.skills.clone(),
@@ -95,6 +100,7 @@ async fn main() -> Result<()> {
         cli.harness_dir.as_deref().map(std::path::Path::new),
         Some(prompt_state.clone()),
         Some(goals.clone()),
+        cli.local_harness_dir.as_deref().map(std::path::Path::new),
     );
 
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.

@@ -176,6 +176,11 @@ impl Tool for CreateLuaToolTool {
 pub struct ImproveHarnessTool {
     /// Absolute path to the harness dir (system_prompt.md lives here).
     pub harness_dir: std::path::PathBuf,
+    /// Session-local harness dir (optional). When set, `scope=local`
+    /// writes land here instead of the global dir — the session's
+    /// private experiment surface (prime-agent local/global dual-track).
+    /// `None` = no local layer; scope=local is rejected with a hint.
+    pub local_dir: Option<std::path::PathBuf>,
     /// Live prompt state to update after writes (so the running agent
     /// sees edits immediately). `None` = isolated (tests).
     pub prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
@@ -227,6 +232,11 @@ impl Tool for ImproveHarnessTool {
          prompt), 'add_skill' (create a skill markdown file whose first \
          line is '> short description', reusable by future sessions), \
          'list_skills' (list existing skills). \
+         Optional 'scope': 'global' (default) edits the shared harness \
+         that persists across sessions; 'local' edits the session-local \
+         harness (only when sigil was started with --local-harness-dir) — \
+         use local for experiments you don't want to permanently change \
+         the global harness. \
          Every write REQUIRES a 'reason' field: one sentence of evidence \
          why this change is a durable, generally-useful improvement. \
          Noise edits (empty/identical content, too-short prompts) are \
@@ -244,6 +254,11 @@ impl Tool for ImproveHarnessTool {
                     "type": "string",
                     "enum": ["edit_prompt", "add_skill", "list_skills"],
                     "description": "What to do"
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["global", "local"],
+                    "description": "Where to write: 'global' (default) edits the shared persistent harness; 'local' edits the session-local harness (available only with --local-harness-dir)."
                 },
                 "content": {
                     "type": "string",
@@ -267,11 +282,46 @@ impl Tool for ImproveHarnessTool {
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // local/global dual-track: scope=local writes to the session-local
+        // harness dir (when one is configured); default is the global dir.
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("global");
+        let target_dir = match scope {
+            "global" => self.harness_dir.clone(),
+            "local" => self.local_dir.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scope=local requires a session-local harness dir — start sigil with --local-harness-dir <dir>"
+                )
+            })?,
+            other => anyhow::bail!("unknown scope: {other} (expected 'global' or 'local')"),
+        };
+        // Refresh the live prompt state from the merged global+local
+        // view, so the running agent sees this write on the very next
+        // turn (global writes show up too — unless a local layer
+        // shadows the same asset).
+        let refresh_state = || {
+            let Some(state) = &self.prompt_state else {
+                return;
+            };
+            let Ok(mut s) = state.write() else {
+                return;
+            };
+            if let Ok(merged) = crate::harness::Harness::load_with_local(
+                Some(&self.harness_dir),
+                self.local_dir.as_deref(),
+            ) {
+                s.system_prompt = merged.system_prompt;
+                s.skills = merged.skills;
+            }
+        };
         // Writes (edit_prompt / add_skill) take the directory lock so
         // concurrent sigil instances never interleave "read old →
         // archive → write new" on the harness assets. list_skills is
-        // read-only and stays outside the lock.
-        crate::harness::lock::with_dir_lock(&self.harness_dir, || match action {
+        // read-only and stays outside the lock. The lock follows the
+        // target dir: local writes lock the local dir, global the global.
+        crate::harness::lock::with_dir_lock(&target_dir, || match action {
             "edit_prompt" => {
                 let content = args
                     .get("content")
@@ -281,7 +331,7 @@ impl Tool for ImproveHarnessTool {
                 // is required so harness changes are auditable and
                 // reviewable (mirrors prime-agent's /refine review).
                 let reason = gated_reason(args)?;
-                let path = self.harness_dir.join("system_prompt.md");
+                let path = target_dir.join("system_prompt.md");
                 let old = std::fs::read_to_string(&path).unwrap_or_default();
                 // Quality gate: a full prompt replacement must actually
                 // change something and stay substantial.
@@ -302,23 +352,20 @@ impl Tool for ImproveHarnessTool {
                 // Snapshot the current prompt before replacing it.
                 if !old.is_empty() {
                     crate::harness::versions::backup_and_prune(
-                        &self.harness_dir,
+                        &target_dir,
                         "prompt",
                         "system_prompt",
                         &old,
                     );
                 }
                 std::fs::write(&path, content)?;
-                if let Some(state) = &self.prompt_state
-                    && let Ok(mut s) = state.write()
-                {
-                    s.system_prompt = content.to_string();
-                }
+                refresh_state();
                 record_refinement(
-                    &self.harness_dir,
+                    &target_dir,
                     &json!({
                         "ts": crate::session::chrono_like_timestamp(),
                         "action": "edit_prompt",
+                        "scope": scope,
                         "reason": reason,
                         "result": "ok",
                     }),
@@ -349,7 +396,7 @@ impl Tool for ImproveHarnessTool {
                 if safe.is_empty() {
                     anyhow::bail!("skill name must contain alphanumerics");
                 }
-                let skills_dir = self.harness_dir.join("skills");
+                let skills_dir = target_dir.join("skills");
                 std::fs::create_dir_all(&skills_dir)?;
                 let path = skills_dir.join(format!("{safe}.md"));
                 // Quality gate: a skill needs a description header, a
@@ -378,31 +425,21 @@ impl Tool for ImproveHarnessTool {
                 }
                 // Snapshot the previous version if this skill exists.
                 if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup_and_prune(
-                        &self.harness_dir,
-                        "skills",
-                        &safe,
-                        &old,
-                    );
+                    crate::harness::versions::backup_and_prune(&target_dir, "skills", &safe, &old);
                 }
                 std::fs::write(&path, content)?;
-                if let Some(state) = &self.prompt_state
-                    && let Ok(mut s) = state.write()
-                {
-                    // Refresh the in-memory skill list from disk so
-                    // dynamic inlining picks the new skill up now.
-                    s.skills = crate::harness::load_skills(&skills_dir);
-                }
+                refresh_state();
                 // Detect dependency cycles across all skills and warn
                 // (the write succeeds — a cycle is a quality problem,
                 // not a reason to reject the skill).
                 let all_skills = crate::harness::load_skills(&skills_dir);
                 let cycles = crate::harness::find_dependency_cycles(&all_skills);
                 record_refinement(
-                    &self.harness_dir,
+                    &target_dir,
                     &json!({
                         "ts": crate::session::chrono_like_timestamp(),
                         "action": "add_skill",
+                        "scope": scope,
                         "name": safe,
                         "reason": reason,
                         "result": "ok",
@@ -423,7 +460,7 @@ impl Tool for ImproveHarnessTool {
                 Ok(ToolOutput { text })
             }
             "list_skills" => {
-                let skills_dir = self.harness_dir.join("skills");
+                let skills_dir = target_dir.join("skills");
                 let skills = crate::harness::load_skills(&skills_dir);
                 let cycles = crate::harness::find_dependency_cycles(&skills);
                 if skills.is_empty() {

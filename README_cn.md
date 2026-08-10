@@ -23,14 +23,16 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 49** — 结构化运行结果：`run_messages` 返回
-> `RunResult`（output + steps + state）而非裸字符串；步数预算用尽不再
-> 中止回合——循环追加一次无工具调用（smolagents `provide_final_answer`）
-> 产出收尾总结并标记 `StepLimitReached`，daemon 的 `done` 帧携带 state。
-> 另修复 daemon 多字节日志截断崩溃（UTF-8 字符边界 panic）。
-> 此前：Phase 48 外部调研落地（并行工具执行、
-> 反应式压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
-> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
+> 状态：**Phase 51** — improve_harness local/global 双轨（第一步）：
+> `--local-harness-dir` 创建合并视图（local 的 system_prompt.md 覆盖全局、
+> local 技能遮蔽同名全局技能）；improve_harness 新增 `scope` 参数
+> （global 默认 | local），模型可跑会话局部实验而不触碰共享 harness，
+> 审计按层分开 refinements.jsonl。此前：Phase 50 Lua 沙箱加固（io/os
+> 不再暴露、require 白名单、host.date 替代 os.date）、Phase 49
+> 结构化运行结果（RunResult + provide_final_answer）、Phase 48 外部调研
+> 落地（并行工具执行、反应式压缩重试、规划检查点、子 agent 报告模板）
+> + 48r daemon 死锁修复、Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、
+> Phase 45
 > ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
 > Phase 42 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
@@ -250,6 +252,19 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 51 — 2026-08-11（improve_harness local/global 双轨第一步）
+- **`--local-harness-dir`**：加载全局 + 会话局部两层 harness 的合并
+  视图——local 的 `system_prompt.md` 覆盖全局；local 技能**遮蔽同名**
+  全局技能（其余合并）。`Harness::load_with_local` 承担 merge。
+- **`improve_harness` 新增 `scope` 参数**（`global` 默认 | `local`）：
+  local 写会话局部目录（独立目录锁 + 独立 refinements.jsonl 审计，
+  审计事件带 scope 字段），全局 harness 零污染——模型可跑会话实验，
+  借鉴 prime-agent Continual Harness 的 local/global 双轨。
+- PromptState 写入后刷新为**合并视图**（load_with_local 重载），
+  下一轮立即生效。
+- 6 个新测试：merge 语义（prompt 覆盖/skills 遮蔽/无 local 回退）+
+  scope=local 写入与隔离 + 无 local 目录拒绝 + 刷新合并视图。
 
 ### Phase 50 — 2026-08-11（Lua 沙箱加固：authorized_imports 白名单）
 - **`io`/`os` 标准库不再暴露给脚本工具**——此前 stdlib 开着

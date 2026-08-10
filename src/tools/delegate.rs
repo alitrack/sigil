@@ -311,7 +311,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,

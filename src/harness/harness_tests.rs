@@ -343,3 +343,75 @@ fn harness_fingerprint_changes_with_content() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Unique temp dir per test name (parallel tests must not collide).
+fn tmp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sigil-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn load_with_local_no_local_dir_falls_back_to_global() {
+    let g = tmp_dir("lg-nolocal");
+    std::fs::write(g.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+    let skills = g.join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(skills.join("gs.md"), "> global skill\nglobal body").unwrap();
+
+    // No local dir → identical to plain load.
+    let h = Harness::load_with_local(Some(&g), None).unwrap();
+    assert_eq!(h.system_prompt, "GLOBAL PROMPT");
+    assert_eq!(h.skills.len(), 1);
+    assert!(h.local_dir.is_none());
+
+    let _ = std::fs::remove_dir_all(&g);
+}
+
+#[test]
+fn load_with_local_local_prompt_overrides_global() {
+    let g = tmp_dir("lg-ovr");
+    let l = tmp_dir("lg-ovr-local");
+    std::fs::write(g.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+    std::fs::create_dir_all(g.join("skills")).unwrap();
+    std::fs::write(l.join("system_prompt.md"), "LOCAL PROMPT").unwrap();
+
+    let h = Harness::load_with_local(Some(&g), Some(&l)).unwrap();
+    assert_eq!(h.system_prompt, "LOCAL PROMPT");
+    assert_eq!(h.local_dir.as_deref(), Some(l.as_path()));
+    assert!(h.local_skills_dir.is_some());
+
+    let _ = std::fs::remove_dir_all(&g);
+    let _ = std::fs::remove_dir_all(&l);
+}
+
+#[test]
+fn load_with_local_local_skills_shadow_global_same_name() {
+    let g = tmp_dir("lg-shdw");
+    let l = tmp_dir("lg-shdw-local");
+    let gs = g.join("skills");
+    let ls = l.join("skills");
+    std::fs::create_dir_all(&gs).unwrap();
+    std::fs::create_dir_all(&ls).unwrap();
+
+    // Same-named skill in both layers: local wins.
+    std::fs::write(gs.join("dup.md"), "> global dup\nglobal body").unwrap();
+    std::fs::write(ls.join("dup.md"), "> local dup\nlocal body").unwrap();
+    // Global-only skill: survives the merge.
+    std::fs::write(gs.join("only-global.md"), "> only global\nbody").unwrap();
+    // Local-only skill: added.
+    std::fs::write(ls.join("only-local.md"), "> only local\nbody").unwrap();
+
+    let h = Harness::load_with_local(Some(&g), Some(&l)).unwrap();
+    let by_name: std::collections::HashMap<&str, &crate::harness::Skill> =
+        h.skills.iter().map(|s| (s.name.as_str(), s)).collect();
+    assert_eq!(by_name.len(), 3, "dup+only-global+only-local");
+    assert!(by_name["dup"].body.contains("local body"));
+    assert!(!by_name["dup"].body.contains("global body"));
+    assert!(by_name.contains_key("only-global"));
+    assert!(by_name.contains_key("only-local"));
+
+    let _ = std::fs::remove_dir_all(&g);
+    let _ = std::fs::remove_dir_all(&l);
+}

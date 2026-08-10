@@ -37,6 +37,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub harness_dir: Option<String>,
 
+    /// Session-local harness directory (optional). When set, sigil loads
+    /// a merged view: local system_prompt.md overrides the global one and
+    /// local skills shadow same-named global skills. improve_harness can
+    /// write here with scope=local — experiments stay out of the global
+    /// harness (prime-agent local/global dual-track).
+    #[arg(long, global = true)]
+    pub local_harness_dir: Option<String>,
+
     /// Memory file for remember/recall tools (default: ~/.sigil/memory.md).
     #[arg(long, global = true)]
     pub memory: Option<String>,

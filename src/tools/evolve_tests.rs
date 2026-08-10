@@ -187,6 +187,7 @@ async fn improve_harness_edits_prompt() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     let out = tool
@@ -213,6 +214,7 @@ async fn improve_harness_adds_and_lists_skills() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
 
@@ -273,6 +275,7 @@ async fn improve_harness_rejects_unknown_action() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     let err = tool
@@ -298,6 +301,7 @@ async fn edit_prompt_updates_live_prompt_state() {
     }));
     let tool = ImproveHarnessTool {
         harness_dir: dir.clone(),
+        local_dir: None,
         prompt_state: Some(state.clone()),
     };
     let out = tool
@@ -330,6 +334,7 @@ async fn refinement_gate_rejects_missing_reason() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     // No reason → rejected before any write.
@@ -360,6 +365,7 @@ async fn refinement_gate_rejects_noop_rewrites() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     // Identical content (just whitespace difference) → rejected.
@@ -400,6 +406,7 @@ async fn refinement_gate_rejects_noise_and_bad_shape() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     // Too short to be a full prompt replacement.
@@ -440,6 +447,7 @@ async fn accepted_edits_are_audited_in_refinements_jsonl() {
 
     let tool = ImproveHarnessTool {
         harness_dir: harness.clone(),
+        local_dir: None,
         prompt_state: None,
     };
     tool.run(&json!({
@@ -465,6 +473,119 @@ async fn accepted_edits_are_audited_in_refinements_jsonl() {
     assert!(lines[0].contains("\"reason\":\"audit test\""));
     assert!(lines[1].contains("\"action\":\"add_skill\""));
     assert!(lines[1].contains("\"name\":\"audit-skill\""));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn scope_local_writes_to_local_dir_when_configured() {
+    let dir = fresh_dir("scope-local");
+    let harness = dir.join("harness");
+    let local = dir.join("local-harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::create_dir_all(local.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: Some(local.clone()),
+        prompt_state: None,
+    };
+
+    // scope=local edit_prompt → lands in the local dir, not the global one.
+    tool.run(&json!({
+        "action": "edit_prompt",
+        "scope": "local",
+        "content": "A local experimental prompt that is comfortably over one hundred characters long so the quality gate happily accepts it for the local scope test",
+        "reason": "testing a session-local experiment"
+    }))
+    .await
+    .unwrap();
+
+    let local_prompt = std::fs::read_to_string(local.join("system_prompt.md")).unwrap();
+    assert!(local_prompt.contains("local experimental prompt"));
+    // Global prompt untouched.
+    let global_prompt = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
+    assert_eq!(global_prompt, "GLOBAL PROMPT");
+    // Audit lands next to the write (local refinements.jsonl).
+    assert!(local.join("refinements.jsonl").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn scope_local_without_local_dir_is_rejected() {
+    let dir = fresh_dir("scope-reject");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: None,
+        prompt_state: None,
+    };
+    let err = tool
+        .run(&json!({
+            "action": "edit_prompt",
+            "scope": "local",
+            "content": "A local experimental prompt padded well beyond one hundred characters so the gate accepts it but the missing local dir should reject it first",
+            "reason": "test"
+        }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--local-harness-dir"), "err: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn scope_local_add_skill_and_refresh_state_merge() {
+    let dir = fresh_dir("scope-merge");
+    let harness = dir.join("harness");
+    let local = dir.join("local-harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::create_dir_all(local.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+    // Same-named global skill that the local layer will shadow.
+    std::fs::write(
+        harness.join("skills").join("dup.md"),
+        "> global dup\nglobal body",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
+        system_prompt: "GLOBAL PROMPT".into(),
+        skills: crate::harness::load_skills(&harness.join("skills")),
+        fingerprint: None,
+    }));
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: Some(local.clone()),
+        prompt_state: Some(state.clone()),
+    };
+
+    // Local add_skill shadows the global same-named skill.
+    tool.run(&json!({
+        "action": "add_skill",
+        "scope": "local",
+        "name": "dup",
+        "content": "> local dup\nlocal body padded out beyond the minimum length comfortably for the gate",
+        "reason": "session experiment"
+    }))
+    .await
+    .unwrap();
+
+    // PromptState was refreshed to the merged view: local skill wins.
+    let s = state.read().unwrap();
+    let dup = s.skills.iter().find(|sk| sk.name == "dup").unwrap();
+    assert!(
+        dup.body
+            .contains("local body padded out beyond the minimum length comfortably for the gate")
+    );
+    assert!(!dup.body.contains("global body"));
+    assert!(s.skills.iter().any(|sk| sk.name == "dup"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -45,6 +45,13 @@ pub struct Harness {
     pub harness_dir: PathBuf,
     #[allow(dead_code)]
     pub skills_dir: PathBuf,
+    /// Session-local harness dir, if any. When set, the loaded view is
+    /// the merge of global + local (local wins on same names).
+    #[allow(dead_code)]
+    pub local_dir: Option<PathBuf>,
+    /// Where session-local skills live (derived from `local_dir`).
+    #[allow(dead_code)]
+    pub local_skills_dir: Option<PathBuf>,
 }
 
 /// Live prompt state shared between the agent loop and the evolution
@@ -95,7 +102,51 @@ impl Harness {
             skills,
             harness_dir: dir,
             skills_dir,
+            local_dir: None,
+            local_skills_dir: None,
         })
+    }
+
+    /// Load the harness bundle as a **merged view** of a global harness
+    /// dir and a session-local one (prime-agent local/global dual-track).
+    ///
+    /// - `system_prompt.md`: local overrides global when present (the
+    ///   local layer is the session's private experiment surface).
+    /// - skills: local skills **shadow** same-named global skills
+    ///   (first-wins on name); everything else merges.
+    ///
+    /// The returned `Harness` carries both dirs so AHE tools can write
+    /// to either layer, and `PromptState` built from it reflects the
+    /// merged view the agent actually sees.
+    pub fn load_with_local(harness_dir: Option<&Path>, local_dir: Option<&Path>) -> Result<Self> {
+        let mut h = Self::load(harness_dir)?;
+        let Some(local) = local_dir else {
+            return Ok(h);
+        };
+        let local_skills_dir = local.join("skills");
+        std::fs::create_dir_all(&local_skills_dir)?;
+
+        // Local system_prompt.md overrides the global one.
+        if let Ok(text) = std::fs::read_to_string(local.join("system_prompt.md")) {
+            h.system_prompt = text;
+        }
+
+        // Local skills shadow same-named global skills; others merge.
+        let local_skills = load_skills(&local_skills_dir);
+        if !local_skills.is_empty() {
+            let mut merged = h.skills;
+            for ls in local_skills {
+                match merged.iter_mut().find(|s| s.name == ls.name) {
+                    Some(slot) => *slot = ls,
+                    None => merged.push(ls),
+                }
+            }
+            h.skills = merged;
+        }
+
+        h.local_dir = Some(local.to_path_buf());
+        h.local_skills_dir = Some(local_skills_dir);
+        Ok(h)
     }
 
     /// Render a compact index of all skills (name + description only,

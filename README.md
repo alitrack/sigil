@@ -25,12 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 38** — LLM failover: the provider holds an endpoint
-> chain (primary + `[llm] fallbacks` / `SIGIL_FALLBACK_BASE_URL`); on
-> transient failures (network error, 5xx, 429) it retries the next
-> endpoint with backoff, while 4xx client errors abort immediately.
-> Plus Phase 36's session continuity and Phase 35's cross-instance
-> knowledge sync.
+> Status: **Phase 39** — memory write safety: `remember`/`delete` now
+> run their read-modify-write under the cross-process directory lock
+> (Phase 32), so concurrent sigil instances can't lose each other's
+> facts. Plus Phase 38's LLM failover, Phase 36's session continuity
+> and Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -227,8 +226,24 @@ MCP tool list.
 | **36** ✅ | Session continuity (`session list` summaries + `--resume latest`) |
 | **37** ✅ | Ratchet LLM-variance tolerance (per-task retries + retry_prompt) |
 | **38** ✅ | LLM failover (endpoint chain: transient retry, 4xx abort) |
+| **39** ✅ | Memory write safety (remember/delete under cross-process lock) |
 
 ## Changelog
+
+### Phase 39 — 2026-08-10
+- **Memory write safety**. `remember` and `delete` were plain
+  read-modify-write (`read_to_string` → edit → whole-file `write`):
+  two concurrent sigil instances appending facts could lose each
+  other's entries (last writer wins). Both now run their full
+  read-check-append-write / read-edit-write sequence under the Phase 32
+  cross-process directory lock (`with_dir_lock` on the memory file's
+  parent, falling back to `.` for a bare filename). Reads (`recall`,
+  `list`) stay lock-free.
+  - Tests: `concurrent_remembers_lose_nothing` (2×25 interleaved
+    appends, all 50 facts survive), `concurrent_delete_and_remember_are_consistent`
+    (append vs delete race keeps the file valid). 94 total.
+  - E2E: two real pipe-mode sigil processes racing 10 remembers each —
+    all 20 facts present, zero loss.
 
 ### Phase 38 — 2026-08-10
 - **LLM failover**. The OpenAI-compatible provider now holds an endpoint

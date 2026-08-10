@@ -23,10 +23,10 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 38** — LLM 故障转移：provider 持端点链（主 +
-> `[llm] fallbacks` / `SIGIL_FALLBACK_BASE_URL`）；瞬时故障（网络错误、
-> 5xx、429）带退避重试下一端点，4xx 客户端错误立即中止。另有
-> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
+> 状态：**Phase 39** — 记忆写安全：`remember`/`delete` 的读-改-写
+> 全程置于跨进程目录锁（Phase 32）下，并发 sigil 实例不再互相覆盖
+> 事实。另有 Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
+> 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -206,8 +206,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **36** ✅ | 会话续接（`session list` 摘要 + `--resume latest`） |
 | **37** ✅ | ratchet LLM 方差容忍（任务级重试 + retry_prompt 强制话术） |
 | **38** ✅ | LLM 故障转移（端点链：瞬时故障重试下一端点，4xx 中止） |
+| **39** ✅ | 记忆写安全（remember/delete 置于跨进程锁下） |
 
 ## 更新日志
+
+### Phase 39 — 2026-08-10
+- **记忆写安全**。`remember` 和 `delete` 原本是裸的读-改-写
+  （`read_to_string` → 编辑 → 整体 `write`）：两个并发 sigil 实例
+  追加事实时可能互相覆盖（last-writer-wins）。两者现在把完整的
+  读-查-追加-写 / 读-改-写 序列置于 Phase 32 跨进程目录锁下
+  （`with_dir_lock` 锁 memory 文件父目录；裸文件名回退 `.`）。
+  读操作（`recall`、`list`）保持无锁。
+  - 测试：`concurrent_remembers_lose_nothing`（2×25 交错追加，
+    50 条事实全存活）、`concurrent_delete_and_remember_are_consistent`
+    （追加 vs 删除竞争下文件保持有效）。共 94 项。
+  - E2E：两个真实管道模式 sigil 进程各并发 remember 10 条——
+    20 条全部在场，零丢失。
 
 ### Phase 38 — 2026-08-10
 - **LLM 故障转移**。OpenAI 兼容 provider 现在持端点链：主端点 +

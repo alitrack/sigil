@@ -21,27 +21,41 @@ pub fn default_memory_path() -> PathBuf {
 }
 
 /// Append a fact to the memory file (idempotent by substring).
+///
+/// The whole read-check-append-write sequence runs under the
+/// cross-process directory lock (Phase 32 `with_dir_lock` on the
+/// memory file's parent) so concurrent sigil instances can't lose
+/// each other's facts to read-modify-write races.
 pub fn remember(path: &PathBuf, fact: &str) -> anyhow::Result<String> {
-    let fact = fact.trim();
-    if fact.is_empty() {
-        return Ok("nothing to remember (empty fact)".into());
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.contains(fact) {
-        return Ok("already in memory — skipped".into());
-    }
-    let date = chrono_lite_today();
-    let entry = format!("- ({date}) {fact}\n");
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(&entry);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, updated)?;
-    Ok(format!("remembered: {fact}"))
+    let fact = fact.trim().to_string();
+    // Parent may be "" for a bare filename — lock the current dir then.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    crate::harness::lock::with_dir_lock(&dir, || {
+        let fact = fact.as_str();
+        if fact.is_empty() {
+            return Ok("nothing to remember (empty fact)".into());
+        }
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        if existing.contains(fact) {
+            return Ok("already in memory — skipped".into());
+        }
+        let date = chrono_lite_today();
+        let entry = format!("- ({date}) {fact}\n");
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&entry);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, updated)?;
+        Ok(format!("remembered: {fact}"))
+    })
 }
 
 /// Show the memory file, optionally filtered by a search term.
@@ -98,50 +112,63 @@ pub fn list(path: &PathBuf) -> anyhow::Result<String> {
 
 /// Delete memory entries by 1-based index (from `list`) or by substring
 /// (case-insensitive). Returns what was removed.
+///
+/// Locked like [`remember`]: read-modify-write under the cross-process
+/// directory lock so concurrent instances can't resurrect deleted
+/// entries (or drop each other's edits).
 pub fn delete(
     path: &PathBuf,
     index: Option<usize>,
     substring: Option<&str>,
 ) -> anyhow::Result<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    let mut removed: Vec<String> = Vec::new();
-    match (index, substring) {
-        (Some(i), _) if i >= 1 && i <= lines.len() => {
-            removed.push(lines.remove(i - 1));
-        }
-        (Some(i), _) => {
-            return Ok(format!(
-                "index {i} out of range (memory has {} lines)",
-                lines.len()
-            ));
-        }
-        (None, Some(sub)) if !sub.trim().is_empty() => {
-            let lower = sub.to_lowercase();
-            let mut kept = Vec::with_capacity(lines.len());
-            for l in lines {
-                if l.to_lowercase().contains(&lower) {
-                    removed.push(l);
-                } else {
-                    kept.push(l);
-                }
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let substring = substring.map(|s| s.to_string());
+    crate::harness::lock::with_dir_lock(&dir, || {
+        let substring = substring.as_deref();
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        let mut removed: Vec<String> = Vec::new();
+        match (index, substring) {
+            (Some(i), _) if i >= 1 && i <= lines.len() => {
+                removed.push(lines.remove(i - 1));
             }
-            lines = kept;
+            (Some(i), _) => {
+                return Ok(format!(
+                    "index {i} out of range (memory has {} lines)",
+                    lines.len()
+                ));
+            }
+            (None, Some(sub)) if !sub.trim().is_empty() => {
+                let lower = sub.to_lowercase();
+                let mut kept = Vec::with_capacity(lines.len());
+                for l in lines {
+                    if l.to_lowercase().contains(&lower) {
+                        removed.push(l);
+                    } else {
+                        kept.push(l);
+                    }
+                }
+                lines = kept;
+            }
+            _ => return Ok("delete needs 'index' (from list) or 'substring'".into()),
         }
-        _ => return Ok("delete needs 'index' (from list) or 'substring'".into()),
-    }
-    let updated = lines.join("\n");
-    std::fs::write(path, updated)?;
-    if removed.is_empty() {
-        Ok("nothing removed".into())
-    } else {
-        Ok(format!(
-            "removed {} entr{}:\n{}",
-            removed.len(),
-            if removed.len() == 1 { "y" } else { "ies" },
-            removed.join("\n")
-        ))
-    }
+        let updated = lines.join("\n");
+        std::fs::write(path, updated)?;
+        if removed.is_empty() {
+            Ok("nothing removed".into())
+        } else {
+            Ok(format!(
+                "removed {} entr{}:\n{}",
+                removed.len(),
+                if removed.len() == 1 { "y" } else { "ies" },
+                removed.join("\n")
+            ))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -240,6 +267,68 @@ mod tests {
         // Neither arg → guidance.
         let out = delete(&path, None, None).unwrap();
         assert!(out.contains("delete needs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_remembers_lose_nothing() {
+        // Two "instances" racing to append different facts must both
+        // land: the cross-process lock serializes read-modify-write.
+        let dir = std::env::temp_dir().join(format!("sigil-mem-race-{}", std::process::id()));
+        let path = dir.join("memory.md");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..25 {
+                remember(&p1, &format!("fact-alpha-{i}")).unwrap();
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..25 {
+                remember(&p2, &format!("fact-beta-{i}")).unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        for i in 0..25 {
+            assert!(text.contains(&format!("fact-alpha-{i}")), "lost alpha-{i}");
+            assert!(text.contains(&format!("fact-beta-{i}")), "lost beta-{i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_delete_and_remember_are_consistent() {
+        // One thread appends while another deletes; the lock must keep
+        // the file valid (no torn writes, no resurrected entries).
+        let dir = std::env::temp_dir().join(format!("sigil-mem-race2-{}", std::process::id()));
+        let path = dir.join("memory.md");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "- (2026-08-09) keep-me\n").unwrap();
+
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..20 {
+                remember(&p1, &format!("fact-delta-{i}")).unwrap();
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..20 {
+                delete(&p2, None, Some(&format!("fact-delta-{i}"))).unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("keep-me"), "base entry lost: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

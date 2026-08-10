@@ -170,7 +170,16 @@ impl Tool for DelegateTool {
                 let provider = self.provider.clone();
                 let mut sub_tools = self.registry.clone_shallow();
                 let config = self.config.clone();
-                let task = task.to_string();
+                // Report template (borrowed from smolagents' managed
+                // agents): the sub-agent is asked to structure its
+                // final report so the parent can see both the answer
+                // and the key steps that produced it.
+                let task = format!(
+                    "{task}\n\n\
+                     When you finish, end your reply with a short report:\n\
+                     <final_answer>\n  (the answer to the task)\n</final_answer>\n\
+                     <key_steps>\n  - 2-5 bullet points of what you did\n</key_steps>\n"
+                );
                 let delegates = self.delegates.clone();
                 let spawn_id = id.clone();
                 tokio::spawn(async move {
@@ -244,7 +253,9 @@ impl Tool for DelegateTool {
                     .context("no such delegate id (see action=list)")?;
                 match (&st.status, &st.result) {
                     (DelegateStatus::Completed, Some(r)) => Ok(ToolOutput {
-                        text: format!("delegate '{id}' result:\n{r}"),
+                        text: format!(
+                            "delegate '{id}' report (parse the <final_answer> / <key_steps> tags):\n{r}"
+                        ),
                     }),
                     (DelegateStatus::Failed, _) => Ok(ToolOutput {
                         text: format!(
@@ -317,6 +328,7 @@ mod tests {
                 max_context_tokens: 0,
                 goals: None,
                 goals_dir: None,
+                planning_interval: 0,
             },
             delegates: Arc::new(DelegateRegistry::default()),
         };

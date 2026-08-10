@@ -23,13 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 47** — CLI 一致性：pipe 模式现在支持 `--resume
-> latest`（加载会话转录作为上下文），`session list` 显示最后活动
-> 时间戳。此前：Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI +
-> goal turn 预算、Phase 44 daemon、Phase 43 异步委托、Phase 42 持久
-> 目标、Phase 41 改进门控 + token 预算压缩、Phase 39 记忆写安全、
-> Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35 跨实例知识
-> 同步。管道模式、
+> 状态：**Phase 48** — 外部调研落地：并行工具执行、反应式压缩重试、
+> 规划检查点、子 agent 报告模板（来自 OpenHands + smolagents）。
+> 此前：Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
+> ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
+> Phase 42 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39
+> 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
+> 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -218,8 +218,27 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **45** ✅ | ratchet 进 CI（--check-only）+ goal turn 预算（自动 pause） |
 | **46** ✅ | daemon 体验打磨（attach 持久会话 + /quit、send --timeout、友好错误） |
 | **47** ✅ | CLI 一致性（pipe --resume latest 生效、session list 时间戳） |
+| **48** ✅ | 调研落地（并行工具调用、反应式压缩、规划检查点、delegate 报告） |
 
 ## 更新日志
+
+### Phase 48 — 2026-08-10（外部调研落地：smolagents + OpenHands）
+四项调研机制落地：
+- **并行工具执行**（OpenHands ParallelToolExecutor）：模型一次返回
+  多个 tool_call 时并发执行，结果按原调用顺序回填。未知工具错误
+  现在作为工具输出反馈给模型而非中断整个 turn（与 ToolRegistry
+  契约一致）。
+- **反应式压缩**（OpenHands condenser）：provider 上下文超限/历史
+  畸形错误触发一次压缩重试（转录减半）后再放弃——补充主动预算
+  检查（单个巨大工具输出可能超过其保护）。
+- **规划检查点**（smolagents planning_interval）：每 N 个 agent
+  循环步让模型复述计划；过期检查点被清除避免历史反复应答。
+  `AgentConfig.planning_interval`（0 = 关闭）。
+- **子 agent 报告模板**（smolagents managed agents）：spawn 的子
+  agent 被要求以 `<final_answer>`/`<key_steps>` 标签结尾；
+  `delegate result` 标注解析结构。
+- 125 测试；ratchet 12/12；E2E：并行 turn 写两个文件、delegate
+  报告携带子 agent 答案与步骤。
 
 ### Phase 47 — 2026-08-10（CLI 一致性）
 - **pipe 模式支持 `--resume`**：`sigil prompt --resume latest "…"`

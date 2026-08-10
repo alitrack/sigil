@@ -25,13 +25,13 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 47** — CLI consistency: pipe mode now honors
-> `--resume latest` (loads the session transcript as context) and
-> `session list` shows last-activity timestamps.
-> Before: Phase 46 daemon UX polish, Phase 45 ratchet-in-CI + goal
-> turn-budgets, Phase 44 daemon, Phase 43 async delegation, Phase 42
-> goals, Phase 41's harness refinement gate + token-budget
-> compression, Phase 39's memory write
+> Status: **Phase 48** — external research landing: parallel tool
+> execution, reactive compaction retry, planning checkpoints and
+> sub-agent report templates (from OpenHands + smolagents).
+> Before: Phase 47 CLI consistency, Phase 46 daemon UX polish, Phase 45
+> ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
+> delegation, Phase 42 goals, Phase 41's harness refinement gate +
+> token-budget compression, Phase 39's memory write
 > safety, Phase 38's LLM failover, Phase 36's session continuity and
 > Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
@@ -239,8 +239,31 @@ MCP tool list.
 | **45** ✅ | Ratchet in CI (--check-only) + goal turn-budgets (auto-pause) |
 | **46** ✅ | Daemon UX polish (persistent attach session + /quit, send --timeout, friendly errors) |
 | **47** ✅ | CLI consistency (pipe --resume latest works, session list timestamps) |
+| **48** ✅ | Research landing (parallel tool calls, reactive compaction, planning checkpoints, delegate reports) |
 
 ## Changelog
+
+### Phase 48 — 2026-08-10 (external research landing: smolagents + OpenHands)
+Four mechanisms borrowed from the research round landed:
+- **Parallel tool execution** (OpenHands' ParallelToolExecutor): when
+  the model issues several tool calls in one response, they execute
+  concurrently; results are re-inserted in the original call order.
+  Unknown-tool errors now flow back to the model as tool output
+  instead of aborting the turn (matching ToolRegistry's contract).
+- **Reactive compaction** (OpenHands' condenser): a provider
+  context-window / malformed-history error triggers one compaction
+  retry (transcript halved) before giving up — complements the
+  proactive budget check, which a single huge tool output can still
+  outrun.
+- **Planning checkpoints** (smolagents' planning_interval): every N
+  agent-loop steps the model restates its plan; stale checkpoints are
+  stripped so the history never re-answers them. `AgentConfig.planning_interval`
+  (0 = off).
+- **Sub-agent report template** (smolagents' managed agents): spawned
+  sub-agents are asked to end with `<final_answer>` / `<key_steps>`
+  tags; `delegate result` labels the parsed structure.
+- 125 tests; ratchet 12/12; E2E: parallel turn writes two files,
+  delegate report carries the sub-agent's answer + steps.
 
 ### Phase 47 — 2026-08-10 (CLI consistency)
 - **Pipe mode honors `--resume`**: `sigil prompt --resume latest "…"`

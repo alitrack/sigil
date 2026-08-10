@@ -56,7 +56,16 @@ pub struct AgentConfig {
     /// Where `goals.jsonl` lives, for persisting turn-budget
     /// auto-pauses from the agent loop (same file the tool writes).
     pub goals_dir: Option<std::path::PathBuf>,
+    /// Planning checkpoints (borrowed from smolagents'
+    /// `planning_interval`): every N agent-loop steps the model is
+    /// asked to restate its plan before continuing. `0` disables.
+    pub planning_interval: u32,
 }
+
+/// Planning checkpoint prompt injected every `planning_interval` steps.
+pub const PLANNING_CHECKPOINT_PROMPT: &str = "PLANNING CHECKPOINT: Before continuing, briefly restate your \
+     current plan — what you have done so far and what remains. Keep it \
+     to 2-3 lines. Then continue working toward the task.";
 
 impl AgentConfig {
     /// System prompt for a specific user prompt: base prompt plus the
@@ -348,6 +357,20 @@ pub async fn run_messages(
             }
         }
 
+        // Planning checkpoints (borrowed from smolagents'
+        // `planning_interval`): on the first step and every Nth step
+        // afterwards, ask the model to restate its plan. Keeps long
+        // multi-tool turns on track instead of drifting. A previous
+        // checkpoint is dropped first so the history never carries a
+        // stale one between checkpoints (and the model does not keep
+        // re-answering it on every step).
+        messages.retain(|m| !m.content.contains("PLANNING CHECKPOINT"));
+        if config.planning_interval > 0
+            && (step == 0 || step.is_multiple_of(config.planning_interval))
+        {
+            messages.push(ChatMessage::system(PLANNING_CHECKPOINT_PROMPT));
+        }
+
         // Fresh specs every turn: evolution tools may have added tools
         // mid-run, and the model should see them on the next turn.
         let specs = tools.specs();
@@ -365,10 +388,45 @@ pub async fn run_messages(
             temperature: None,
         };
 
-        let mut stream = provider
-            .chat_stream(req.clone())
-            .await
-            .context("starting completion")?;
+        // Reactive compaction (borrowed from OpenHands' condenser):
+        // the proactive budget check above runs every iteration, but a
+        // single huge tool output can still push the transcript over
+        // the provider's window. When the LLM call fails with a
+        // context-window / malformed-history error, compact once and
+        // retry before giving up.
+        let mut stream = match provider.chat_stream(req.clone()).await {
+            Ok(s) => s,
+            Err(e) if is_recoverable_llm_error(&e) && messages.len() > 4 => {
+                // Halve the transcript: the proactive budget check may
+                // already have run (its result can still exceed the
+                // provider's window), so a second, more aggressive pass
+                // must make progress regardless of the configured
+                // budget.
+                let compacted = compact_messages_with_budget(&messages, messages.len() / 2, 0);
+                if compacted.len() < messages.len() {
+                    eprintln!(
+                        "  llm error ({e:#}); compacting transcript \
+                         ({} -> {} messages) and retrying",
+                        messages.len(),
+                        compacted.len()
+                    );
+                    let retry_req = ChatRequest {
+                        model: config.model.clone(),
+                        messages: compacted,
+                        tools: specs,
+                        stream: true,
+                        temperature: None,
+                    };
+                    provider
+                        .chat_stream(retry_req)
+                        .await
+                        .context("starting completion (after compaction)")?
+                } else {
+                    return Err(e).context("starting completion");
+                }
+            }
+            Err(e) => return Err(e).context("starting completion"),
+        };
 
         let mut text = String::new();
         let mut tool_calls_requested = false;
@@ -409,7 +467,23 @@ pub async fn run_messages(
                 &complete.text,
                 complete.tool_calls.clone(),
             ));
-            for call in complete.tool_calls {
+
+            // Two-phase tool execution (borrowed from OpenHands'
+            // ParallelToolExecutor): approval-gate and circuit-breaker
+            // checks are cheap and serial; the actual tool runs are
+            // independent (the LLM issues several tool calls in one
+            // response precisely because they do not depend on each
+            // other), so they execute concurrently. Results are
+            // re-inserted in the original call order so the LLM always
+            // sees tool_results matching its tool_call ids.
+            struct Plan {
+                call: crate::llm::ToolCall,
+                /// Some(reason) = rejected/tripped, do not run.
+                blocked: Option<String>,
+            }
+            let mut plans: Vec<Plan> = Vec::with_capacity(complete.tool_calls.len());
+            let mut executables: Vec<usize> = Vec::new(); // plan indices to run
+            for call in &complete.tool_calls {
                 // Approval gate: reject destructive commands in
                 // non-interactive mode before they ever run. In
                 // interactive mode the human may override.
@@ -422,36 +496,68 @@ pub async fn run_messages(
                     allowed = true;
                     eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
                 }
+                if !allowed {
+                    plans.push(Plan {
+                        call: call.clone(),
+                        blocked: Some(safety::reject_message(&call.name, &call.arguments)),
+                    });
+                    continue;
+                }
+                // Circuit breaker: skip tripped tools entirely.
+                if breaker.is_tripped(&call.name) {
+                    plans.push(Plan {
+                        call: call.clone(),
+                        blocked: Some(safety::CircuitBreaker::tripped_message(&call.name)),
+                    });
+                    continue;
+                }
+                executables.push(plans.len());
+                plans.push(Plan {
+                    call: call.clone(),
+                    blocked: None,
+                });
+            }
 
-                if allowed {
-                    // Circuit breaker: skip tripped tools entirely.
-                    if breaker.is_tripped(&call.name) {
-                        let msg = safety::CircuitBreaker::tripped_message(&call.name);
-                        messages.push(ChatMessage::tool_result(msg, call.id));
-                        continue;
-                    }
-                    let result = tools.execute(&call).await?;
+            // Parallel execution of the allowed calls. CircuitBreaker
+            // is internally locked, so per-call failure/success
+            // recording stays correct under concurrency. Errors are
+            // returned as tool output (never fatal), matching
+            // ToolRegistry::execute's contract.
+            let registry = &*tools;
+            let breaker_ref = &breaker;
+            let futs = executables.iter().map(|&pi| {
+                let call = plans[pi].call.clone();
+                async move {
+                    let result = match registry.execute(&call).await {
+                        Ok(r) => r,
+                        Err(e) => format!("error: {e}"),
+                    };
                     // Execution ring: flag harness mutations to the
                     // model so it knows the toolset changed.
                     let result = match safety::ring_of(&call.name) {
-                        safety::Ring::Harness => {
-                            format!("[harness mutation] {result}")
-                        }
+                        safety::Ring::Harness => format!("[harness mutation] {result}"),
                         _ => result,
                     };
-                    // Circuit breaker: failures trip, successes reset.
                     if result.starts_with("error:") {
-                        if breaker.record_failure(&call.name) {
-                            eprintln!("circuit breaker tripped: {}", call.name);
-                        }
+                        breaker_ref.record_failure(&call.name);
                     } else {
-                        breaker.record_success(&call.name);
+                        breaker_ref.record_success(&call.name);
                     }
-                    messages.push(ChatMessage::tool_result(result, call.id));
-                } else {
-                    let msg = safety::reject_message(&call.name, &call.arguments);
-                    messages.push(ChatMessage::tool_result(msg, call.id));
+                    (pi, result)
                 }
+            });
+            let executed: Vec<(usize, String)> = futures_util::future::join_all(futs).await;
+            let mut results_by_plan: std::collections::HashMap<usize, String> =
+                executed.into_iter().collect();
+
+            for (i, plan) in plans.into_iter().enumerate() {
+                let msg = match plan.blocked {
+                    Some(m) => m,
+                    None => results_by_plan
+                        .remove(&i)
+                        .unwrap_or_else(|| "error: tool produced no result".into()),
+                };
+                messages.push(ChatMessage::tool_result(msg, plan.call.id));
             }
             // Evolution: hot-register any tools the model created this
             // turn so they are callable (and advertised) next turn.
@@ -461,6 +567,505 @@ pub async fn run_messages(
 
         // No tool call — this is the final answer.
         return Ok(text.trim().to_string());
+    }
+}
+
+/// Classify a provider error: can compaction recover from it? OpenHands
+/// routes context-window-exceeded and malformed-history failures into
+/// condensation retries; sigil does the same with its deterministic
+/// compaction.
+fn is_recoverable_llm_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    const RECOVERABLE: &[&str] = &[
+        "context length",
+        "context window",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "token limit",
+        "context is too long",
+        "exceeded the maximum",
+        "malformed",
+        "unmatched tool",
+        "invalid tool",
+        "previous response",
+    ];
+    RECOVERABLE.iter().any(|k| msg.contains(k))
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::llm::provider::{ChatComplete, ChatRequest, ChatStream, LlmProvider, ToolCall};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Records its start time, then sleeps — the slow half of the
+    /// concurrency check.
+    #[derive(Clone)]
+    struct SlowTool(Arc<Mutex<Vec<Instant>>>);
+    #[async_trait]
+    impl crate::tools::Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+        fn description(&self) -> &str {
+            "slow tool for concurrency test"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(&self, _args: &serde_json::Value) -> anyhow::Result<crate::tools::ToolOutput> {
+            self.0.lock().unwrap().push(Instant::now());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(crate::tools::ToolOutput {
+                text: "SLOW".into(),
+            })
+        }
+    }
+
+    /// Records its start time and returns immediately — the fast half.
+    #[derive(Clone)]
+    struct FastTool(Arc<Mutex<Vec<Instant>>>);
+    #[async_trait]
+    impl crate::tools::Tool for FastTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+        fn description(&self) -> &str {
+            "fast tool for concurrency test"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(&self, _args: &serde_json::Value) -> anyhow::Result<crate::tools::ToolOutput> {
+            self.0.lock().unwrap().push(Instant::now());
+            Ok(crate::tools::ToolOutput {
+                text: "FAST".into(),
+            })
+        }
+    }
+
+    /// First request emits two tool calls (slow_tool + fast_tool);
+    /// second request verifies the tool results arrived in original
+    /// call order and returns the final answer.
+    #[derive(Debug)]
+    struct TwoCallProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmProvider for TwoCallProvider {
+        fn name(&self) -> &str {
+            "two-call-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(Box::new(futures_util::stream::iter(vec![
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: false,
+                        tool_calls_requested: true,
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: true,
+                    }),
+                ])))
+            } else {
+                // Second loop iteration: verify the tool results came
+                // back in original call order, then answer.
+                let results: Vec<&str> = req
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == crate::llm::provider::Role::Tool)
+                    .map(|m| m.content.as_str())
+                    .collect();
+                assert_eq!(
+                    results,
+                    vec!["SLOW", "FAST"],
+                    "tool results must keep call order"
+                );
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "DONE".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                    },
+                )])))
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            // Only ever called once: the first-iteration tool-call
+            // replay (the second iteration's stream carries the final
+            // answer, so no replay happens).
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "slow_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "fast_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+            })
+        }
+    }
+
+    /// Minimal AgentConfig for tests (no goals, no compression).
+    fn test_config() -> AgentConfig {
+        AgentConfig {
+            model: "m".into(),
+            max_steps: 0,
+            prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::harness::PromptState {
+                    system_prompt: "base".into(),
+                    skills: vec![],
+                    fingerprint: None,
+                },
+            )),
+            max_inline_skills: 0,
+            sync_dir: None,
+            max_context_messages: 0,
+            max_context_tokens: 0,
+            goals: None,
+            goals_dir: None,
+            planning_interval: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reactive_compaction_retries_after_context_error() {
+        // The provider fails the first stream with a context-window
+        // error; the agent must compact the transcript and retry, and
+        // the retried request must carry fewer messages.
+        let provider = ContextErrorProvider {
+            calls: AtomicUsize::new(0),
+            seen_compacted: AtomicUsize::new(0),
+        };
+        let mut tools = crate::tools::ToolRegistry::new();
+        let config = AgentConfig {
+            model: "m".into(),
+            max_steps: 0,
+            prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::harness::PromptState {
+                    system_prompt: "base".into(),
+                    skills: vec![],
+                    fingerprint: None,
+                },
+            )),
+            max_inline_skills: 0,
+            sync_dir: None,
+            max_context_messages: 6,
+            max_context_tokens: 0,
+            goals: None,
+            goals_dir: None,
+            planning_interval: 0,
+        };
+        // 10 user turns -> well over the 6-message budget.
+        let mut msgs = vec![ChatMessage::system("SYS")];
+        for i in 0..10 {
+            msgs.push(ChatMessage::user(format!("user-{i}")));
+            msgs.push(ChatMessage::assistant(format!("assistant-{i}")));
+        }
+        let answer = run_messages(&provider, &mut tools, &config, &msgs, None, None)
+            .await
+            .expect("compaction retry succeeds");
+        assert_eq!(answer, "AFTER-RETRY");
+        // First stream failed, second succeeded.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.seen_compacted.load(Ordering::SeqCst), 1);
+    }
+
+    /// First chat_stream errors with a context-window failure; the
+    /// retried stream must receive a compacted transcript and answer.
+    #[derive(Debug)]
+    struct ContextErrorProvider {
+        calls: AtomicUsize,
+        seen_compacted: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmProvider for ContextErrorProvider {
+        fn name(&self) -> &str {
+            "context-error-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(anyhow::anyhow!(
+                    "This model's maximum context length is 8192 tokens. \
+                     However, your messages resulted in 12000 tokens."
+                ))
+            } else {
+                assert!(
+                    req.messages.len() < 8,
+                    "retried request must be compacted, got {} messages",
+                    req.messages.len()
+                );
+                self.seen_compacted.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "AFTER-RETRY".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                    },
+                )])))
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            unreachable!("no tool calls in this test")
+        }
+    }
+
+    #[test]
+    fn recoverable_error_classification() {
+        let ctx = anyhow::anyhow!("maximum context length is 8192 tokens");
+        assert!(is_recoverable_llm_error(&ctx));
+        let too_long = anyhow::anyhow!("This model's maximum context length");
+        assert!(is_recoverable_llm_error(&too_long));
+        let malformed = anyhow::anyhow!("previous response contained invalid tool_use arguments");
+        assert!(is_recoverable_llm_error(&malformed));
+        let unrecoverable = anyhow::anyhow!("rate limit exceeded, retry in 60s");
+        assert!(!is_recoverable_llm_error(&unrecoverable));
+        let network = anyhow::anyhow!("failed to connect to 127.0.0.1:15722");
+        assert!(!is_recoverable_llm_error(&network));
+    }
+
+    #[tokio::test]
+    async fn planning_interval_injects_checkpoints() {
+        // interval=2: steps 0 and 2 get the checkpoint, step 1 does not.
+        // The mock answers with a tool call on step 0, a plain answer
+        // on step 1, and verifies checkpoint presence per request.
+        let provider = PlanningProvider {
+            calls: AtomicUsize::new(0),
+            checkpoint_at: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(FastTool(Arc::new(Mutex::new(Vec::new())))));
+        let config = AgentConfig {
+            model: "m".into(),
+            max_steps: 0,
+            prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::harness::PromptState {
+                    system_prompt: "base".into(),
+                    skills: vec![],
+                    fingerprint: None,
+                },
+            )),
+            max_inline_skills: 0,
+            sync_dir: None,
+            max_context_messages: 0,
+            max_context_tokens: 0,
+            goals: None,
+            goals_dir: None,
+            planning_interval: 2,
+        };
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("do the multi-step task")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer, "PLANNED-DONE");
+        let checkpoints = provider.checkpoint_at.lock().unwrap().clone();
+        // Only step 0 (first iteration) carries the checkpoint: step 1's
+        // request had it stripped, and there is no step 2 in this run.
+        assert_eq!(checkpoints, vec![0], "checkpoint only on step 0");
+    }
+
+    /// Step 0: emits a tool call (fast_tool). Step 1: plain answer.
+    /// Step 2: plain answer; records which requests carried the
+    /// PLANNING CHECKPOINT prompt.
+    #[derive(Debug)]
+    struct PlanningProvider {
+        calls: AtomicUsize,
+        checkpoint_at: Arc<Mutex<Vec<usize>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for PlanningProvider {
+        fn name(&self) -> &str {
+            "planning-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let has_checkpoint = req
+                .messages
+                .iter()
+                .any(|m| m.content.contains("PLANNING CHECKPOINT"));
+            if has_checkpoint {
+                self.checkpoint_at.lock().unwrap().push(n);
+            }
+            match n {
+                0 => Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: true,
+                    },
+                )]))),
+                _ => Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "PLANNED-DONE".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                    },
+                )]))),
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-p".into(),
+                    name: "fast_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_execute_concurrently_and_keep_order() {
+        let starts: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(SlowTool(starts.clone())));
+        tools.register(Arc::new(FastTool(starts.clone())));
+
+        let provider = TwoCallProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let config = test_config();
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("run both tools")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer, "DONE");
+
+        // Both tools ran: two recorded start instants.
+        let recorded = starts.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "both tools must run");
+        // Concurrency proof: the fast tool started while the slow one
+        // was still sleeping (its start is < 200ms before the slow
+        // tool finished — far below a serial 200ms gap).
+        let gap = recorded[1].duration_since(recorded[0]).as_millis();
+        assert!(
+            gap < 150,
+            "fast tool started {gap}ms after slow tool — expected <150ms (concurrent), got serial execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_survive_unknown_tool() {
+        // One call names a tool that does not exist: the turn must not
+        // abort — the model gets an error tool_result and can answer.
+        let starts: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(FastTool(starts.clone())));
+
+        let provider = UnknownToolProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let config = test_config();
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("do the thing")],
+            None,
+            None,
+        )
+        .await
+        .expect("unknown tool must not abort the turn");
+        assert!(answer.contains("RECOVERED"));
+    }
+
+    /// Emits [unknown_tool, fast_tool] then checks the model received
+    /// an error for the unknown one and a real result for fast_tool.
+    #[derive(Debug)]
+    struct UnknownToolProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmProvider for UnknownToolProvider {
+        fn name(&self) -> &str {
+            "unknown-tool-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: true,
+                    },
+                )])))
+            } else {
+                // Second loop iteration: verify results for both calls
+                // (error for the unknown one, real result for fast).
+                let results: Vec<&str> = req
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == crate::llm::provider::Role::Tool)
+                    .map(|m| m.content.as_str())
+                    .collect();
+                assert_eq!(results.len(), 2);
+                assert!(results[0].contains("error"), "unknown tool -> error result");
+                assert_eq!(results[1], "FAST");
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "RECOVERED".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                    },
+                )])))
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            // First-iteration replay only.
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-x".into(),
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "call-y".into(),
+                        name: "fast_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+            })
+        }
     }
 }
 

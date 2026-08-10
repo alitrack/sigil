@@ -541,6 +541,75 @@ async fn scope_local_without_local_dir_is_rejected() {
 }
 
 #[tokio::test]
+async fn default_scope_is_local_when_local_layer_exists() {
+    let dir = fresh_dir("scope-default-local");
+    let harness = dir.join("harness");
+    let local = dir.join("local-harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::create_dir_all(local.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: Some(local.clone()),
+        prompt_state: None,
+    };
+
+    // No scope arg → lands in the local layer (prime-agent semantics).
+    tool.run(&json!({
+        "action": "edit_prompt",
+        "content": "A session-local prompt that is comfortably over one hundred characters long so the quality gate accepts it as a substantial full-prompt replacement",
+        "reason": "default scope should be local"
+    }))
+    .await
+    .unwrap();
+
+    assert!(local.join("system_prompt.md").exists());
+    let global_prompt = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
+    assert_eq!(
+        global_prompt, "GLOBAL PROMPT",
+        "global untouched by default-scope write"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn explicit_global_scope_writes_global_even_with_local_layer() {
+    let dir = fresh_dir("scope-explicit-global");
+    let harness = dir.join("harness");
+    let local = dir.join("local-harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+    std::fs::create_dir_all(local.join("skills")).unwrap();
+    std::fs::write(harness.join("system_prompt.md"), "GLOBAL PROMPT").unwrap();
+
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: Some(local.clone()),
+        prompt_state: None,
+    };
+
+    // Explicit scope=global bypasses the local default.
+    tool.run(&json!({
+        "action": "edit_prompt",
+        "scope": "global",
+        "content": "A cross-session prompt that is comfortably over one hundred characters long so the quality gate accepts it as a substantial full-prompt replacement",
+        "reason": "durable cross-session improvement"
+    }))
+    .await
+    .unwrap();
+
+    let global_prompt = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
+    assert!(global_prompt.contains("cross-session prompt"));
+    assert!(
+        !local.join("system_prompt.md").exists(),
+        "local untouched by explicit global write"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn scope_local_add_skill_and_refresh_state_merge() {
     let dir = fresh_dir("scope-merge");
     let harness = dir.join("harness");

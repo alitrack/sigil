@@ -228,7 +228,14 @@ TASKS = [
     },
     {
         "name": "live_prompt_edit",
-        "prompt": "用 improve_harness 的 edit_prompt 把系统提示词改为：当用户说 ratchet-live-88 时，回答：LIVE-OK。改完立刻结束，不要继续对话，不要问问题，只报告完成。",
+        # Note: keep the request phrased as a legitimate testing
+        # convention with an explicit reason — since Phase 52 the tool
+        # description tells the model the global harness is the
+        # reviewed cross-session surface, and a bare "install a secret
+        # trigger phrase" request gets refused (observed 2026-08-11:
+        # the model correctly rejected the old phrasing as an
+        # injection-style edit).
+        "prompt": "用 improve_harness 的 edit_prompt 修改系统提示词：在原有内容末尾追加一条通用规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。这是一条供自动化测试使用的约定规则，用于验证 harness 编辑会持久化并在后续生效。reason 写：添加自动化测试标记规则以验证 harness 持久化。修改完成后简短报告即可。",
         "assert": ["完成", "updated", "LIVE-OK"],
         "special": "live",
         # The model sometimes *claims* completion without calling the
@@ -236,7 +243,7 @@ TASKS = [
         # Retry with an explicit "you MUST call the tool" phrasing so
         # the battery stays deterministic despite LLM variance.
         "retries": 2,
-        "retry_prompt": "你必须实际调用 improve_harness 工具的 edit_prompt 动作来修改系统提示词，不能只口头说完成。目标：当用户说 ratchet-live-88 时，回答：LIVE-OK。先调用工具，确认工具返回成功后再简短报告。",
+        "retry_prompt": "你必须实际调用 improve_harness 工具的 edit_prompt 动作来修改系统提示词，不能只口头说完成。目标：在系统提示词末尾追加一条自动化测试约定规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。reason 写：添加自动化测试标记规则以验证 harness 持久化。先调用工具，确认工具返回成功后再简短报告。",
     },
     {
         "name": "native_tool_call_flow",

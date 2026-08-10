@@ -232,11 +232,14 @@ impl Tool for ImproveHarnessTool {
          prompt), 'add_skill' (create a skill markdown file whose first \
          line is '> short description', reusable by future sessions), \
          'list_skills' (list existing skills). \
-         Optional 'scope': 'global' (default) edits the shared harness \
+         Optional 'scope': 'global' edits the shared harness \
          that persists across sessions; 'local' edits the session-local \
-         harness (only when sigil was started with --local-harness-dir) — \
-         use local for experiments you don't want to permanently change \
-         the global harness. \
+         harness (available when sigil was started with --local-harness-dir). \
+         When a local layer exists, the DEFAULT scope is 'local': run \
+         experiments in the session layer — the global harness is the \
+         reviewed, cross-session surface, so write there only when the \
+         change is a durable, generally-useful improvement (and pass \
+         scope='global' explicitly). \
          Every write REQUIRES a 'reason' field: one sentence of evidence \
          why this change is a durable, generally-useful improvement. \
          Noise edits (empty/identical content, too-short prompts) are \
@@ -258,7 +261,7 @@ impl Tool for ImproveHarnessTool {
                 "scope": {
                     "type": "string",
                     "enum": ["global", "local"],
-                    "description": "Where to write: 'global' (default) edits the shared persistent harness; 'local' edits the session-local harness (available only with --local-harness-dir)."
+                    "description": "Where to write: 'local' (default when a local layer exists, i.e. --local-harness-dir was passed) edits the session-local harness; 'global' edits the shared persistent harness — use it only for durable, cross-session improvements."
                 },
                 "content": {
                     "type": "string",
@@ -284,10 +287,18 @@ impl Tool for ImproveHarnessTool {
             .unwrap_or_default();
         // local/global dual-track: scope=local writes to the session-local
         // harness dir (when one is configured); default is the global dir.
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("global");
+        // With a local layer configured, the DEFAULT scope is "local"
+        // (prime-agent semantics: experiments land in the session layer
+        // unless the model explicitly asks for global) — global writes
+        // are the explicit, cross-session decision.
+        let scope =
+            args.get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or(if self.local_dir.is_some() {
+                    "local"
+                } else {
+                    "global"
+                });
         let target_dir = match scope {
             "global" => self.harness_dir.clone(),
             "local" => self.local_dir.clone().ok_or_else(|| {

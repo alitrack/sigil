@@ -25,18 +25,19 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 51** — improve_harness local/global dual-track
-> (first step): a `--local-harness-dir` creates a merged harness view
-> (local system_prompt.md overrides global, local skills shadow
-> same-named global ones); improve_harness gains a `scope` parameter
-> (global default | local) so the model can run session-local
-> experiments that never touch the shared harness, with per-layer
-> refinements.jsonl audit. Previous: Phase 50 Lua sandbox hardening
-> (io/os no longer exposed; require allowlist; host.date), Phase 49
-> structured run results (RunResult + provide_final_answer), Phase 48
-> parallel tools + reactive compaction + planning checkpoints + delegate
-> report templates, 48r daemon deadlock fix, Phase 47 CLI consistency,
-> Phase 46 daemon UX, Phase 45 ratchet in CI.
+> Status: **Phase 52** — local/global dual-track, step 2 (scope
+> strategy): with a local harness layer configured, improve_harness
+> **defaults to scope=local** — experiments land in the session layer
+> and global writes become the explicit cross-session decision (the
+> model is told to reserve global for durable, generally-useful
+> improvements). Previous: Phase 51 the dual-track itself
+> (--local-harness-dir merged view + scope parameter), Phase 50 Lua
+> sandbox hardening (io/os no longer exposed; require allowlist;
+> host.date), Phase 49 structured run results (RunResult +
+> provide_final_answer), Phase 48 parallel tools + reactive compaction +
+> planning checkpoints + delegate report templates, 48r daemon deadlock
+> fix, Phase 47 CLI consistency, Phase 46 daemon UX, Phase 45 ratchet in
+> CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -280,6 +281,18 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 52 — 2026-08-11 (local/global dual-track, step 2: scope strategy)
+- With a local layer configured (--local-harness-dir), improve_harness
+  **defaults to scope=local**: experiments land in the session layer
+  automatically; scope=global stays available but becomes the explicit
+  cross-session decision. No local layer → default stays global
+  (backward compatible; ratchet's live_prompt_edit untouched).
+- Tool description/params now state the strategy: global is the
+  reviewed, cross-session surface — reserve it for durable,
+  generally-useful improvements.
+- 2 new tests: default-scope-is-local with a local layer; explicit
+  global write bypasses the local default (local stays untouched).
 
 ### Phase 51 — 2026-08-11 (improve_harness local/global dual-track, step 1)
 - `--local-harness-dir` loads a **merged view** of global + session-local

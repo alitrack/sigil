@@ -23,16 +23,15 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 51** — improve_harness local/global 双轨（第一步）：
-> `--local-harness-dir` 创建合并视图（local 的 system_prompt.md 覆盖全局、
-> local 技能遮蔽同名全局技能）；improve_harness 新增 `scope` 参数
-> （global 默认 | local），模型可跑会话局部实验而不触碰共享 harness，
-> 审计按层分开 refinements.jsonl。此前：Phase 50 Lua 沙箱加固（io/os
-> 不再暴露、require 白名单、host.date 替代 os.date）、Phase 49
-> 结构化运行结果（RunResult + provide_final_answer）、Phase 48 外部调研
-> 落地（并行工具执行、反应式压缩重试、规划检查点、子 agent 报告模板）
-> + 48r daemon 死锁修复、Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、
-> Phase 45
+> 状态：**Phase 52** — local/global 双轨第二步（scope 策略）：配置了
+> 会话局部层时，improve_harness **默认 scope=local**——实验落在会话层，
+> 全局写入成为显式的跨会话决策（提示模型把 global 留给持久通用改进）。
+> 此前：Phase 51 双轨本身（--local-harness-dir 合并视图 + scope 参数）、
+> Phase 50 Lua 沙箱加固（io/os 不再暴露、require 白名单、host.date
+> 替代 os.date）、Phase 49 结构化运行结果（RunResult +
+> provide_final_answer）、Phase 48 外部调研落地（并行工具执行、反应式
+> 压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
+> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
 > ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
 > Phase 42 持久目标、Phase 41 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
@@ -252,6 +251,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 52 — 2026-08-11（local/global 双轨第二步：scope 策略）
+- 配置了会话局部层（--local-harness-dir）时，improve_harness
+  **默认 scope=local**：实验自动落在会话层；scope=global 仍可用但
+  成为显式的跨会话决策。无 local 层时默认保持 global（向后兼容，
+  ratchet 的 live_prompt_edit 不受影响）。
+- 工具描述/参数写明策略：global 是经过评审的跨会话表面——留给持久
+  通用改进。
+- 2 个新测试：有 local 层时默认 scope=local；显式 global 绕过 local
+  默认（local 保持不动）。
 
 ### Phase 51 — 2026-08-11（improve_harness local/global 双轨第一步）
 - **`--local-harness-dir`**：加载全局 + 会话局部两层 harness 的合并

@@ -25,14 +25,16 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 43** — async sub-agent delegation: `delegate`
-> spawns a sub-agent and returns a handle immediately (it runs in the
-> background); `status`/`result`/`list` poll and collect, mirroring
-> prime-agent's `rlm(...)` handle semantics. Plus Phase 42's
-> persistent goals, Phase 41's harness refinement gate +
-> token-budget compression, Phase 39's memory write safety, Phase
-> 38's LLM failover, Phase 36's session continuity and Phase 35's
-> cross-instance knowledge sync.
+> Status: **Phase 44** — background daemon: `sigil daemon` keeps the
+> agent loop alive on a Unix socket; `sigil attach` / `sigil send`
+> drive it from anywhere, and a client can disconnect mid-run while
+> the task keeps going (herdr's "the runtime your coding agents live
+> on"). The daemon carries multi-turn context across connections and
+> persists every turn to the session file. Plus Phase 43's async
+> delegation, Phase 42's persistent goals, Phase 41's harness
+> refinement gate + token-budget compression, Phase 39's memory write
+> safety, Phase 38's LLM failover, Phase 36's session continuity and
+> Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -234,8 +236,30 @@ MCP tool list.
 | **41** ✅ | Harness refinement gate (reason-gated edits + audit log; token-budget compression) |
 | **42** ✅ | Persistent goals (manage_goals tool + per-turn context injection + goals.jsonl) |
 | **43** ✅ | Async delegation (spawn → handle → status/result/list registry) |
+| **44** ✅ | Background daemon (Unix socket agent loop + attach/send + session persistence) |
 
 ## Changelog
+
+### Phase 44 — 2026-08-10
+- **Background daemon** (herdr-inspired: "the runtime your coding
+  agents live on"): `sigil daemon` serves the agent loop on a Unix
+  socket (`~/.sigil/daemon.sock` by default); `sigil attach` is the
+  interactive client, `sigil send "message"` the one-shot client —
+  CLI and socket speak the same JSON-line surface. The daemon owns
+  the loop: a client can disconnect mid-run and the task keeps
+  going; multi-turn context is carried across connections; every
+  turn is appended to the session file (resumable with
+  `--resume <id>` when the daemon restarts). Turns are serialized
+  with a loop lock (FIFO across concurrent clients); deltas stream
+  to the requesting client via a channel.
+  - Also fixed: the REPL never sent the system prompt (multi-turn
+    history only); the daemon always sends
+    `system_prompt_for(user)` + history + the new turn.
+  - Tests: 115 total — role mapping, one-shot protocol parsing
+    (delta + done), daemon lifecycle E2E.
+  - E2E: daemon up → `sigil send` replies "42" → second `send`
+    replies "43" (context carried across connections) → daemon
+    killed → session file has 4 turns (user/assistant × 2).
 
 ### Phase 43 — 2026-08-10
 - **Async sub-agent delegation** (mirrors prime-agent's `rlm(...)`

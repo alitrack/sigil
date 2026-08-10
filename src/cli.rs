@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{CommandFactory, Parser, Subcommand};
 
 /// sigil — a Rust + LuaJIT coding agent with a self-evolving harness.
@@ -65,6 +67,33 @@ pub enum Command {
     /// Serve as an ACP (Agent Client Protocol) server on stdio —
     /// any ACP client (editors, other agents) can drive sigil.
     Acp,
+
+    /// Start the background daemon: the agent loop lives on a Unix
+    /// socket, so `sigil attach` / `sigil send` can drive it from
+    /// anywhere — and a client can disconnect mid-run while the task
+    /// keeps going.
+    Daemon {
+        /// Socket path (default: ~/.sigil/daemon.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Attach to a running daemon (interactive: send lines, watch the
+    /// streamed output).
+    Attach {
+        /// Socket path (default: ~/.sigil/daemon.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Send one message to a running daemon and print the reply.
+    Send {
+        /// Message text.
+        message: String,
+        /// Socket path (default: ~/.sigil/daemon.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 
     /// Serve as an MCP (Model Context Protocol) server on stdio —
     /// expose sigil's tools (bash, files, git, Lua, ...) to any MCP

@@ -23,12 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 43** — 异步子 agent 委托：`delegate` spawn 子 agent
-> 后立即返回 handle（后台运行），`status`/`result`/`list` 轮询与
-> 收集——对标 prime-agent 的 `rlm(...)` handle 语义。另有 Phase 42
-> 持久目标、Phase 41 harness 改进门控 + token 预算压缩、Phase 39
-> 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
-> 跨实例知识同步。管道模式、
+> 状态：**Phase 44** — 后台 daemon：`sigil daemon` 让 agent 循环常驻
+> Unix socket；`sigil attach`/`sigil send` 随处驱动它，client 中途
+> 断开任务照跑（herdr 的 "the runtime your coding agents live on"）。
+> daemon 跨连接保持多轮上下文，每轮追加到 session 文件。另有
+> Phase 43 异步委托、Phase 42 持久目标、Phase 41 harness 改进门控 +
+> token 预算压缩、Phase 39 记忆写安全、Phase 38 LLM 故障转移、
+> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -213,8 +214,26 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **41** ✅ | harness 改进门控（reason 门控编辑 + 审计日志；token 预算压缩） |
 | **42** ✅ | 持久目标（manage_goals 工具 + 每轮上下文注入 + goals.jsonl） |
 | **43** ✅ | 异步委托（spawn → handle → status/result/list 注册表） |
+| **44** ✅ | 后台 daemon（Unix socket agent 循环 + attach/send + 会话持久化） |
 
 ## 更新日志
+
+### Phase 44 — 2026-08-10
+- **后台 daemon**（herdr 启发："the runtime your coding agents live
+  on"）：`sigil daemon` 在 Unix socket（默认 `~/.sigil/daemon.sock`）
+  上提供 agent 循环；`sigil attach` 是交互 client，`sigil send
+  "message"` 是一次性 client——CLI 与 socket 说同一套 JSON 行协议。
+  daemon 拥有循环：client 中途断开任务照跑；多轮上下文跨连接保持；
+  每轮追加到 session 文件（daemon 重启可用 `--resume <id>` 恢复）。
+  循环锁串行化 turn（并发 client FIFO）；delta 经 channel 流式发给
+  发起连接的 client。
+  - 顺带修复：REPL 从不发 system prompt（只有多轮历史）；daemon
+    总是发 `system_prompt_for(user)` + 历史 + 新轮。
+  - 测试：共 115——角色映射、一次性协议解析（delta+done）、
+    daemon 生命周期 E2E。
+  - E2E：daemon 起来 → `sigil send` 回 "42" → 第二次 `send` 回
+    "43"（上下文跨连接延续）→ kill daemon → session 文件 4 轮
+    （user/assistant × 2）。
 
 ### Phase 43 — 2026-08-10
 - **异步子 agent 委托**（对标 prime-agent 的 `rlm(...)` handle

@@ -183,7 +183,7 @@ TASKS = [
     {
         "name": "file_tool_read",
         "prompt": "用 read_file 工具读取 src/cli.rs 的前 5 行，告诉我第一行的内容",
-        "assert": ["use clap"],
+        "assert": ["use std::path::PathBuf"],
     },
     {
         "name": "bash_tool_exec",

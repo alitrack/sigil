@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod cli;
 mod config;
+mod daemon;
 mod doctor;
 mod goals;
 mod harness;
@@ -227,6 +228,33 @@ async fn main() -> Result<()> {
         Some(Command::Acp) => {
             eprintln!("sigil acp: serving Agent Client Protocol on stdio");
             acp::serve(tools, agent_config, provider_arc).await
+        }
+        Some(Command::Daemon { socket }) => {
+            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+            let sessions_dir = cli
+                .sessions_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(session::default_sessions_dir);
+            daemon::serve(
+                &socket,
+                provider_arc.clone(),
+                &mut tools,
+                &agent_config,
+                &sessions_dir,
+                cli.resume.as_deref(),
+            )
+            .await
+        }
+        Some(Command::Attach { socket }) => {
+            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+            daemon::attach(&socket).await
+        }
+        Some(Command::Send { message, socket }) => {
+            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+            let answer = daemon::send_once(&socket, message).await?;
+            println!("{answer}");
+            Ok(())
         }
         Some(Command::Mcp) => {
             eprintln!(

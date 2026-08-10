@@ -49,6 +49,10 @@ pub struct AgentConfig {
     /// exceeds this, the oldest turns are folded like
     /// `max_context_messages`. `0` disables the token budget.
     pub max_context_tokens: usize,
+    /// Persistent goals shared with the `manage_goals` tool. Active
+    /// goals are injected into the system context each turn until
+    /// completed. `None` disables the goals feature.
+    pub goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
 }
 
 impl AgentConfig {
@@ -309,6 +313,22 @@ pub async fn run_messages(
                 config.max_context_messages,
                 config.max_context_tokens,
             );
+        }
+
+        // Persistent goals: inject active goals into the system context
+        // so the model keeps working toward them this turn. Inserted
+        // right after the first system message (the main prompt /
+        // compaction summary) so it is never folded away.
+        if let Some(goals) = &config.goals
+            && let Ok(g) = goals.read()
+            && let Some(block) = crate::goals::active_goals_block(&g)
+        {
+            let pos = messages
+                .iter()
+                .position(|m| m.role == Role::System)
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            messages.insert(pos, ChatMessage::system(block));
         }
 
         // Fresh specs every turn: evolution tools may have added tools

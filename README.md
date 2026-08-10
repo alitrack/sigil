@@ -25,14 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 41** — harness refinement gate: `improve_harness`
-> writes now require an evidence-backed `reason` and pass deterministic
-> quality gates (no empty/identical/too-short edits); accepted edits
-> are audited in `refinements.jsonl`. Context compression gained a
-> token budget (chars/4 heuristic, 64k default) and tracks
-> read/write file paths into the summary. Plus Phase 39's memory
-> write safety, Phase 38's LLM failover, Phase 36's session continuity
-> and Phase 35's cross-instance knowledge sync.
+> Status: **Phase 42** — persistent goals: the model declares
+> long-running objectives with `manage_goals` (add/complete/pause/
+> resume/list/clear); active goals are injected into the system
+> context every turn and persisted to `goals.jsonl` in the harness
+> dir, so they survive restarts and are shared across instances.
+> Plus Phase 41's harness refinement gate + token-budget compression,
+> Phase 39's memory write safety, Phase 38's LLM failover, Phase 36's
+> session continuity and Phase 35's cross-instance knowledge sync.
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -232,8 +232,27 @@ MCP tool list.
 | **39** ✅ | Memory write safety (remember/delete under cross-process lock) |
 | **40** ✅ | Robustness (tool timeouts + context compression + atomic export) |
 | **41** ✅ | Harness refinement gate (reason-gated edits + audit log; token-budget compression) |
+| **42** ✅ | Persistent goals (manage_goals tool + per-turn context injection + goals.jsonl) |
 
 ## Changelog
+
+### Phase 42 — 2026-08-10
+- **Persistent goals** (inspired by prime-agent's `GoalState`):
+  `manage_goals` lets the model declare long-running objectives
+  (add/complete/pause/resume/list/clear). Active goals are injected
+  into the system context every turn right after the first system
+  message (never folded away by compaction), and persisted to
+  `harness_dir/goals.jsonl` under the directory lock (atomic tmp +
+  rename), so goals survive restarts and are shared across sigil
+  instances. Completed goals stop being injected.
+  - Quality gates: objectives must be ≥ 8 chars (one clear sentence);
+    unknown ids and unknown actions are rejected; corrupt jsonl lines
+    degrade gracefully.
+  - Tests: 112 total — goals roundtrip, active-block formatting,
+    add/list/complete/pause/resume flow, noise rejection.
+  - E2E: a model adds a goal → `goals.jsonl` on disk; a fresh sigil
+    process sees it injected into its context; completing it stops
+    the injection.
 
 ### Phase 41 — 2026-08-10
 - **Harness refinement gate** (inspired by prime-agent's `/refine`):

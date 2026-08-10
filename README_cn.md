@@ -23,12 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 41** — harness 改进门控：`improve_harness` 写入现在
-> 必须有证据型 `reason` 并通过确定性质量门（拒绝空/相同/过短编辑）；
-> 被接受的编辑记入 `refinements.jsonl` 审计。上下文压缩新增 token
-> 预算（chars/4 启发式，默认 64k）并把读/写文件路径带进摘要。另有
-> Phase 39 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与
-> Phase 35 跨实例知识同步。管道模式、
+> 状态：**Phase 42** — 持久目标：模型用 `manage_goals`
+> （add/complete/pause/resume/list/clear）声明长期目标；active 目标
+> 每轮注入系统上下文，并持久化到 harness 目录的 `goals.jsonl`，
+> 重启不丢、多实例共享。另有 Phase 41 的 harness 改进门控 +
+> token 预算压缩、Phase 39 记忆写安全、Phase 38 LLM 故障转移、
+> Phase 36 会话续接与 Phase 35 跨实例知识同步。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -211,8 +211,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **39** ✅ | 记忆写安全（remember/delete 置于跨进程锁下） |
 | **40** ✅ | 健壮性（工具超时 + 上下文压缩 + 原子导出） |
 | **41** ✅ | harness 改进门控（reason 门控编辑 + 审计日志；token 预算压缩） |
+| **42** ✅ | 持久目标（manage_goals 工具 + 每轮上下文注入 + goals.jsonl） |
 
 ## 更新日志
+
+### Phase 42 — 2026-08-10
+- **持久目标**（借鉴 prime-agent 的 `GoalState`）：`manage_goals`
+  让模型声明长期目标（add/complete/pause/resume/list/clear）。active
+  目标每轮注入系统上下文（紧跟第一条 system 消息之后，不会被压缩
+  折叠），并持久化到 `harness_dir/goals.jsonl`（目录锁内原子
+  tmp+rename），重启不丢、多实例共享。完成的目标停止注入。
+  - 质量门：objective ≥ 8 字符（一句清晰的话）；未知 id/action 拒绝；
+    损坏的 jsonl 行优雅降级。
+  - 测试：共 112——goals 往返、active 块格式、add/list/complete/
+    pause/resume 流程、噪音拒绝。
+  - E2E：模型 add goal → `goals.jsonl` 落盘；全新 sigil 进程在其
+    上下文中看到注入；complete 后停止注入。
 
 ### Phase 41 — 2026-08-10
 - **harness 改进门控**（借鉴 prime-agent 的 `/refine`）：

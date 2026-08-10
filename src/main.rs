@@ -3,6 +3,7 @@ mod agent;
 mod cli;
 mod config;
 mod doctor;
+mod goals;
 mod harness;
 mod llm;
 mod lua;
@@ -78,10 +79,21 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(scripted::default_tools_dir);
+    // Persistent goals: the same `Arc` goes to the manage_goals tool
+    // and the agent loop (which injects active goals into the system
+    // context every turn). Loaded from the harness dir so goals
+    // survive restarts and are shared across instances.
+    let goals_dir: std::path::PathBuf = cli
+        .harness_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(harness::default_harness_dir);
+    let goals = std::sync::Arc::new(std::sync::RwLock::new(goals::load_goals(&goals_dir)));
     let mut tools = ToolRegistry::with_tools(
         Some(tools_dir.as_path()),
         cli.harness_dir.as_deref().map(std::path::Path::new),
         Some(prompt_state.clone()),
+        Some(goals.clone()),
     );
 
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.
@@ -138,6 +150,7 @@ async fn main() -> Result<()> {
         // sessions; deepseek-v4-flash context is 64k).
         max_context_messages: 40,
         max_context_tokens: 64_000,
+        goals: Some(goals),
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

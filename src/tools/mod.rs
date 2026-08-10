@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -19,6 +19,7 @@ pub mod delegate;
 pub mod evolve;
 pub mod files;
 pub mod git;
+pub mod goals_tool;
 pub mod mcp;
 pub mod memory;
 pub mod scripted;
@@ -114,7 +115,7 @@ impl ToolRegistry {
 
     #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
-        Self::with_tools(None, None, None)
+        Self::with_tools(None, None, None, None)
     }
 
     /// Native tools plus any Lua scripted tools found on disk.
@@ -122,10 +123,15 @@ impl ToolRegistry {
     /// `prompt_state` is the live harness state shared with the agent
     /// loop; evolution tools update it so harness edits apply without
     /// a restart. Pass `None` (tests) to use an isolated state.
+    ///
+    /// `goals` is the shared goal state (same `Arc` the agent loop
+    /// injects into the system context). Pass `None` to run without
+    /// the persistent-goals feature.
     pub fn with_tools(
         scripted_dir: Option<&Path>,
         harness_dir: Option<&Path>,
         prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
+        goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
     ) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
@@ -163,6 +169,15 @@ impl ToolRegistry {
         registry.register(Arc::new(evolve::ImproveHarnessTool {
             harness_dir: harness_dir.clone(),
             prompt_state: prompt_state.clone(),
+        }));
+        // Persistent goals: the model declares long-running objectives;
+        // active goals are injected into the system context each turn.
+        // (The same `Arc` is handed to the agent loop, so tool writes
+        // are visible to the loop without a restart.)
+        let goals = goals.unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
+        registry.register(Arc::new(goals_tool::ManageGoalsTool {
+            goals_dir: harness_dir.clone(),
+            goals: goals.clone(),
         }));
         // Version library: list & roll back model-written assets.
         registry.register(Arc::new(versions::SkillHistoryTool {

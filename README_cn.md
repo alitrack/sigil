@@ -23,10 +23,10 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 35** — 跨实例知识同步：agent 循环每轮对 harness 目录做
-> 轻量指纹检查（仅 stat），另一个 sigil 进程改动后自动重载提示词与技能
-> ——运行中的 REPL/MCP server 无需重启即感知并发实例的写入。记忆本就
-> 共享（每次调用读文件）。管道模式、
+> 状态：**Phase 36** — 会话续接：`session list` 现在显示轮数 + 首条
+> 用户消息摘要 + 最后活动时间（最新在前）；`--resume latest` /
+> `/session latest` 直接续接最近会话，不再手抄 id。另有 Phase 35 的
+> 跨实例知识同步（每轮指纹重载）。管道模式、
 > 带真实 FFI 和 host helpers 的脚本化 Lua 工具（运行时创建/更新/删除/列出）、
 > **带声明式依赖的技能动态选择**（`> depends_on:` 头部——依赖被
 > 传递性内联，环安全）**和环检测**（add_skill 在写入形成依赖环时
@@ -203,8 +203,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **33** ✅ | Ratchet +2（ACP e2e、会话导出/导入）+ 脚本化工具 schema 加固 |
 | **34** ✅ | 技能按需加载（紧凑常驻索引，正文按需读取） |
 | **35** ✅ | 跨实例知识同步（每轮 harness 指纹检查 → 热重载） |
+| **36** ✅ | 会话续接（`session list` 摘要 + `--resume latest`） |
 
 ## 更新日志
+
+### Phase 36 — 2026-08-10
+- **会话续接**。`session list` 现在为每个会话渲染摘要（轮数、首条
+  用户消息的空白折叠预览、最后活动时间戳），按最新活动排序；
+  `--resume latest` 与 `/session latest` 直接续接最近活动的会话，
+  不用再手抄纳秒 id。Phase 31 之前的 legacy 会话（无 `ts`）回退到
+  id 排序，永不破坏排序。
+  - `session::SessionSummary` + `session::summaries(dir)`（按最后
+    轮次 `ts` 最新在前，id 兜底）+ `session::latest(dir)`。
+  - 测试：`summaries_order_by_last_activity_and_preview`、
+    `summaries_fallback_to_id_order_for_legacy_sessions`（手工写
+    JSONL——`append` 会自动盖章，legacy 行必须绕过它）、
+    `summaries_empty_dir`。共 89 项。
 
 ### Phase 35 — 2026-08-10
 - **跨实例知识同步**。运行中的 agent 循环每轮对 harness 目录做指纹

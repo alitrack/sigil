@@ -180,12 +180,16 @@ async fn main() -> Result<()> {
                     );
                 }
                 cli::SessionAction::List => {
-                    let ids = session::list(&sessions_dir)?;
-                    if ids.is_empty() {
+                    let sessions = session::summaries(&sessions_dir)?;
+                    if sessions.is_empty() {
                         println!("no sessions");
                     } else {
-                        for id in ids {
-                            println!("{id}");
+                        for s in sessions {
+                            if s.preview.is_empty() {
+                                println!("{} — {} turns", s.id, s.turns);
+                            } else {
+                                println!("{} — {} turns — {}", s.id, s.turns, s.preview);
+                            }
                         }
                     }
                 }

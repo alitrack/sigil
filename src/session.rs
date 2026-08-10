@@ -92,6 +92,62 @@ pub fn list(sessions_dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(ids)
 }
 
+/// One line of `session list`: id, turn count, a preview of the first
+/// user turn, and the last-activity timestamp (newest first).
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub turns: usize,
+    /// First user message, truncated for display.
+    pub preview: String,
+    /// Last turn timestamp (lexicographic = chronological); `None` for
+    /// sessions whose every turn predates Phase 31 (legacy).
+    pub last_ts: Option<String>,
+}
+
+/// Summaries for all sessions, ordered newest-first by last activity
+/// (the `ts` of the most recent turn, falling back to file mtime).
+pub fn summaries(sessions_dir: &Path) -> std::io::Result<Vec<SessionSummary>> {
+    let mut out = Vec::new();
+    for id in list(sessions_dir)? {
+        let turns = load(sessions_dir, &id)?;
+        let preview = turns
+            .iter()
+            .find(|t| t.role == "user")
+            .map(|t| {
+                let flat: String = t.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut s: String = flat.chars().take(60).collect();
+                if flat.chars().count() > 60 {
+                    s.push('…');
+                }
+                s
+            })
+            .unwrap_or_default();
+        let last_ts = turns.iter().rev().find_map(|t| t.ts.clone());
+        out.push(SessionSummary {
+            id,
+            turns: turns.len(),
+            preview,
+            last_ts,
+        });
+    }
+    // Newest first: by last turn ts, else by file mtime (ids are
+    // chronological for legacy files whose turns predate Phase 31 —
+    // id order is a fine fallback).
+    out.sort_by(|a, b| {
+        let ka = a.last_ts.clone().unwrap_or_else(|| a.id.clone());
+        let kb = b.last_ts.clone().unwrap_or_else(|| b.id.clone());
+        kb.cmp(&ka)
+    });
+    Ok(out)
+}
+
+/// The most recently active session id, for `--resume latest` /
+/// `/session latest`. `None` when there are no sessions.
+pub fn latest(sessions_dir: &Path) -> std::io::Result<Option<String>> {
+    Ok(summaries(sessions_dir)?.into_iter().next().map(|s| s.id))
+}
+
 /// Compact timestamp: YYYYMMDD-HHMMSS-nnnnnnnnn (nanosecond precision
 /// so sessions started in the same second never collide).
 fn chrono_like_timestamp() -> String {
@@ -398,6 +454,124 @@ mod tests {
         let out2 = dir.join("since2.json");
         assert!(export_session(&dir, &id2, &out2, Some("2026-22000-130000-000000000")).is_err());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summaries_order_by_last_activity_and_preview() {
+        let dir = std::env::temp_dir().join(format!("sigil-summary-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Session A: older last turn.
+        let a = start(&dir).unwrap();
+        append(
+            &dir,
+            &a,
+            &Turn {
+                role: "user".into(),
+                text: "first question about lua".into(),
+                ts: Some("2026-22000-090000-000000000".into()),
+            },
+        )
+        .unwrap();
+        append(
+            &dir,
+            &a,
+            &Turn {
+                role: "assistant".into(),
+                text: "answer a".into(),
+                ts: Some("2026-22000-100000-000000000".into()),
+            },
+        )
+        .unwrap();
+
+        // Session B: newer last turn.
+        let b = start(&dir).unwrap();
+        append(
+            &dir,
+            &b,
+            &Turn {
+                role: "user".into(),
+                text: "second question".into(),
+                ts: Some("2026-22000-110000-000000000".into()),
+            },
+        )
+        .unwrap();
+        append(
+            &dir,
+            &b,
+            &Turn {
+                role: "assistant".into(),
+                text: "answer b".into(),
+                ts: Some("2026-22000-120000-000000000".into()),
+            },
+        )
+        .unwrap();
+
+        let s = summaries(&dir).unwrap();
+        assert_eq!(s.len(), 2);
+        // Newest last-activity first.
+        assert_eq!(s[0].id, b);
+        assert_eq!(s[1].id, a);
+        // Turn counts.
+        assert_eq!(s[0].turns, 2);
+        // Preview = first user turn, whitespace-flattened, truncated.
+        assert_eq!(s[1].preview, "first question about lua");
+        // latest() = the newest.
+        assert_eq!(latest(&dir).unwrap().as_deref(), Some(b.as_str()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summaries_fallback_to_id_order_for_legacy_sessions() {
+        // Sessions whose turns all predate Phase 31 have no `ts` (write
+        // the JSONL by hand — `append` auto-stamps); they still appear,
+        // sorted by id (chronological for legacy files).
+        let dir = std::env::temp_dir().join(format!("sigil-summary-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let older = start(&dir).unwrap();
+        let older_path = dir.join(format!("{older}.jsonl"));
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&older_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{{\"role\":\"user\",\"text\":\"legacy one\"}}")
+            })
+            .unwrap();
+        let newer = start(&dir).unwrap();
+        let newer_path = dir.join(format!("{newer}.jsonl"));
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&newer_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{{\"role\":\"user\",\"text\":\"legacy two\"}}")
+            })
+            .unwrap();
+
+        let s = summaries(&dir).unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].id, newer);
+        assert_eq!(s[0].preview, "legacy two");
+        assert_eq!(s[0].last_ts, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summaries_empty_dir() {
+        let dir = std::env::temp_dir().join(format!("sigil-summary-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(summaries(&dir).unwrap().is_empty());
+        assert!(latest(&dir).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }

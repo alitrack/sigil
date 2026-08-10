@@ -56,11 +56,17 @@ pub async fn run(
 
     // Session: resume an existing one or start fresh. `session_id`,
     // `history` and `hist_path` are mutable: `/session <id>` can switch
-    // mid-REPL.
-    let mut session_id = match resume {
+    // mid-REPL. `--resume latest` (and `/session latest`) resume the
+    // most recently active session.
+    let resume_id = match resume {
+        Some("latest") => crate::session::latest(sessions_dir)?.unwrap_or_else(|| {
+            eprintln!("  no sessions yet — starting a new one");
+            crate::session::start(sessions_dir).unwrap_or_default()
+        }),
         Some(id) => id.to_string(),
         None => crate::session::start(sessions_dir)?,
     };
+    let mut session_id = resume_id;
     let mut history = crate::session::load(sessions_dir, &session_id)?;
     if !history.is_empty() {
         println!(
@@ -133,12 +139,24 @@ pub async fn run(
             cmd if cmd.starts_with("/session ") => {
                 // Switch to another session: load its transcript as the
                 // conversation context (like --resume, mid-REPL).
-                let target = cmd.trim_start_matches("/session ").trim();
+                // `/session latest` switches to the most recent one.
+                let raw = cmd.trim_start_matches("/session ").trim();
+                let target = if raw == "latest" {
+                    match crate::session::latest(sessions_dir)? {
+                        Some(id) => id,
+                        None => {
+                            println!("  no sessions yet");
+                            continue;
+                        }
+                    }
+                } else {
+                    raw.to_string()
+                };
                 if target.is_empty() {
-                    println!("  usage: /session <id>");
+                    println!("  usage: /session <id> (or 'latest')");
                     continue;
                 }
-                match crate::session::load(sessions_dir, target) {
+                match crate::session::load(sessions_dir, &target) {
                     Ok(turns) => {
                         session_id = target.to_string();
                         history = turns.clone();

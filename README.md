@@ -25,11 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 35** — cross-instance knowledge sync: each agent loop
-> iteration fingerprints the harness dir (stat-only) and reloads the
-> prompt state when another sigil process edited it, so a running REPL /
-> MCP server picks up skills & prompt written by a concurrent instance —
-> no restart needed. Memory is already shared (file-backed reads).
+> Status: **Phase 36** — session continuity: `session list` now shows
+> turn count + first-user-turn preview + last activity (newest first);
+> `--resume latest` / `/session latest` continue the most recent session
+> instead of hunting for ids. Plus Phase 35's cross-instance knowledge
+> sync (per-turn fingerprint reload).
 > Pipe mode, scripted Lua tools with real FFI and host helpers (tool
 > create/update/delete/list at runtime), dynamic skill selection with
 > **declared dependencies** (`> depends_on:` header — dependencies are
@@ -223,8 +223,23 @@ MCP tool list.
 | **33** ✅ | Ratchet +2 (ACP e2e, session export/import) + scripted-tool schema hardening |
 | **34** ✅ | On-demand skill loading (compact always-on index, bodies read on demand) |
 | **35** ✅ | Cross-instance knowledge sync (per-turn harness fingerprint → live reload) |
+| **36** ✅ | Session continuity (`session list` summaries + `--resume latest`) |
 
 ## Changelog
+
+### Phase 36 — 2026-08-10
+- **Session continuity**. `session list` now renders a summary per
+  session (turn count, whitespace-flattened preview of the first user
+  turn, last-activity timestamp) ordered newest-first; `--resume latest`
+  and `/session latest` continue the most recently active session
+  instead of hand-copying nanosecond ids. Legacy sessions (pre-Phase 31,
+  no `ts`) fall back to id ordering and never break the sort.
+  - `session::SessionSummary` + `session::summaries(dir)` (newest-first
+    by last turn `ts`, id fallback) + `session::latest(dir)`.
+  - Tests: `summaries_order_by_last_activity_and_preview`,
+    `summaries_fallback_to_id_order_for_legacy_sessions` (hand-written
+    JSONL — `append` auto-stamps so legacy lines must bypass it),
+    `summaries_empty_dir`. 89 total.
 
 ### Phase 35 — 2026-08-10
 - **Cross-instance knowledge sync**. A running agent loop now

@@ -25,6 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 71** — cron jobs (prime-agent `cron-jobs.ts`,
+> minimal): daemon frames `{"type":"cron","action":"add|list|pause|
+> resume|remove",...}` manage persisted jobs (`<sessions_dir>/
+> cron.json`) with `interval` (refires every N s) and `once` (fires at
+> a unix time) schedules; a 30s scheduler loop fires due jobs into
+> their target session like a user turn. E2E: an interval-5s job was
+> added, fired by the scheduler, and its prompt/answer turns landed in
+> the session file with run_count/next_run_at tracked.
+>
 > Status: **Phase 70** — side questions (prime-agent
 > `side-question.ts`): a daemon frame `{"type":"side_question",
 > "text":..., "id":...}` answers against a clone of the session
@@ -364,6 +373,25 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 71 — 2026-08-11 (cron jobs — prime-agent cron-jobs.ts, minimal)
+- Daemon frames manage persisted scheduled turns:
+  `{"type":"cron","action":"add","kind":"interval|once",
+  "interval_secs":N|"at":unix,"prompt":...,"session":?}` and
+  `list|pause|resume|remove` by id. Jobs live in
+  `<sessions_dir>/cron.json` (atomic write-then-rename).
+- A 30s scheduler loop in the daemon fires due jobs into their target
+  session exactly like a user turn (appended, run, answered,
+  recorded), then reschedules: interval jobs refire every
+  `interval_secs` after the last run, once jobs become `completed`.
+  Firing is serialized through `loop_lock` like any other turn.
+- New `src/cron.rs` (job struct, load/save/due/after_run, unix-time
+  based, no chrono). Tests 174 → 179 (interval refire, once
+  completion, paused/completed never fire, due window, persistence
+  round-trip).
+- E2E: an interval-5s job was added (c00001), the scheduler fired it,
+  and the session file shows the injected prompt/answer turns with
+  run_count/next_run_at/last_run_at tracked.
 
 ### Phase 70 — 2026-08-11 (side questions — prime-agent side-question.ts)
 - A daemon frame `{"type":"side_question","text":...,"id":...}` lets

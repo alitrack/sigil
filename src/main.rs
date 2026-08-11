@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod cli;
 mod config;
+mod cron;
 mod daemon;
 mod doctor;
 mod goals;

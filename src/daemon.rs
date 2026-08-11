@@ -111,6 +111,98 @@ pub async fn serve(
         socket_path.display()
     );
 
+    // Cron scheduler: every 30s, fire due jobs (prime-agent's
+    // cron-jobs.ts, minimal interval/once schedules). A due job
+    // injects its prompt into the target session exactly like a user
+    // turn — appended, run, answered, recorded — then reschedules
+    // itself. Runs serially through loop_lock like any other turn.
+    let cron_provider = provider.clone();
+    let cron_config = config.clone();
+    let mut cron_tools = tools.clone_shallow();
+    let cron_state = state.clone();
+    let cron_sessions_dir = sessions_dir.to_path_buf();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            let now = crate::cron::now_unix();
+            let cron_path = cron_sessions_dir.join("cron.json");
+            let mut jobs = crate::cron::load(&cron_path);
+            let due = crate::cron::due(&jobs, now);
+            if due.is_empty() {
+                continue;
+            }
+            for job in due {
+                let target = job
+                    .session
+                    .clone()
+                    .unwrap_or_else(|| cron_state.default_session.clone());
+                let Ok((sid, session)) =
+                    resolve_session(&cron_state, &cron_sessions_dir, Some(&target)).await
+                else {
+                    continue;
+                };
+                eprintln!(
+                    "  [daemon] cron '{}' firing into session {}: {:?}",
+                    truncate_log(&job.id, 16),
+                    truncate_log(&sid, 24),
+                    truncate_log(&job.prompt, 40)
+                );
+                let _guard = cron_state.loop_lock.lock().await;
+                let _ = crate::session::append(
+                    &cron_sessions_dir,
+                    &sid,
+                    &Turn {
+                        role: "user".into(),
+                        text: job.prompt.clone(),
+                        ts: None,
+                    },
+                );
+                {
+                    let mut messages = session.messages.lock().await;
+                    messages.push(ChatMessage::user(job.prompt.clone()));
+                }
+                let mut run_msgs = vec![ChatMessage::system(
+                    cron_config.system_prompt_for(&job.prompt),
+                )];
+                {
+                    let messages = session.messages.lock().await;
+                    run_msgs.extend(messages.clone());
+                }
+                if let Ok(result) = run_messages(
+                    cron_provider.as_ref(),
+                    &mut cron_tools,
+                    &cron_config,
+                    &run_msgs,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    {
+                        let mut messages = session.messages.lock().await;
+                        messages.push(ChatMessage::assistant(result.output.clone()));
+                    }
+                    let _ = crate::session::append(
+                        &cron_sessions_dir,
+                        &sid,
+                        &Turn {
+                            role: "assistant".into(),
+                            text: result.output,
+                            ts: None,
+                        },
+                    );
+                }
+                for j in jobs.iter_mut() {
+                    if j.id == job.id {
+                        *j = crate::cron::after_run(j.clone(), now);
+                    }
+                }
+                let _ = crate::cron::save(&cron_path, &jobs);
+            }
+        }
+    });
+
     loop {
         let (stream, _) = listener.accept().await?;
         let (provider, config, tools, state, sessions_dir) = (
@@ -402,6 +494,101 @@ async fn handle_connection(
                         "text": answer,
                     })
                 ));
+            }
+            Some("cron") => {
+                // Scheduled turns (prime-agent cron-jobs.ts, minimal):
+                //   {"type":"cron","action":"add","kind":"interval|once",
+                //    "interval_secs":N|"at":unix,"prompt":"...","session":?}
+                //   {"type":"cron","action":"list"}
+                //   {"type":"cron","action":"pause|resume|remove","id":"..."}
+                // Jobs persist in <sessions_dir>/cron.json; the daemon's
+                // scheduler loop fires due ones into their target session.
+                let action = v["action"].as_str().unwrap_or("");
+                let cron_path = sessions_dir.join("cron.json");
+                let mut jobs = crate::cron::load(&cron_path);
+                let reply = match action {
+                    "add" => {
+                        let prompt = v["prompt"].as_str().unwrap_or("").to_string();
+                        if prompt.trim().is_empty() {
+                            json!({"type": "error", "text": "cron add requires a 'prompt'"})
+                        } else {
+                            let now = crate::cron::now_unix();
+                            let (kind, interval_secs, at, next) = match v["kind"].as_str() {
+                                Some("once") => {
+                                    let at = v["at"].as_u64().unwrap_or(now);
+                                    ("once".to_string(), None, Some(at), at)
+                                }
+                                _ => {
+                                    let iv = v["interval_secs"].as_u64().unwrap_or(60).max(1);
+                                    ("interval".to_string(), Some(iv), None, now + iv)
+                                }
+                            };
+                            let max_suffix = jobs
+                                .iter()
+                                .filter_map(|j| j.id.strip_prefix('c'))
+                                .filter_map(|s| s.parse::<u64>().ok())
+                                .max()
+                                .unwrap_or(0);
+                            let id = format!("c{:05}", max_suffix + 1);
+                            let job = crate::cron::CronJob {
+                                id: id.clone(),
+                                status: "active".into(),
+                                kind,
+                                interval_secs,
+                                at,
+                                prompt,
+                                session: v["session"].as_str().map(|s| s.to_string()),
+                                created_at: now,
+                                next_run_at: next,
+                                last_run_at: None,
+                                run_count: 0,
+                            };
+                            jobs.push(job);
+                            let _ = crate::cron::save(&cron_path, &jobs);
+                            json!({"type": "cron_result", "action": "added", "id": id, "next_run_at": next})
+                        }
+                    }
+                    "list" => json!({
+                        "type": "cron_result",
+                        "action": "list",
+                        "jobs": jobs,
+                    }),
+                    "pause" | "resume" | "remove" => {
+                        let id = v["id"].as_str().unwrap_or("").to_string();
+                        let mut found = false;
+                        for j in jobs.iter_mut() {
+                            if j.id == id {
+                                found = true;
+                                match action {
+                                    "pause" => j.status = "paused".into(),
+                                    "resume" => {
+                                        j.status = "active".into();
+                                        j.next_run_at = if j.kind == "once" {
+                                            j.at.unwrap_or(crate::cron::now_unix())
+                                        } else {
+                                            crate::cron::now_unix() + j.interval_secs.unwrap_or(60)
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if action == "remove" {
+                            jobs.retain(|j| j.id != id);
+                        }
+                        if found {
+                            let _ = crate::cron::save(&cron_path, &jobs);
+                            json!({"type": "cron_result", "action": action, "id": id})
+                        } else {
+                            json!({"type": "error", "text": format!("no cron job '{id}' (see cron list)")})
+                        }
+                    }
+                    other => json!({
+                        "type": "error",
+                        "text": format!("unknown cron action '{other}' (expected add|list|pause|resume|remove)")
+                    }),
+                };
+                let _ = tx.send(format!("{reply}\n"));
             }
             _ => {}
         }

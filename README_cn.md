@@ -23,6 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 71** — cron 定时任务（prime-agent `cron-jobs.ts` 最小版）：
+> daemon 帧 `{"type":"cron","action":"add|list|pause|resume|remove",...}`
+> 管理持久化作业（`<sessions_dir>/cron.json`），`interval`（每 N 秒重触发）与
+> `once`（unix 时间点触发）两种调度；30s 调度循环把到期作业像用户 turn 一样
+> 注入目标会话。E2E：interval-5s 作业添加后被调度器触发，prompt/回答轮次落入
+> 会话文件，run_count/next_run_at 正确跟踪。
+>
 > 状态：**Phase 70** — 旁路提问（prime-agent `side-question.ts`）：daemon 帧
 > `{"type":"side_question","text":...,"id":...}` 基于会话上下文的克隆回答，
 > **无工具**、单轮预算，流式 `side_delta` + 回 `side_answer`——会话历史不受
@@ -315,6 +322,21 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 71 — 2026-08-11（cron 定时任务——prime-agent cron-jobs.ts 最小版）
+- daemon 帧管理持久化定时轮次：`{"type":"cron","action":"add","kind":
+  "interval|once","interval_secs":N|"at":unix,"prompt":...,"session":?}` 与
+  按 id 的 `list|pause|resume|remove`。作业存于 `<sessions_dir>/cron.json`
+  （临时文件写后重命名，原子）。
+- daemon 内 30s 调度循环把到期作业像用户 turn 一样注入目标会话（append →
+  运行 → 回答 → 记录），然后重排：interval 作业在 last_run 后每
+  `interval_secs` 重触发，once 作业变 `completed`。触发经 `loop_lock` 与其他
+  turn 串行。
+- 新增 `src/cron.rs`（作业结构、load/save/due/after_run，unix 时间，无
+  chrono）。测试 174 → 179（interval 重触发、once 完成、paused/completed
+  永不触发、到期窗口、持久化往返）。
+- E2E：interval-5s 作业（c00001）添加后被调度器触发，会话文件出现注入的
+  prompt/回答轮次，run_count/next_run_at/last_run_at 正确跟踪。
 
 ### Phase 70 — 2026-08-11（旁路提问——prime-agent side-question.ts）
 - daemon 帧 `{"type":"side_question","text":...,"id":...}`：基于当前会话消息的

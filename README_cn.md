@@ -23,10 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 57** — `delegate delete`（prime-agent rlm registry 语义
-> 的最后缺口）：已完成的子代理记录可删除以释放 handle——`remove` 同时删
-> 内存条目**和**磁盘 `<dir>/<id>/`（两者保持同步），未知 id 报错，
-> running 中的子代理拒绝删除（后台任务仍在写）。此前：Phase 56
+> 状态：**Phase 58** — 按子任务选模型（`rlm.find_models` 思路）：
+> `delegate spawn`（和 `resume`）接受可选 `model` 覆盖——由于
+> `ChatRequest.model` 是请求级字段，子代理的 config 运行前覆盖即可；
+> handle 记录实际运行的模型（meta.json 的 `model` 字段，
+> `#[serde(default)]`），`delegate list` 显示 `(model: …)`。此前：
+> Phase 57 `delegate delete`（rlm registry 语义补全）、Phase 56
 > 子代理步数可见性（metrics 第一片）、Phase 55 refine 审计 id + 合并
 > 历史（prime-agent `mergeRefinementHistory` 模式）、Phase 54
 > 子 agent 类型化（AgentDefinition 模式）、Phase 53 子任务 resume +
@@ -256,6 +258,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 58 — 2026-08-11（按子任务选模型）
+- `delegate spawn`（和 `resume`）接受可选 `model` 覆盖——rlm.find_models
+  思路按子任务应用。由于 `ChatRequest.model` 是请求级字段，子代理的
+  config 运行前覆盖即可（无需 provider 管道改动）。
+- handle 记录实际运行的模型：`DelegateState.model`
+  （`#[serde(default)]`，旧 meta.json 仍可加载），`delegate list`
+  显示 `(model: …)`。
+- 测试扩展：model 覆盖持久化到 meta.json、旧文件默认 None、list
+  在有时显示模型。
 
 ### Phase 57 — 2026-08-11（delegate delete：rlm registry 补全）
 - `delegate delete`（id）：删除已完成的子代理记录、释放 handle——prime-agent

@@ -60,6 +60,10 @@ pub struct DelegateState {
     /// (Absent for legacy states written before this field existed.)
     #[serde(default)]
     pub steps: Option<usize>,
+    /// Model the sub-agent ran with, when `spawn` overrode it
+    /// (rlm.find_models-style per-sub-task model pick).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl DelegateState {
@@ -248,14 +252,18 @@ impl DelegateTool {
     /// `subagent_type` applies the type's system-prompt suffix and
     /// tool allowlist (the OpenHands AgentDefinition pattern); the
     /// parent's system prompt is never mutated (deep-copied first).
+    /// An optional `model` overrides the sub-agent's model (the
+    /// rlm.find_models idea: pick a model per sub-task) and is
+    /// recorded on the handle.
     async fn spawn_subagent(
         &self,
         task: String,
         resume_from: Option<String>,
         subagent_type: Option<&str>,
+        model: Option<&str>,
     ) -> anyhow::Result<String> {
         let mut sub_tools = self.registry.clone_shallow();
-        let config = if let Some(ty) = subagent_type {
+        let mut config = if let Some(ty) = subagent_type {
             let def = self.agents.resolve(ty).ok_or_else(|| {
                 let avail = self
                     .agents
@@ -273,6 +281,9 @@ impl DelegateTool {
         } else {
             self.config.clone()
         };
+        if let Some(m) = model {
+            config.model = m.to_string();
+        }
         let name = task.chars().take(40).collect::<String>();
         let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
         let ts = crate::session::chrono_like_timestamp();
@@ -288,6 +299,7 @@ impl DelegateTool {
                 task: task.clone(),
                 resume_from,
                 steps: None,
+                model: model.map(|m| m.to_string()),
             })
             .await;
 
@@ -414,7 +426,11 @@ impl Tool for DelegateTool {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "description": "optional: the sub-agent type to use (see the description for the available types; each type brings its own system-prompt suffix and tool allowlist)"
+                    "description": "Optional sub-agent type name (system-prompt suffix + tool allowlist)",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override for the sub-agent (rlm.find_models-style per-sub-task model pick; the handle records which model ran)",
                 },
                 "id": {
                     "type": "string",
@@ -443,6 +459,7 @@ impl Tool for DelegateTool {
                         task,
                         None,
                         args.get("subagent_type").and_then(Value::as_str),
+                        args.get("model").and_then(Value::as_str),
                     )
                     .await?;
                 Ok(ToolOutput {
@@ -490,11 +507,13 @@ impl Tool for DelegateTool {
                         task,
                         Some(st.id.clone()),
                         args.get("subagent_type").and_then(Value::as_str),
+                        args.get("model").and_then(Value::as_str),
                     )
                     .await?;
                 Ok(ToolOutput {
                     text: format!(
-                        "delegate '{new_id}' spawned as a continuation of '{id}' (status: running). Poll with action=status, collect with action=result."
+                        "delegate '{new_id}' spawned as a continuation of '{}' (status: running). Poll with action=status, collect with action=result.",
+                        st.id
                     ),
                 })
             }
@@ -567,8 +586,13 @@ impl Tool for DelegateTool {
                         .steps
                         .map(|n| format!(" ({n} steps)"))
                         .unwrap_or_default();
+                    let model = st
+                        .model
+                        .as_deref()
+                        .map(|m| format!(" (model: {m})"))
+                        .unwrap_or_default();
                     text.push_str(&format!(
-                        "\n- {} [{}] — {}{}{}",
+                        "\n- {} [{}] — {}{}{}{}",
                         st.id,
                         st.status.as_str(),
                         st.name,
@@ -576,7 +600,8 @@ impl Tool for DelegateTool {
                             .as_deref()
                             .map(|r| format!(" (resumed from {r})"))
                             .unwrap_or_default(),
-                        steps
+                        steps,
+                        model
                     ));
                 }
                 Ok(ToolOutput { text })
@@ -660,6 +685,7 @@ mod tests {
             task: "first task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         let snap = reg.snapshot().await;
@@ -697,6 +723,7 @@ mod tests {
                     task: format!("task-{i}"),
                     resume_from: None,
                     steps: None,
+                    model: None,
                 })
                 .await;
                 // Simulate the sub-agent finishing right away.
@@ -741,6 +768,7 @@ mod tests {
             task: "some task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         reg.update("d00001", |st| {
@@ -778,12 +806,14 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         reg.update("d00001", |st| {
             st.status = DelegateStatus::Completed;
             st.result = Some("done".into());
             st.steps = Some(7);
+            st.model = Some("model-x".into());
         })
         .await;
         let back: DelegateState = serde_json::from_str(
@@ -791,6 +821,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back.steps, Some(7), "steps persisted to meta.json");
+        assert_eq!(
+            back.model.as_deref(),
+            Some("model-x"),
+            "model override persisted to meta.json"
+        );
 
         // ...and a legacy meta.json without the field still loads
         // (serde default → None), so old delegate dirs keep working.
@@ -818,6 +853,10 @@ mod tests {
             legacy.steps, None,
             "legacy meta.json without steps loads fine"
         );
+        assert_eq!(
+            legacy.model, None,
+            "legacy meta.json without model loads fine"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -836,6 +875,7 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: Some(7),
+            model: Some("model-x".into()),
         })
         .await;
         reg.insert(DelegateState {
@@ -849,6 +889,7 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         let tool = DelegateTool {
@@ -892,10 +933,15 @@ mod tests {
             out.text
         );
         assert!(
+            out.text.contains("(model: model-x)"),
+            "model override shown on the handle: {}",
+            out.text
+        );
+        assert!(!out.text.contains("(0 steps)"), "no '0 steps' shown");
+        assert!(
             !out.text.contains("no steps") || !out.text.contains("(0 steps)"),
             "running sub-agent without steps shows no count"
         );
-        assert!(!out.text.contains("(0 steps)"), "no '0 steps' shown");
     }
 
     #[tokio::test]
@@ -914,6 +960,7 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: Some(3),
+            model: Some("model-y".into()),
         })
         .await;
         assert!(dir.join("d00001").join("meta.json").exists());
@@ -987,6 +1034,7 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         let err = tool
@@ -1024,6 +1072,7 @@ mod tests {
                 task: "old task".into(),
                 resume_from: None,
                 steps: None,
+                model: None,
             })
             .await;
         }
@@ -1098,6 +1147,7 @@ mod tests {
             task: "task".into(),
             resume_from: None,
             steps: None,
+            model: None,
         })
         .await;
         let tool = DelegateTool {

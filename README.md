@@ -25,21 +25,22 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 57** — `delegate delete` (the last gap in the
-> prime-agent rlm registry semantics): finished sub-agent records can
-> be removed to free handles — `remove` deletes the in-memory entry
-> **and** its `<dir>/<id>/` on disk (the two stay in sync), unknown ids
-> error, and running sub-agents are refused (their background task
-> would still be writing). Previous: Phase 56 sub-agent step
-> visibility (a first slice of metrics), Phase 55 refinement audit ids
-> + merged history (the prime-agent `mergeRefinementHistory` pattern),
-> Phase 54 sub-agent typing (AgentDefinition pattern), Phase 53
-> sub-agent resume + delegate registry persistence, Phase 52 scope
-> strategy, Phase 51 the dual-track itself (--local-harness-dir merged
-> view + scope parameter), Phase 50 Lua sandbox hardening, Phase 49
-> structured run results (RunResult + provide_final_answer), Phase 48
-> parallel tools + reactive compaction + planning checkpoints +
-> delegate report templates, 48r daemon deadlock fix, Phase 47 CLI
+> Status: **Phase 58** — per-sub-task model pick (the `rlm.find_models`
+> idea): `delegate spawn` (and `resume`) accept an optional `model`
+> override — since `ChatRequest.model` is per-request, the sub-agent's
+> config is simply overridden before it runs; the handle records which
+> model ran (`model` in meta.json, `#[serde(default)]`) and
+> `delegate list` shows it as `(model: …)`. Previous: Phase 57
+> `delegate delete` (rlm registry completion), Phase 56 sub-agent
+> step visibility (a first slice of metrics), Phase 55 refinement
+> audit ids + merged history (the prime-agent `mergeRefinementHistory`
+> pattern), Phase 54 sub-agent typing (AgentDefinition pattern),
+> Phase 53 sub-agent resume + delegate registry persistence, Phase 52
+> scope strategy, Phase 51 the dual-track itself (--local-harness-dir
+> merged view + scope parameter), Phase 50 Lua sandbox hardening,
+> Phase 49 structured run results (RunResult + provide_final_answer),
+> Phase 48 parallel tools + reactive compaction + planning checkpoints
+> + delegate report templates, 48r daemon deadlock fix, Phase 47 CLI
 > consistency, Phase 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
@@ -284,6 +285,17 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 58 — 2026-08-11 (per-sub-task model pick)
+- `delegate spawn` (and `resume`) accept an optional `model` override —
+  the rlm.find_models idea, applied per sub-task. Since
+  `ChatRequest.model` is a per-request field, the sub-agent's config
+  is overridden before it runs (no provider plumbing needed).
+- The handle records which model actually ran: `DelegateState.model`
+  (`#[serde(default)]`, legacy meta.json keeps loading) and
+  `delegate list` shows it as `(model: …)`.
+- Tests extended: model override persists to meta.json, legacy files
+  default to None, list shows the model when present.
 
 ### Phase 57 — 2026-08-11 (delegate delete: rlm registry completion)
 - `delegate delete` (id): removes a finished sub-agent's record and

@@ -23,6 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 62** — 压缩由真实 token 用量驱动：
+> `compact_messages_with_budget` 现在接收最近一次 LLM 调用的真实
+> `prompt_tokens`（prime-agent 用实际 `usage.totalTokens` 而非 chars/4
+> 估算）：驱动超限触发 + 用真实/估算比值校准保留尾部的逐条估算
+> （chars/4 对中文密集转录低估约 4 倍）。预算检查每轮迭代都跑——
+> 第一步用估算、之后每步用实测用量。
+>
 > 状态：**Phase 61** — token 用量计量：解析 provider 的 `usage` 块
 > （流式 SSE 末块 + 工具回放 completion 两条路径），跨整次运行累计进
 > `RunResult.tokens`，持久化到 delegate handle 并在 `delegate status/list`
@@ -264,6 +271,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 62 — 2026-08-11（压缩由真实 token 用量驱动）
+- `compact_messages_with_budget` 新增 `recent_prompt_tokens` 参数：最近一次
+  LLM 调用的真实 `prompt_tokens` 用量（prime-agent 用实际 `usage.totalTokens`，
+  无则回退 chars/4 估算）。作用：(a) 驱动超限触发；(b) 用真实/估算比值校准
+  保留尾部的逐条估算——chars/4 对中文密集转录低估约 4 倍，未校准的 walk
+  会保留过少。
+- 预算检查每轮迭代都跑：第一步用估算、之后每步用实测用量。
+- 测试 162 → 164：真实用量触发（估算在预算内、实测超限）、校准砍更多。
+  E2E：多工具运行正常完成、usage 流经整个循环。
 
 ### Phase 61 — 2026-08-11（token 用量计量）
 - 解析 provider 的 `usage` 块：流式 SSE 末块 + 工具回放 completion 两条路径，

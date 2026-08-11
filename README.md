@@ -25,6 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 62** — compaction driven by real token usage:
+> `compact_messages_with_budget` now takes the most recent LLM call's
+> real `prompt_tokens` (prime-agent uses actual `usage.totalTokens`
+> over the chars/4 heuristic): it drives the over-budget trigger and
+> calibrates the per-message estimate while walking the retained tail
+> (the heuristic underestimates CJK-heavy transcripts ~4x). The
+> budget check runs every loop iteration, so the first step uses the
+> heuristic and every step after uses measured usage.
+>
 > Status: **Phase 61** — token usage accounting: the provider's
 > `usage` block is parsed from both the streaming SSE (final chunk)
 > and tool-call replay completions, accumulated across the run
@@ -297,6 +306,20 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 62 — 2026-08-11 (compaction driven by real token usage)
+- `compact_messages_with_budget` gained a `recent_prompt_tokens`
+  parameter: the most recent LLM call's real `prompt_tokens` usage
+  (prime-agent uses actual `usage.totalTokens`, falling back to
+  chars/4). It (a) drives the over-budget trigger and (b) calibrates
+  the per-message estimate by the real/estimated ratio while walking
+  the retained tail — the heuristic underestimates CJK-heavy
+  transcripts by ~4x, so an uncalibrated walk kept far too little.
+- The budget check runs every loop iteration: the first step uses the
+  heuristic, every step after uses measured usage.
+- Tests 162 → 164: trigger-by-real-usage (estimate under budget, real
+  usage over), calibration trims more. E2E: multi-tool run completes
+  normally with usage flowing through the loop.
 
 ### Phase 61 — 2026-08-11 (token usage accounting)
 - Parse the provider's `usage` block from the streaming SSE (final

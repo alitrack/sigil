@@ -111,7 +111,7 @@ impl AgentConfig {
 /// already within budget.
 #[cfg(test)]
 pub fn compact_messages(messages: &[ChatMessage], max: usize) -> Vec<ChatMessage> {
-    compact_messages_with_budget(messages, max, 0)
+    compact_messages_with_budget(messages, max, 0, None)
 }
 
 /// Rough token estimate for a text (chars/4, conservative).
@@ -157,16 +157,26 @@ fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
 }
 
 /// [`compact_messages`] with a token budget: compress when the
-/// estimated transcript size exceeds `max_tokens` (chars/4 heuristic)
-/// OR the message count exceeds `max_msgs`. Either budget may be `0`
-/// to disable that axis. The kept tail is chosen by walking backwards
-/// from the newest message, accumulating tokens until the token budget
-/// (or message budget) is met, then extended forward to the nearest
-/// safe cut boundary.
+/// estimated transcript size exceeds `max_tokens` OR the message count
+/// exceeds `max_msgs`. Either budget may be `0` to disable that axis.
+///
+/// `recent_prompt_tokens` is the real `prompt_tokens` usage from the
+/// most recent LLM call (prime-agent uses actual `usage.totalTokens`
+/// over the chars/4 heuristic). When present it (a) drives the
+/// over-budget trigger and (b) calibrates the per-message estimate by
+/// the real/estimated ratio while walking the retained tail — the
+/// chars/4 heuristic underestimates CJK-heavy transcripts by ~4x, so
+/// an uncalibrated walk would keep far too little.
+///
+/// The kept tail is chosen by walking backwards from the newest
+/// message, accumulating tokens until the token budget (or message
+/// budget) is met, then extended forward to the nearest safe cut
+/// boundary.
 pub fn compact_messages_with_budget(
     messages: &[ChatMessage],
     max_msgs: usize,
     max_tokens: usize,
+    recent_prompt_tokens: Option<usize>,
 ) -> Vec<ChatMessage> {
     // No budget configured → never compress.
     if max_msgs == 0 && max_tokens == 0 {
@@ -175,13 +185,22 @@ pub fn compact_messages_with_budget(
     if messages.len() < 3 {
         return messages.to_vec();
     }
-    // Already within every configured budget?
+    // Already within every configured budget? Real usage from the last
+    // LLM call (≈ current transcript size, since prompts accumulate)
+    // wins over the heuristic when available.
     let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
+    let effective_total = recent_prompt_tokens.unwrap_or(total_tokens);
     let within_msgs = max_msgs == 0 || messages.len() <= max_msgs;
-    let within_tokens = max_tokens == 0 || total_tokens <= max_tokens;
+    let within_tokens = max_tokens == 0 || effective_total <= max_tokens;
     if within_msgs && within_tokens {
         return messages.to_vec();
     }
+    // Calibrate the per-message estimate for the tail walk.
+    let ratio: f64 = if total_tokens > 0 {
+        (effective_total as f64 / total_tokens as f64).max(1.0)
+    } else {
+        1.0
+    };
 
     // Walk backwards, accumulating token estimates, until the token
     // budget or the message budget (minus the summary slot) is met.
@@ -189,7 +208,7 @@ pub fn compact_messages_with_budget(
     let mut cut = 1usize;
     let mut acc = 0usize;
     for i in (1..messages.len()).rev() {
-        acc += estimate_message_tokens(&messages[i]);
+        acc += (estimate_message_tokens(&messages[i]) as f64 * ratio) as usize;
         let count_over = messages.len() - i >= keep_count;
         let tokens_over = max_tokens > 0 && acc > max_tokens;
         if count_over || tokens_over {
@@ -354,6 +373,9 @@ pub async fn run_messages(
     let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;
     let mut tokens: Option<TokenUsage> = None;
+    // Real prompt-token usage of the most recent LLM call — feeds the
+    // compaction trigger/calibration (see compact_messages_with_budget).
+    let mut last_prompt_tokens: Option<usize> = None;
 
     loop {
         // Cross-instance sync: if another sigil process edited the
@@ -370,6 +392,7 @@ pub async fn run_messages(
                 &messages,
                 config.max_context_messages,
                 config.max_context_tokens,
+                last_prompt_tokens,
             );
         }
 
@@ -465,7 +488,8 @@ pub async fn run_messages(
                 // provider's window), so a second, more aggressive pass
                 // must make progress regardless of the configured
                 // budget.
-                let compacted = compact_messages_with_budget(&messages, messages.len() / 2, 0);
+                let compacted =
+                    compact_messages_with_budget(&messages, messages.len() / 2, 0, None);
                 if compacted.len() < messages.len() {
                     eprintln!(
                         "  llm error ({e:#}); compacting transcript \
@@ -496,6 +520,9 @@ pub async fn run_messages(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading stream")?;
             accumulate_usage(&mut tokens, chunk.usage);
+            if let Some(u) = chunk.usage {
+                last_prompt_tokens = Some(u.prompt_tokens as usize);
+            }
             if !chunk.thinking {
                 text.push_str(&chunk.delta);
                 if let Some(cb) = stream_cb {
@@ -519,6 +546,9 @@ pub async fn run_messages(
                 .await
                 .context("replaying completion for tool calls")?;
             accumulate_usage(&mut tokens, complete.usage);
+            if let Some(u) = complete.usage {
+                last_prompt_tokens = Some(u.prompt_tokens as usize);
+            }
             if complete.tool_calls.is_empty() {
                 // Model asked for tools but sent none; treat text as answer.
                 let answer = if text.trim().is_empty() {
@@ -1382,7 +1412,7 @@ mod compact_tests {
         assert!(total > 200, "test transcript too small: {total}");
         // Tight token budget → compress; kept tail must fit the budget
         // plus the safe-boundary slack.
-        let c = compact_messages_with_budget(&m, 0, 200);
+        let c = compact_messages_with_budget(&m, 0, 200, None);
         assert!(c.len() < m.len(), "expected compression");
         // Summary + kept tail: kept tail alone respects the budget.
         let kept_tail: usize = c[2..].iter().map(estimate_message_tokens).sum();
@@ -1391,7 +1421,44 @@ mod compact_tests {
             "kept tail {kept_tail} tokens exceeds budget with slack"
         );
         // No budget configured → no-op even for a huge transcript.
-        assert_eq!(compact_messages_with_budget(&m, 0, 0).len(), m.len());
+        assert_eq!(compact_messages_with_budget(&m, 0, 0, None).len(), m.len());
+    }
+
+    #[test]
+    fn compact_triggered_by_real_usage_when_estimate_within_budget() {
+        // A transcript whose chars/4 estimate sits *under* the budget…
+        let mut m = vec![ChatMessage::system("sys")];
+        for i in 0..10 {
+            m.push(ChatMessage::user(format!("user-{i} short line")));
+            m.push(ChatMessage::assistant(format!("assistant-{i} short reply")));
+        }
+        let total: usize = m.iter().map(estimate_message_tokens).sum();
+        assert!(total <= 200, "test transcript too big: {total}");
+        // …must NOT compress on the heuristic alone…
+        assert_eq!(
+            compact_messages_with_budget(&m, 0, 200, None).len(),
+            m.len()
+        );
+        // …but MUST once real usage (CJK-heavy, ~10x the estimate) says
+        // the transcript is actually over budget (prime-agent: use
+        // actual usage, fall back to chars/4).
+        let c = compact_messages_with_budget(&m, 0, 200, Some(10 * total));
+        assert!(c.len() < m.len(), "expected compression via real usage");
+    }
+
+    #[test]
+    fn compact_calibrates_tail_by_real_usage_ratio() {
+        let mut m = vec![ChatMessage::system("sys")];
+        for i in 0..20 {
+            m.push(ChatMessage::user(format!("user-{i} line")));
+            m.push(ChatMessage::assistant(format!("assistant-{i} reply")));
+        }
+        // Uncalibrated walk keeps the tail that *estimates* to 1000…
+        let unc = compact_messages_with_budget(&m, 0, 1000, None);
+        // …calibrated walk (real usage = 10x estimate) keeps a tail that
+        // estimates to ~100, i.e. far less transcript survives.
+        let cal = compact_messages_with_budget(&m, 0, 1000, Some(10 * 1000));
+        assert!(cal.len() < unc.len(), "calibration must trim more");
     }
 
     #[test]
@@ -1420,7 +1487,7 @@ mod compact_tests {
             ChatMessage::tool_result("ok", "c2"),
             ChatMessage::user("newest-request"),
         ];
-        let c = compact_messages_with_budget(&m, 0, 5);
+        let c = compact_messages_with_budget(&m, 0, 5, None);
         let summary = c
             .iter()
             .find(|m| m.role == Role::System && m.content.contains("compressed"))

@@ -25,13 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 56** — sub-agent step visibility (a first slice of
-> metrics): the delegate registry now records how many agent steps each
-> sub-agent took (`steps` in meta.json — `#[serde(default)]`, so legacy
-> delegate dirs keep loading) and `delegate list` shows it as
-> `(N steps)`; sub-agents run via `run_messages` so the RunResult
-> metadata is captured. Previous: Phase 55 refinement audit ids +
-> merged history (the prime-agent `mergeRefinementHistory` pattern),
+> Status: **Phase 57** — `delegate delete` (the last gap in the
+> prime-agent rlm registry semantics): finished sub-agent records can
+> be removed to free handles — `remove` deletes the in-memory entry
+> **and** its `<dir>/<id>/` on disk (the two stay in sync), unknown ids
+> error, and running sub-agents are refused (their background task
+> would still be writing). Previous: Phase 56 sub-agent step
+> visibility (a first slice of metrics), Phase 55 refinement audit ids
+> + merged history (the prime-agent `mergeRefinementHistory` pattern),
 > Phase 54 sub-agent typing (AgentDefinition pattern), Phase 53
 > sub-agent resume + delegate registry persistence, Phase 52 scope
 > strategy, Phase 51 the dual-track itself (--local-harness-dir merged
@@ -283,6 +284,17 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 57 — 2026-08-11 (delegate delete: rlm registry completion)
+- `delegate delete` (id): removes a finished sub-agent's record and
+  frees its handle — the last gap in the prime-agent `rlm` registry
+  semantics (spawn/status/result/resume/list were already aligned).
+- `DelegateRegistry::remove` deletes the in-memory entry **and** its
+  `<dir>/<id>/` directory on disk, keeping memory and disk in sync;
+  unknown ids produce a clear error, and running sub-agents are
+  refused (their background task would still be updating the entry).
+- 1 new test: delete removes the record and the disk dir, unknown id
+  errors, running delegate survives delete.
 
 ### Phase 56 — 2026-08-11 (sub-agent step visibility)
 - The delegate registry records how many agent steps each sub-agent

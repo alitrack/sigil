@@ -161,6 +161,26 @@ impl DelegateRegistry {
     async fn snapshot(&self) -> Vec<DelegateState> {
         self.states.lock().await.values().cloned().collect()
     }
+
+    /// Remove a sub-agent's record (and its `<dir>/<id>/` directory on
+    /// disk, keeping the two in sync). Running sub-agents are refused:
+    /// their background task would still be updating the entry.
+    async fn remove(&self, id: &str) -> anyhow::Result<()> {
+        let mut guard = self.states.lock().await;
+        let Some(st) = guard.get(id) else {
+            anyhow::bail!("no such delegate id '{id}'");
+        };
+        if st.status == DelegateStatus::Running {
+            anyhow::bail!(
+                "delegate '{id}' is still running — wait for it to finish before deleting"
+            );
+        }
+        guard.remove(id);
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir.join(id));
+        }
+        Ok(())
+    }
 }
 
 /// Tool that delegates a sub-task to a fresh agent turn.
@@ -350,7 +370,9 @@ impl Tool for DelegateTool {
                  (id + task — continue a finished/failed sub-agent with a new \
                  instruction: its original task and final report are fed back \
                  as context, and a fresh handle is returned), 'list' \
-                 (all sub-agents). Use for parallel exploration, research, or \
+                 (all sub-agents), 'delete' (id — remove a finished \
+                 sub-agent's record and free its handle). Use for parallel \
+                 exploration, research, or \
                  long independent subtasks; the result is a text summary, not \
                  the full transcript. Poll with action=status then collect \
                  with action=result.",
@@ -383,8 +405,8 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "status", "result", "resume", "list"],
-                    "description": "spawn (default): start a sub-agent; status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all"
+                    "enum": ["spawn", "status", "result", "resume", "list", "delete"],
+                    "description": "spawn (default): start a sub-agent; status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record"
                 },
                 "task": {
                     "type": "string",
@@ -559,7 +581,17 @@ impl Tool for DelegateTool {
                 }
                 Ok(ToolOutput { text })
             }
-            _ => anyhow::bail!("unknown action '{action}' (spawn|status|result|list)"),
+            "delete" => {
+                let id = args
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("delete requires 'id'"))?;
+                self.delegates.remove(id).await?;
+                Ok(ToolOutput {
+                    text: format!("delegate '{id}' deleted"),
+                })
+            }
+            _ => anyhow::bail!("unknown action '{action}' (spawn|status|result|list|delete)"),
         }
     }
 }
@@ -608,7 +640,10 @@ mod tests {
         let p = tool.parameters();
         let actions = p["properties"]["action"]["enum"].as_array().unwrap();
         let names: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(names, vec!["spawn", "status", "result", "resume", "list"]);
+        assert_eq!(
+            names,
+            vec!["spawn", "status", "result", "resume", "list", "delete"]
+        );
     }
 
     #[tokio::test]
@@ -861,6 +896,114 @@ mod tests {
             "running sub-agent without steps shows no count"
         );
         assert!(!out.text.contains("(0 steps)"), "no '0 steps' shown");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_record_and_disk_dir() {
+        let dir = std::env::temp_dir().join(format!("sigil-delegate-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = Arc::new(DelegateRegistry::new(Some(dir.clone())));
+        reg.insert(DelegateState {
+            id: "d00001".into(),
+            name: "to delete".into(),
+            status: DelegateStatus::Completed,
+            started_ts: "t0".into(),
+            finished_ts: Some("t1".into()),
+            result: Some("done".into()),
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: Some(3),
+        })
+        .await;
+        assert!(dir.join("d00001").join("meta.json").exists());
+
+        let tool = DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg.clone(),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        };
+
+        let out = tool
+            .run(&json!({"action": "delete", "id": "d00001"}))
+            .await
+            .unwrap();
+        assert_eq!(out.text, "delegate 'd00001' deleted");
+        assert!(
+            reg.snapshot().await.is_empty(),
+            "record removed from registry"
+        );
+        assert!(
+            !dir.join("d00001").exists(),
+            "meta.json dir removed from disk"
+        );
+
+        // Unknown id → clear error.
+        let err = tool
+            .run(&json!({"action": "delete", "id": "d99999"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such delegate id"), "err: {err}");
+
+        // Running sub-agent → refused (background task still writing).
+        reg.insert(DelegateState {
+            id: "d00002".into(),
+            name: "still going".into(),
+            status: DelegateStatus::Running,
+            started_ts: "t0".into(),
+            finished_ts: None,
+            result: None,
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: None,
+        })
+        .await;
+        let err = tool
+            .run(&json!({"action": "delete", "id": "d00002"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("still running"),
+            "running delegate refused: {err}"
+        );
+        assert!(
+            reg.snapshot().await.iter().any(|st| st.id == "d00002"),
+            "running delegate survives delete"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

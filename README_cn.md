@@ -23,21 +23,21 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 56** — 子代理步数可见性（metrics 的第一片）：delegate
-> 注册表现在记录每个子代理消耗的 agent 步数（meta.json 的 `steps` 字段，
-> `#[serde(default)]` 兼容旧 delegate 目录），`delegate list` 显示
-> `(N steps)`；子代理改走 `run_messages` 以捕获 RunResult 元数据。
-> 此前：Phase 55 refine 审计 id + 合并历史（prime-agent
-> `mergeRefinementHistory` 模式）、Phase 54 子 agent 类型化
-> （AgentDefinition 模式）、Phase 53 子任务 resume + delegate 注册表
-> 持久化、Phase 52 scope 策略（有 local 层时 improve_harness 默认
-> scope=local）、Phase 51 双轨本身（--local-harness-dir 合并视图 +
-> scope 参数）、Phase 50 Lua 沙箱加固、Phase 49 结构化运行结果
-> （RunResult + provide_final_answer）、Phase 48 外部调研落地（并行
-> 工具执行、反应式压缩重试、规划检查点、子 agent 报告模板）+ 48r
-> daemon 死锁修复、Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、
-> Phase 45 ratchet 进 CI + goal turn 预算、Phase 44 daemon、
-> Phase 43 异步委托、Phase 42 持久目标、Phase 41
+> 状态：**Phase 57** — `delegate delete`（prime-agent rlm registry 语义
+> 的最后缺口）：已完成的子代理记录可删除以释放 handle——`remove` 同时删
+> 内存条目**和**磁盘 `<dir>/<id>/`（两者保持同步），未知 id 报错，
+> running 中的子代理拒绝删除（后台任务仍在写）。此前：Phase 56
+> 子代理步数可见性（metrics 第一片）、Phase 55 refine 审计 id + 合并
+> 历史（prime-agent `mergeRefinementHistory` 模式）、Phase 54
+> 子 agent 类型化（AgentDefinition 模式）、Phase 53 子任务 resume +
+> delegate 注册表持久化、Phase 52 scope 策略（有 local 层时
+> improve_harness 默认 scope=local）、Phase 51 双轨本身
+> （--local-harness-dir 合并视图 + scope 参数）、Phase 50 Lua 沙箱
+> 加固、Phase 49 结构化运行结果（RunResult + provide_final_answer）、
+> Phase 48 外部调研落地（并行工具执行、反应式压缩重试、规划检查点、
+> 子 agent 报告模板）+ 48r daemon 死锁修复、Phase 47 CLI 一致性、
+> Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI + goal turn 预算、
+> Phase 44 daemon、Phase 43 异步委托、Phase 42 持久目标、Phase 41
 > 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
 > 跨实例知识同步。管道模式、
@@ -256,6 +256,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 57 — 2026-08-11（delegate delete：rlm registry 补全）
+- `delegate delete`（id）：删除已完成的子代理记录、释放 handle——prime-agent
+  `rlm` registry 语义的最后缺口（spawn/status/result/resume/list
+  此前已对齐）。
+- `DelegateRegistry::remove` 同时删内存条目**和**磁盘 `<dir>/<id>/`
+  目录，内存与磁盘保持同步；未知 id 报错清晰，running 中的子代理
+  拒绝删除（后台任务仍在写该条目）。
+- 1 个新测试：delete 删除记录与磁盘目录、未知 id 报错、running
+  存活。
 
 ### Phase 56 — 2026-08-11（子代理步数可见性）
 - delegate 注册表记录每个子代理消耗的步数：`DelegateState.steps:

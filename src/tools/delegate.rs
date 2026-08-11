@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use crate::agent::{AgentConfig, run_turn};
 use crate::llm::provider::LlmProvider;
+use crate::tools::subagent;
 use crate::tools::{Tool, ToolOutput, ToolRegistry};
 
 /// Lifecycle of one delegated sub-agent.
@@ -164,6 +165,8 @@ pub struct DelegateTool {
     registry: ToolRegistry,
     config: AgentConfig,
     delegates: Arc<DelegateRegistry>,
+    agents: Arc<subagent::AgentRegistry>,
+    description: std::sync::OnceLock<String>,
 }
 
 impl DelegateTool {
@@ -172,21 +175,80 @@ impl DelegateTool {
         registry: ToolRegistry,
         config: AgentConfig,
         delegates_dir: Option<std::path::PathBuf>,
+        harness_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             provider,
             registry,
             config,
             delegates: Arc::new(DelegateRegistry::new(delegates_dir)),
+            agents: Arc::new(subagent::AgentRegistry::new(harness_dir.as_deref())),
+            description: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl DelegateTool {
+    /// Apply a sub-agent type definition to a sub-agent's config and
+    /// tool registry: append the type's system prompt to a *deep copy*
+    /// of the parent's prompt state (the shared Arc must never be
+    /// mutated) and drop every tool outside the type's allowlist.
+    /// Testable on its own, without spawning an LLM sub-agent.
+    fn apply_subagent_type(
+        config: &AgentConfig,
+        sub_tools: &mut ToolRegistry,
+        def: &subagent::AgentDefinition,
+    ) -> AgentConfig {
+        let mut config = config.clone();
+        let mut ps = config
+            .prompt_state
+            .read()
+            .expect("prompt_state poisoned")
+            .clone();
+        ps.system_prompt = format!("{}\n\n{}", ps.system_prompt, def.prompt);
+        config.prompt_state = std::sync::Arc::new(std::sync::RwLock::new(ps));
+        if let Some(tools) = &def.tools {
+            let names: Vec<String> = sub_tools.specs().iter().map(|s| s.name.clone()).collect();
+            for n in names {
+                if !tools.contains(&n) {
+                    sub_tools.unregister(&n);
+                }
+            }
+        }
+        config
+    }
+
     /// Start a sub-agent for `task` and return its handle. Used by
     /// both `spawn` and `resume` (which passes the previous run's
-    /// outcome as context and records the lineage).
-    async fn spawn_subagent(&self, task: String, resume_from: Option<String>) -> String {
+    /// outcome as context and records the lineage). An optional
+    /// `subagent_type` applies the type's system-prompt suffix and
+    /// tool allowlist (the OpenHands AgentDefinition pattern); the
+    /// parent's system prompt is never mutated (deep-copied first).
+    async fn spawn_subagent(
+        &self,
+        task: String,
+        resume_from: Option<String>,
+        subagent_type: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let mut sub_tools = self.registry.clone_shallow();
+        let config = if let Some(ty) = subagent_type {
+            let def = self.agents.resolve(ty).ok_or_else(|| {
+                let avail = self
+                    .agents
+                    .list()
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::anyhow!(
+                    "no such sub-agent type '{ty}' (available: {avail}; \
+                     omit subagent_type for the default untyped sub-agent)"
+                )
+            })?;
+            Self::apply_subagent_type(&self.config, &mut sub_tools, def)
+        } else {
+            self.config.clone()
+        };
         let name = task.chars().take(40).collect::<String>();
         let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
         let ts = crate::session::chrono_like_timestamp();
@@ -205,8 +267,6 @@ impl DelegateTool {
             .await;
 
         let provider = self.provider.clone();
-        let mut sub_tools = self.registry.clone_shallow();
-        let config = self.config.clone();
         // Report template (borrowed from smolagents' managed
         // agents): the sub-agent is asked to structure its
         // final report so the parent can see both the answer
@@ -245,7 +305,7 @@ impl DelegateTool {
                 }
             }
         });
-        id
+        Ok(id)
     }
 }
 
@@ -256,18 +316,45 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a self-contained sub-task to a fresh sub-agent. \
-         Actions: 'spawn' (default — start a sub-agent and return its \
-         handle immediately; it keeps running in the background while \
-         you work), 'status' (id — running/completed/failed), 'result' \
-         (id — the sub-agent's final summary once completed), 'resume' \
-         (id + task — continue a finished/failed sub-agent with a new \
-         instruction: its original task and final report are fed back \
-         as context, and a fresh handle is returned), 'list' \
-         (all sub-agents). Use for parallel exploration, research, or \
-         long independent subtasks; the result is a text summary, not \
-         the full transcript. Poll with action=status then collect \
-         with action=result."
+        // Dynamic listing of registered sub-agent types (the OpenHands
+        // get_factory_info pattern, simplified): the model sees which
+        // typed sub-agents exist and what tools each one gets. Built
+        // lazily once per tool instance.
+        self.description.get_or_init(|| {
+            let mut d = String::from(
+                "Delegate a self-contained sub-task to a fresh sub-agent. \
+                 Actions: 'spawn' (default — start a sub-agent and return its \
+                 handle immediately; it keeps running in the background while \
+                 you work), 'status' (id — running/completed/failed), 'result' \
+                 (id — the sub-agent's final summary once completed), 'resume' \
+                 (id + task — continue a finished/failed sub-agent with a new \
+                 instruction: its original task and final report are fed back \
+                 as context, and a fresh handle is returned), 'list' \
+                 (all sub-agents). Use for parallel exploration, research, or \
+                 long independent subtasks; the result is a text summary, not \
+                 the full transcript. Poll with action=status then collect \
+                 with action=result.",
+            );
+            let types = self.agents.list();
+            if types.is_empty() {
+                d.push_str(
+                    " No sub-agent types are defined (create \
+                            <harness-dir>/agents/<name>.md or ~/.sigil/agents/<name>.md).",
+                );
+            } else {
+                d.push_str(
+                    " Available sub-agent types (pass one via \
+                            subagent_type; omit for the default untyped sub-agent):",
+                );
+                for t in types {
+                    d.push_str(&format!("\n- {} — {}", t.name, t.description));
+                    if let Some(tools) = &t.tools {
+                        d.push_str(&format!(" [tools: {}]", tools.join(", ")));
+                    }
+                }
+            }
+            d
+        })
     }
 
     fn parameters(&self) -> Value {
@@ -281,7 +368,11 @@ impl Tool for DelegateTool {
                 },
                 "task": {
                     "type": "string",
-                    "description": "For spawn: the self-contained task for the sub-agent"
+                    "description": "the task for the sub-agent (required for spawn and resume)"
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "optional: the sub-agent type to use (see the description for the available types; each type brings its own system-prompt suffix and tool allowlist)"
                 },
                 "id": {
                     "type": "string",
@@ -305,7 +396,13 @@ impl Tool for DelegateTool {
                     .and_then(Value::as_str)
                     .context("delegate spawn requires a 'task' string")?
                     .to_string();
-                let id = self.spawn_subagent(task, None).await;
+                let id = self
+                    .spawn_subagent(
+                        task,
+                        None,
+                        args.get("subagent_type").and_then(Value::as_str),
+                    )
+                    .await?;
                 Ok(ToolOutput {
                     text: format!(
                         "delegate '{id}' spawned (status: running). Keep working; poll with action=status, collect with action=result."
@@ -346,7 +443,13 @@ impl Tool for DelegateTool {
                     "{}\n\nCONTEXT FROM EARLIER RUN (delegate {}):\n{}\n\nNew instruction: {new_task}",
                     st.task, st.id, prev
                 );
-                let new_id = self.spawn_subagent(task, Some(st.id.clone())).await;
+                let new_id = self
+                    .spawn_subagent(
+                        task,
+                        Some(st.id.clone()),
+                        args.get("subagent_type").and_then(Value::as_str),
+                    )
+                    .await?;
                 Ok(ToolOutput {
                     text: format!(
                         "delegate '{new_id}' spawned as a continuation of '{id}' (status: running). Poll with action=status, collect with action=result."
@@ -473,6 +576,8 @@ mod tests {
                 planning_interval: 0,
             },
             delegates: Arc::new(DelegateRegistry::default()),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
         };
         assert_eq!(tool.name(), "delegate");
         let p = tool.parameters();
@@ -659,6 +764,8 @@ mod tests {
                 planning_interval: 0,
             },
             delegates: Arc::new(DelegateRegistry::default()),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
         };
 
         // Unknown id → clear error.
@@ -693,5 +800,96 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("still running"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn spawn_unknown_subagent_type_lists_available() {
+        let tool = DelegateTool {
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            ..DelegateTool::new(
+                Arc::new(
+                    crate::llm::openai::OpenAiProvider::with_fallbacks(
+                        crate::llm::openai::OpenAiConfig {
+                            base_url: "http://localhost:1/v1".into(),
+                            api_key: "x".into(),
+                        },
+                        vec![],
+                    )
+                    .unwrap(),
+                ),
+                ToolRegistry::with_tools(None, None, None, None, None),
+                AgentConfig {
+                    model: "test".into(),
+                    max_steps: 3,
+                    prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::harness::PromptState {
+                            system_prompt: "sys".into(),
+                            skills: vec![],
+                            fingerprint: None,
+                        },
+                    )),
+                    max_inline_skills: 0,
+                    sync_dir: None,
+                    max_context_messages: 0,
+                    max_context_tokens: 0,
+                    goals: None,
+                    goals_dir: None,
+                    planning_interval: 0,
+                },
+                None,
+                None,
+            )
+        };
+        let err = tool
+            .run(&json!({"action": "spawn", "task": "t", "subagent_type": "nope"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such sub-agent type 'nope'"), "err: {err}");
+        assert!(err.contains("available:"), "err: {err}");
+    }
+
+    #[test]
+    fn apply_subagent_type_appends_prompt_and_filters_tools() {
+        // A registry with many tools; the type allows only one.
+        let mut reg = ToolRegistry::with_tools(None, None, None, None, None);
+        let before = reg.specs().len();
+        assert!(before > 1, "expected several tools, got {before}");
+        let def = subagent::AgentDefinition {
+            name: "focused".into(),
+            description: "only read_file".into(),
+            tools: Some(vec!["read_file".into()]),
+            prompt: "You only use read_file.".into(),
+        };
+        let config = AgentConfig {
+            model: "test".into(),
+            max_steps: 3,
+            prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::harness::PromptState {
+                    system_prompt: "base prompt".into(),
+                    skills: vec![],
+                    fingerprint: None,
+                },
+            )),
+            max_inline_skills: 0,
+            sync_dir: None,
+            max_context_messages: 0,
+            max_context_tokens: 0,
+            goals: None,
+            goals_dir: None,
+            planning_interval: 0,
+        };
+        let parent_arc = config.prompt_state.clone();
+
+        let out = DelegateTool::apply_subagent_type(&config, &mut reg, &def);
+
+        // Prompt suffix appended to a deep copy.
+        let out_prompt = out.prompt_state.read().unwrap().system_prompt.clone();
+        assert_eq!(out_prompt, "base prompt\n\nYou only use read_file.");
+        // Parent prompt state untouched (deep copy, shared Arc intact).
+        assert_eq!(parent_arc.read().unwrap().system_prompt, "base prompt");
+        // Tool allowlist applied: only read_file remains.
+        let names: Vec<String> = reg.specs().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["read_file"], "all other tools dropped");
     }
 }

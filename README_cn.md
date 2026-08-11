@@ -23,19 +23,21 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 53** — 子任务 resume + delegate 注册表持久化：子代理
-> 状态落盘为 `~/.sigil/delegates/<id>/meta.json`（或 `--delegates-dir`），
-> 启动时从磁盘恢复——子代理跨进程存活；`delegate` 工具新增
-> `action=resume`——用新指令延续已结束/失败的子代理，把原任务 + 最终
-> 报告作为上下文回喂（OpenHands partial-result 模式），并记录血缘
-> （list 显示 "resumed from <id>"）。此前：Phase 52 scope 策略（有
-> local 层时 improve_harness 默认 scope=local）、Phase 51 双轨本身
-> （--local-harness-dir 合并视图 + scope 参数）、Phase 50 Lua 沙箱
-> 加固、Phase 49 结构化运行结果（RunResult + provide_final_answer）、
-> Phase 48 外部调研落地（并行工具执行、反应式压缩重试、规划检查点、
-> 子 agent 报告模板）+ 48r daemon 死锁修复、Phase 47 CLI 一致性、
-> Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI + goal turn 预算、
-> Phase 44 daemon、Phase 43 异步委托、Phase 42 持久目标、Phase 41
+> 状态：**Phase 54** — 子 agent 类型化（OpenHands AgentDefinition
+> 模式）：子代理类型 = Markdown 文件 + TOML frontmatter（`description`
+> + 可选 `tools` 白名单），文件 body 作为系统提示词**后缀**追加到父
+> prompt 的深拷贝上（共享 Arc 永不改动）；类型从 `<harness-dir>/agents/`
+> （项目级）与 `~/.sigil/agents/`（用户级兜底）发现，`delegate spawn`
+> 支持 `subagent_type`——白名单外的工具全部剔除，工具描述动态列出
+> 可用类型。此前：Phase 53 子任务 resume + delegate 注册表持久化、
+> Phase 52 scope 策略（有 local 层时 improve_harness 默认 scope=local）、
+> Phase 51 双轨本身（--local-harness-dir 合并视图 + scope 参数）、
+> Phase 50 Lua 沙箱加固、Phase 49 结构化运行结果（RunResult +
+> provide_final_answer）、Phase 48 外部调研落地（并行工具执行、反应式
+> 压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
+> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
+> ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
+> Phase 42 持久目标、Phase 41
 > 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
 > 跨实例知识同步。管道模式、
@@ -254,6 +256,22 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 54 — 2026-08-11（子 agent 类型化：AgentDefinition 模式）
+- 新增 `src/tools/subagent.rs`：子代理类型 = Markdown 文件 + 可选
+  TOML frontmatter（`description`、可选 `tools` 白名单；用 TOML 替代
+  OpenHands 的 YAML——零新依赖）；文件 body 即系统提示词后缀。
+- 类型从 `<harness-dir>/agents/`（项目级，优先级高）与
+  `~/.sigil/agents/`（用户级兜底）发现；同目录 first-wins，
+  README.md 跳过。
+- `delegate spawn` 支持 `subagent_type`：body 追加到父 prompt 状态的
+  **深拷贝**上（共享 Arc 永不改动），白名单外的工具从子代理注册表
+  剔除。未知类型报错并列出可用类型；`resume` 同样支持。
+- delegate 工具描述动态列出可用类型（OpenHands get_factory_info
+  模式）：名字、用途、各类型的工具白名单。
+- 8 个新测试：frontmatter 解析（含缺失/畸形/空列表）、项目覆盖用户、
+  README 跳过、未知类型报错、应用逻辑（prompt 后缀、父不受污染、
+  工具过滤）。
 
 ### Phase 53 — 2026-08-11（子任务 resume + delegate 注册表持久化）
 - 子代理状态落盘为 `~/.sigil/delegates/<id>/meta.json`（或

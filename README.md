@@ -25,17 +25,18 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 53** — sub-agent resume + delegate registry
-> persistence: delegate state is now persisted as
-> `~/.sigil/delegates/<id>/meta.json` (or `--delegates-dir`) and
-> recovered on startup, so sub-agents survive process restarts; the
-> `delegate` tool gains `action=resume` — continuing a
-> finished/failed sub-agent with a new instruction, feeding the
-> original task + its final report back as context (the OpenHands
-> partial-result pattern) and recording the lineage (list shows
-> "resumed from <id>"). Previous: Phase 52 scope strategy (local
-> harness layer → improve_harness defaults to scope=local), Phase 51
-> the dual-track itself (--local-harness-dir merged view + scope
+> Status: **Phase 54** — sub-agent typing (the OpenHands
+> AgentDefinition pattern): a sub-agent type is a Markdown file with a
+> TOML frontmatter (`description` + optional `tools` allowlist) whose
+> body becomes a system-prompt **suffix** appended to a deep copy of
+> the parent's prompt (the shared Arc is never mutated); types are
+> discovered from `<harness-dir>/agents/` (project) then
+> `~/.sigil/agents/` (user fallback), and `delegate spawn` takes
+> `subagent_type` — the type's tool allowlist is enforced by dropping
+> every tool outside it, and the tool description lists the available
+> types dynamically. Previous: Phase 53 sub-agent resume + delegate
+> registry persistence, Phase 52 scope strategy, Phase 51 the
+> dual-track itself (--local-harness-dir merged view + scope
 > parameter), Phase 50 Lua sandbox hardening, Phase 49 structured run
 > results (RunResult + provide_final_answer), Phase 48 parallel tools +
 > reactive compaction + planning checkpoints + delegate report
@@ -284,6 +285,27 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 54 — 2026-08-11 (sub-agent typing: AgentDefinition pattern)
+- New `src/tools/subagent.rs`: a sub-agent type is a Markdown file
+  with an optional TOML frontmatter (`description`, optional `tools`
+  allowlist; TOML instead of OpenHands' YAML — no new dependency);
+  the body becomes the system-prompt suffix.
+- Types are discovered from `<harness-dir>/agents/` (project, higher
+  priority) then `~/.sigil/agents/` (user fallback); within a
+  directory first-wins by name, README.md is skipped.
+- `delegate spawn` takes `subagent_type`: the body is appended to a
+  **deep copy** of the parent's prompt state (the shared Arc is never
+  mutated), and tools outside the type's allowlist are dropped from
+  the sub-agent's registry. Unknown types error with the available
+  list; `resume` accepts it too.
+- The delegate tool description dynamically lists the available
+  types (the OpenHands get_factory_info pattern): name, description
+  and per-type tool allowlist.
+- 8 new tests: frontmatter parsing (+ missing/malformed/empty-list
+  cases), project-over-user shadowing, README skip, unknown-type
+  error, and the apply logic (prompt suffix, parent untouched, tool
+  filtering).
 
 ### Phase 53 — 2026-08-11 (sub-agent resume + delegate registry persistence)
 - Delegate state is persisted as `~/.sigil/delegates/<id>/meta.json`

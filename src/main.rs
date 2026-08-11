@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(tools::delegate::default_delegates_dir),
         ),
+        cli.harness_dir.as_deref().map(std::path::PathBuf::from),
     )));
 
     if cli.list_sessions {

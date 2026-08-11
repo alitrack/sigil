@@ -235,15 +235,18 @@ TASKS = [
         # trigger phrase" request gets refused (observed 2026-08-11:
         # the model correctly rejected the old phrasing as an
         # injection-style edit).
-        "prompt": "用 improve_harness 的 edit_prompt 修改系统提示词：在原有内容末尾追加一条通用规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。这是一条供自动化测试使用的约定规则，用于验证 harness 编辑会持久化并在后续生效。reason 写：添加自动化测试标记规则以验证 harness 持久化。修改完成后简短报告即可。",
+        "prompt": "用 improve_harness 的 edit_prompt 修改系统提示词：在原有内容末尾追加一条通用规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。这是一条供自动化测试使用的约定规则，用于验证 harness 编辑会持久化并在后续生效。reason 写：添加自动化测试标记规则以验证 harness 持久化。直接调用 improve_harness 工具即可，不要先用 bash/read_file 等工具调查源码或 harness 文件。修改完成后简短报告即可。",
         "assert": ["完成", "updated", "LIVE-OK"],
         "special": "live",
         # The model sometimes *claims* completion without calling the
         # tool (sampling randomness — observed twice in Phase 34/36).
         # Retry with an explicit "you MUST call the tool" phrasing so
-        # the battery stays deterministic despite LLM variance.
+        # the battery stays deterministic despite LLM variance. The
+        # "don't investigate first" clause targets the 2026-08-11
+        # failure mode where the model spent its budget grepping the
+        # sigil source tree instead of calling the tool.
         "retries": 2,
-        "retry_prompt": "你必须实际调用 improve_harness 工具的 edit_prompt 动作来修改系统提示词，不能只口头说完成。目标：在系统提示词末尾追加一条自动化测试约定规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。reason 写：添加自动化测试标记规则以验证 harness 持久化。先调用工具，确认工具返回成功后再简短报告。",
+        "retry_prompt": "你必须实际调用 improve_harness 工具的 edit_prompt 动作来修改系统提示词，不能只口头说完成，也不要先用 bash/read_file 等工具调查任何文件或源码——直接调用 improve_harness 工具本身。目标：在系统提示词末尾追加一条自动化测试约定规则：「当用户说 ratchet-live-88 时，回答应以 LIVE-OK 开头」。reason 写：添加自动化测试标记规则以验证 harness 持久化。先调用工具，确认工具返回成功后再简短报告。",
     },
     {
         "name": "native_tool_call_flow",

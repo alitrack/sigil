@@ -23,6 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 65** — `delegate` 阻塞批量（OpenHands `delegate` 语义）：
+> `action=delegate` 传 `tasks` 数组并发 spawn 所有子代理并阻塞等全部完成，
+> 一次调用返回聚合结果（可选 `timeout`，默认 600s；未完成者如实报告而非
+> 报错）。
+>
 > 状态：**Phase 64** — daemon 多会话（herdr pane 模型）：一个 daemon
 > 并行承载多个会话；`sigil send --session foo` 首次使用时开新会话并持续
 > 追加；`{"type":"session","action":"list"|"new"}` 列出/新建会话。每会话
@@ -281,6 +286,20 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 65 — 2026-08-11（delegate 阻塞批量——OpenHands delegate）
+- 新增 `delegate` action（OpenHands 阻塞 `delegate` 语义）：传 `tasks` 数组
+  `[{task, name?, subagent_type?, model?}, ...]`，工具并发 spawn 所有子代理
+  （每个跑在独立 tokio 任务里，真正并行）并阻塞等全部完成，一次调用返回聚合
+  结果：`- d00001 [completed] math-agent (2 steps) (… tokens) — <final_answer>`。
+- 可选 `timeout`（秒，默认 600）：超时未完成者报告为 `[running]` 而非报错——
+  后台任务继续跑，稍后可用 `action=result` 收集；父代理的 turn 永不被挂死的
+  子代理卡住（优于 OpenHands 的无界 join）。
+- 每个 task 可单独覆盖 `name`（≤64 字符、trim，与 spawn 一致）、`subagent_type`、
+  `model`（rlm.find_models 式按子任务选模型）。
+- 测试 167 → 169（全完成聚合 + 超时部分返回）。E2E：模型一次 `delegate` 调用
+  派发两个任务并报告两个回答（1+1=2 / 北京）；两个子代理均落盘 Completed，
+  各自 name/steps/tokens 齐全。
 
 ### Phase 64 — 2026-08-11（daemon 多会话——herdr pane 模型）
 - daemon 现在并行承载多个会话（herdr 术语 pane）：`DaemonState` 从单一消息

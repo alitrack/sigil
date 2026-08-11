@@ -605,6 +605,80 @@ fn spawn_name(args: &serde_json::Value) -> anyhow::Result<Option<String>> {
     Ok(Some(trimmed.to_string()))
 }
 
+/// Blocking batch collect (OpenHands `delegate` semantics): poll the
+/// given sub-agent ids until every one has left `Running` or the
+/// timeout elapses, then format the aggregated results. Still-running
+/// sub-agents are reported as such (their background tasks keep going
+/// — poll with `action=result` later), so the parent's turn is never
+/// stuck forever on a hung sub-agent.
+async fn wait_for_delegates(
+    delegates: &DelegateRegistry,
+    ids: &[String],
+    timeout_secs: u64,
+) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let states = delegates.snapshot().await;
+        let all_done = ids.iter().all(|id| {
+            states
+                .iter()
+                .any(|s| &s.id == id && s.status != DelegateStatus::Running)
+        });
+        if all_done || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let states = delegates.snapshot().await;
+    let mut text = format!("delegate batch ({} tasks):", ids.len());
+    for id in ids {
+        let Some(st) = states.iter().find(|s| &s.id == id) else {
+            text.push_str(&format!("\n- {id} [missing]"));
+            continue;
+        };
+        let steps = st
+            .steps
+            .map(|n| format!(" ({n} steps)"))
+            .unwrap_or_default();
+        let tokens = st
+            .tokens
+            .map(|t| {
+                format!(
+                    " ({} prompt + {} completion tokens)",
+                    t.prompt_tokens, t.completion_tokens
+                )
+            })
+            .unwrap_or_default();
+        match &st.status {
+            DelegateStatus::Completed => {
+                let report = st
+                    .result
+                    .as_deref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default();
+                text.push_str(&format!(
+                    "\n- {id} [completed] {}{}{}{}",
+                    st.name, steps, tokens, report
+                ));
+            }
+            DelegateStatus::Failed => {
+                text.push_str(&format!(
+                    "\n- {id} [failed] {} — {}",
+                    st.name,
+                    st.error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+            DelegateStatus::Running => {
+                text.push_str(&format!(
+                    "\n- {id} [running] {} — still running after {timeout_secs}s (spawned {}); poll action=result later",
+                    st.name, st.started_ts
+                ));
+            }
+        }
+    }
+    Ok(text)
+}
+
 #[async_trait]
 impl Tool for DelegateTool {
     fn name(&self) -> &'static str {
@@ -621,7 +695,11 @@ impl Tool for DelegateTool {
                 "Delegate a self-contained sub-task to a fresh sub-agent. \
                  Actions: 'spawn' (default — start a sub-agent and return its \
                  handle immediately; it keeps running in the background while \
-                 you work; optional 'name' ≤64 chars, trimmed, non-empty), 'status' (id — running/completed/failed), 'result' \
+                 you work; optional 'name' ≤64 chars, trimmed, non-empty), 'delegate' \
+                 (tasks: [{task, name?, subagent_type?, model?}, ...] — spawn the \
+                 whole batch concurrently and block until every sub-agent \
+                 finishes, returning aggregated results in one call; optional \
+                 'timeout' seconds, default 600), 'status' (id — running/completed/failed), 'result' \
                  (id — the sub-agent's final summary once completed), 'resume' \
                  (id + task — continue a finished/failed sub-agent with a new \
                  instruction: its original task and final report are fed back \
@@ -661,12 +739,29 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "status", "result", "resume", "list", "delete", "send"],
-                    "description": "spawn (default): start a sub-agent; status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record; send: queue a message to a running sub-agent (it reads it via check_parent_messages)"
+                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "delete", "send"],
+                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record; send: queue a message to a running sub-agent (it reads it via check_parent_messages)"
                 },
                 "task": {
                     "type": "string",
                     "description": "the task for the sub-agent (required for spawn and resume)"
+                },
+                "tasks": {
+                    "type": "array",
+                    "description": "batch of sub-agent tasks for action=delegate: [{task, name?, subagent_type?, model?}, ...] — spawned concurrently and collected together",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string"},
+                            "name": {"type": "string"},
+                            "subagent_type": {"type": "string"},
+                            "model": {"type": "string"}
+                        }
+                    }
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "seconds to wait for action=delegate's batch (default 600; on timeout still-running sub-agents are reported as such)"
                 },
                 "subagent_type": {
                     "type": "string",
@@ -713,6 +808,49 @@ impl Tool for DelegateTool {
                         "delegate '{id}' spawned (status: running). Keep working; poll with action=status, collect with action=result."
                     ),
                 })
+            }
+            "delegate" => {
+                // OpenHands-style blocking batch: spawn every task
+                // concurrently (each sub-agent runs in its own tokio
+                // task) and wait for them all to finish, returning the
+                // aggregated results. `timeout` (seconds, default 600)
+                // bounds the wait — on timeout the still-running ones
+                // are reported as such instead of erroring.
+                let tasks = args
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .context("delegate requires a 'tasks' array of {task, ...} objects")?;
+                if tasks.is_empty() {
+                    anyhow::bail!("delegate 'tasks' must not be empty");
+                }
+                let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(600);
+                let mut ids = Vec::new();
+                for t in tasks {
+                    let task = t
+                        .get("task")
+                        .and_then(Value::as_str)
+                        .context("each delegate task needs a 'task' string")?
+                        .to_string();
+                    let name = t
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .filter(|n| n.chars().count() <= 64);
+                    let id = self
+                        .spawn_subagent(
+                            task,
+                            name,
+                            None,
+                            t.get("subagent_type").and_then(Value::as_str),
+                            t.get("model").and_then(Value::as_str),
+                            Vec::new(),
+                        )
+                        .await?;
+                    ids.push(id);
+                }
+                let text = wait_for_delegates(&self.delegates, &ids, timeout).await?;
+                Ok(ToolOutput { text })
             }
             "resume" => {
                 let id = args
@@ -907,7 +1045,7 @@ impl Tool for DelegateTool {
                 })
             }
             _ => anyhow::bail!(
-                "unknown action '{action}' (spawn|status|result|resume|list|delete|send)"
+                "unknown action '{action}' (spawn|delegate|status|result|resume|list|delete|send)"
             ),
         }
     }
@@ -960,7 +1098,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "spawn", "status", "result", "resume", "list", "delete", "send"
+                "spawn", "delegate", "status", "result", "resume", "list", "delete", "send"
             ]
         );
     }
@@ -1049,6 +1187,90 @@ mod tests {
         );
         assert!(snap.iter().all(|s| s.status == DelegateStatus::Completed));
         assert!(snap.iter().all(|s| s.result.is_some()));
+    }
+
+    #[tokio::test]
+    async fn wait_for_delegates_returns_aggregate_when_all_done() {
+        let reg = DelegateRegistry::default();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = format!("d{i:05}");
+            reg.insert(DelegateState {
+                id: id.clone(),
+                name: format!("task-{i}"),
+                status: DelegateStatus::Completed,
+                started_ts: "t".into(),
+                finished_ts: Some("t1".into()),
+                result: Some(format!("answer-{i}")),
+                error: None,
+                task: format!("task-{i}"),
+                resume_from: None,
+                steps: Some(1),
+                model: None,
+                messages: Vec::new(),
+                inbox: Vec::new(),
+                tokens: None,
+            })
+            .await;
+            ids.push(id);
+        }
+        let text = wait_for_delegates(&reg, &ids, 2).await.unwrap();
+        assert!(text.contains("delegate batch (2 tasks)"), "got: {text}");
+        assert!(
+            text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("d00001 [completed] task-1 (1 steps) — answer-1"),
+            "got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_delegates_reports_still_running_after_timeout() {
+        let reg = DelegateRegistry::default();
+        let mut ids = Vec::new();
+        // One finishes, one stays Running forever.
+        for i in 0..2 {
+            let id = format!("d{i:05}");
+            reg.insert(DelegateState {
+                id: id.clone(),
+                name: format!("task-{i}"),
+                status: if i == 0 {
+                    DelegateStatus::Completed
+                } else {
+                    DelegateStatus::Running
+                },
+                started_ts: "t".into(),
+                finished_ts: if i == 0 { Some("t1".into()) } else { None },
+                result: if i == 0 {
+                    Some("answer-0".into())
+                } else {
+                    None
+                },
+                error: None,
+                task: format!("task-{i}"),
+                resume_from: None,
+                steps: if i == 0 { Some(1) } else { None },
+                model: None,
+                messages: Vec::new(),
+                inbox: Vec::new(),
+                tokens: None,
+            })
+            .await;
+            ids.push(id);
+        }
+        // 1s timeout: must return promptly with the partial aggregate,
+        // not hang.
+        let text = wait_for_delegates(&reg, &ids, 1).await.unwrap();
+        assert!(
+            text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("d00001 [running] task-1 — still running after 1s"),
+            "got: {text}"
+        );
     }
 
     #[tokio::test]

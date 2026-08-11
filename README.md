@@ -25,6 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 65** — `delegate` blocking batch (OpenHands
+> `delegate` semantics): `action=delegate` with a `tasks` array spawns
+> every sub-agent concurrently and blocks until they finish, returning
+> aggregated results in one call (optional `timeout`, default 600s;
+> still-running ones are reported, not errored).
+>
 > Status: **Phase 64** — daemon multi-session (herdr's pane model):
 > one daemon hosts parallel sessions; `sigil send --session foo`
 > opens a fresh session on first use and keeps appending to it;
@@ -317,6 +323,25 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 65 — 2026-08-11 (delegate blocking batch — OpenHands delegate)
+- New `delegate` action (OpenHands' blocking `delegate` semantics): pass
+  a `tasks` array `[{task, name?, subagent_type?, model?}, ...]` and the
+  tool spawns every sub-agent concurrently (each runs in its own tokio
+  task, so the batch is truly parallel) and blocks until all of them
+  finish, returning aggregated results in one call:
+  `- d00001 [completed] math-agent (2 steps) (… tokens) — <final_answer>`.
+- Optional `timeout` (seconds, default 600): on expiry still-running
+  sub-agents are reported as `[running]` instead of erroring — their
+  background tasks keep going and can be collected later with
+  `action=result`, so the parent's turn is never stuck on a hung
+  sub-agent (improvement over OpenHands' unbounded join).
+- Each task may override `name` (≤64 chars, trimmed, mirrors spawn),
+  `subagent_type`, and `model` per sub-task (rlm.find_models-style).
+- Tests 167 → 169 (aggregate-when-all-done + partial-after-timeout).
+  E2E: the model delegated two tasks in one `delegate` call and
+  reported both answers (1+1=2 / Beijing); both delegates landed
+  `Completed` with their own name, steps and token usage on disk.
 
 ### Phase 64 — 2026-08-11 (daemon multi-session — herdr pane model)
 - The daemon now hosts parallel sessions ("panes" in herdr terms):

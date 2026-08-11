@@ -25,6 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 69** — nesting depth cap (prime-agent
+> `RLM_MAX_DEPTH`, default 1): each `DelegateTool` instance carries a
+> `depth` (0 = top level); a sub-agent's tool registry gets a depth+1
+> copy in place of the shared parent instance, so a delegated
+> sub-agent's spawn/delegate/resume are refused ("nesting depth limit
+> (1) reached"). E2E: the sub-agent tried to delegate twice, got
+> rejected both times, and verified via `delegate list` that no
+> grandchild was created.
+>
 > Status: **Phase 68** — per-agent condenser (OpenHands
 > `definition.condenser`): `spawn` and each `delegate` batch task
 > accept `max_context_messages` / `max_context_tokens` overrides that
@@ -347,6 +356,23 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 69 — 2026-08-11 (nesting depth cap — prime-agent RLM_MAX_DEPTH)
+- prime-agent's `RLM_MAX_DEPTH` defaults to 1: a top-level agent may
+  delegate, but a delegated sub-agent cannot delegate again. sigil
+  previously had no nesting limit — a sub-agent's tool registry
+  shared the parent's `DelegateTool` instance, so delegation could
+  nest arbitrarily deep.
+- Now each `DelegateTool` carries a `depth` (0 = top level). A
+  sub-agent's registry gets a `depth + 1` copy (`with_depth`) in
+  place of the shared instance; spawn/delegate/resume refuse once
+  `depth >= MAX_SUBAGENT_DEPTH` (`check_depth`, "nesting depth limit
+  (1) reached"). Read-only actions (status/result/list/metrics/
+  delete/send) stay available at any depth.
+- Tests 173 → 174 (depth-0 spawn passes; depth-1 spawn/delegate/
+  resume all refused). E2E: a sub-agent tried to delegate twice, got
+  rejected both times, and verified via `delegate list` that no
+  grandchild was created.
 
 ### Phase 68 — 2026-08-11 (per-agent condenser — OpenHands definition.condenser)
 - `spawn` and every `delegate` batch task now accept optional

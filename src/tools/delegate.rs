@@ -385,6 +385,9 @@ pub struct DelegateTool {
     delegates: Arc<DelegateRegistry>,
     agents: Arc<subagent::AgentRegistry>,
     description: std::sync::OnceLock<String>,
+    /// Nesting depth of this tool instance (0 = top-level agent; a
+    /// depth-1 sub-agent's delegate tool is refused further nesting).
+    depth: u32,
 }
 
 impl DelegateTool {
@@ -402,7 +405,37 @@ impl DelegateTool {
             delegates: Arc::new(DelegateRegistry::new(delegates_dir)),
             agents: Arc::new(subagent::AgentRegistry::new(harness_dir.as_deref())),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         }
+    }
+
+    /// A copy of this tool at another nesting depth — installed into a
+    /// sub-agent's tool registry in place of the shared parent
+    /// instance, so a delegated sub-agent's delegate calls are
+    /// governed by `depth + 1` (and refused once `MAX_SUBAGENT_DEPTH`
+    /// is reached).
+    fn with_depth(&self, depth: u32) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            registry: self.registry.clone_shallow(),
+            config: self.config.clone(),
+            delegates: self.delegates.clone(),
+            agents: self.agents.clone(),
+            description: std::sync::OnceLock::new(),
+            depth,
+        }
+    }
+
+    /// Refuse to delegate when this instance sits at (or beyond) the
+    /// nesting limit.
+    fn check_depth(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.depth < MAX_SUBAGENT_DEPTH,
+            "sub-agent nesting depth limit ({MAX_SUBAGENT_DEPTH}) reached: \
+             a depth-{} sub-agent cannot delegate further",
+            self.depth
+        );
+        Ok(())
     }
 }
 
@@ -460,6 +493,11 @@ impl DelegateTool {
         max_context_tokens: Option<usize>,
     ) -> anyhow::Result<String> {
         let mut sub_tools = self.registry.clone_shallow();
+        // Nesting depth: the sub-agent's delegate tool is a depth+1
+        // copy of this instance (a delegated sub-agent can then not
+        // delegate again, per prime-agent's RLM_MAX_DEPTH default).
+        sub_tools.unregister("delegate");
+        sub_tools.register(std::sync::Arc::new(self.with_depth(self.depth + 1)));
         let mut config = if let Some(ty) = subagent_type {
             let def = self.agents.resolve(ty).ok_or_else(|| {
                 let avail = self
@@ -598,10 +636,16 @@ impl DelegateTool {
 
 /// How many sub-agents may run at once (OpenHands' `max_children`,
 /// hard-capped at 5). A spawn or delegate batch that would exceed the
-/// cap is rejected up front so a runaway delegation can't exhaust the
-/// parent's runtime. Finished (completed/failed) sub-agents don't
-/// count against the cap.
+/// cap is rejected up front so a runaway delegation can't exhaust
+/// resources.
 const MAX_ACTIVE_SUBAGENTS: usize = 5;
+
+/// How deep sub-agent nesting may go (prime-agent's `RLM_MAX_DEPTH`,
+/// default 1): a sub-agent delegated by the top-level agent may use
+/// tools, but a delegated sub-agent cannot delegate again. Each
+/// `DelegateTool` instance carries its own depth (0 = top level);
+/// spawn/delegate/resume refuse to go deeper.
+const MAX_SUBAGENT_DEPTH: u32 = 1;
 
 /// Validate and normalize the optional `name` arg of `delegate spawn`
 /// (mirrors prime-agent's `normalizeRequestedRlmSubagentSessionName`:
@@ -728,7 +772,9 @@ impl Tool for DelegateTool {
                  (all sub-agents), 'delete' (id — remove a finished \
                  sub-agent's record and free its handle), 'metrics' \
                  (per-sub-agent token usage with a grand total). At most 5 sub-agents \
-                 may run at once (a spawn or batch beyond the cap is rejected). Use for parallel \
+                 may run at once (a spawn or batch beyond the cap is rejected); \
+                 sub-agent nesting is capped at depth 1 (a delegated sub-agent \
+                 cannot delegate further). Use for parallel \
                  exploration, research, or \
                  long independent subtasks; the result is a text summary, not \
                  the full transcript. Poll with action=status then collect \
@@ -821,6 +867,7 @@ impl Tool for DelegateTool {
 
         match action {
             "spawn" => {
+                self.check_depth()?;
                 let task = args
                     .get("task")
                     .and_then(Value::as_str)
@@ -861,6 +908,7 @@ impl Tool for DelegateTool {
                 })
             }
             "delegate" => {
+                self.check_depth()?;
                 // OpenHands-style blocking batch: spawn every task
                 // concurrently (each sub-agent runs in its own tokio
                 // task) and wait for them all to finish, returning the
@@ -931,6 +979,7 @@ impl Tool for DelegateTool {
                 Ok(ToolOutput { text })
             }
             "resume" => {
+                self.check_depth()?;
                 let id = args
                     .get("id")
                     .and_then(Value::as_str)
@@ -1210,6 +1259,7 @@ mod tests {
             delegates: Arc::new(DelegateRegistry::default()),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
         assert_eq!(tool.name(), "delegate");
         let p = tool.parameters();
@@ -1546,6 +1596,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
 
         // Empty (after trim) and >64-char names are rejected — the
@@ -1670,6 +1721,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
         let out = tool.run(&json!({"action": "list"})).await.unwrap();
         assert!(
@@ -1788,6 +1840,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
         let out = tool.run(&json!({"action": "metrics"})).await.unwrap();
         assert!(
@@ -1878,6 +1931,7 @@ mod tests {
             delegates: reg,
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         }
     }
 
@@ -1944,6 +1998,48 @@ mod tests {
         assert!(
             out2.is_ok(),
             "batch with per-task condenser overrides must pass: {out2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nesting_depth_blocks_sub_sub_agents() {
+        // prime-agent RLM_MAX_DEPTH semantics: a top-level (depth 0)
+        // tool may spawn, but a depth-1 instance (what a sub-agent
+        // holds) must refuse spawn/delegate/resume.
+        let reg = Arc::new(DelegateRegistry::default());
+        let tool = test_tool(reg.clone());
+        // Depth 0: spawn is allowed (fails later on the dead provider,
+        // but the depth check passes).
+        let out = tool
+            .run(&json!({"action": "spawn", "task": "top-level ok"}))
+            .await;
+        assert!(out.is_ok(), "depth-0 spawn must pass: {out:?}");
+        // Depth 1: every delegating action is refused up front.
+        let deep = tool.with_depth(1);
+        let err = deep
+            .run(&json!({"action": "spawn", "task": "nested"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("nesting depth limit (1) reached"),
+            "spawn depth message: {err}"
+        );
+        let tasks = json!([{"task": "t1"}, {"task": "t2"}]);
+        let err2 = deep
+            .run(&json!({"action": "delegate", "tasks": tasks}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err2}").contains("nesting depth limit (1) reached"),
+            "delegate depth message: {err2}"
+        );
+        let err3 = deep
+            .run(&json!({"action": "resume", "id": "d00001", "task": "continue"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err3}").contains("nesting depth limit (1) reached"),
+            "resume depth message: {err3}"
         );
     }
 
@@ -2065,6 +2161,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
         let out = tool
             .run(&json!({
@@ -2156,6 +2253,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
         let out = tool
             .run(&json!({"action": "send", "id": "d00001", "text": "watch out"}))
@@ -2288,6 +2386,7 @@ mod tests {
             delegates: reg.clone(),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
 
         let out = tool
@@ -2420,6 +2519,7 @@ mod tests {
             delegates: Arc::new(DelegateRegistry::default()),
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
+            depth: 0,
         };
 
         // Unknown id → clear error.

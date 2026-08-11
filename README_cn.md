@@ -23,6 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 70** — 旁路提问（prime-agent `side-question.ts`）：daemon 帧
+> `{"type":"side_question","text":...,"id":...}` 基于会话上下文的克隆回答，
+> **无工具**、单轮预算，流式 `side_delta` + 回 `side_answer`——会话历史不受
+> 任何影响。E2E：daemon 正确回答关于自身对话的旁路问题，磁盘会话只保留主
+> 会话轮次。
+>
 > 状态：**Phase 69** — 嵌套深度上限（prime-agent `RLM_MAX_DEPTH`，默认 1）：
 > 每个 `DelegateTool` 实例带 `depth`（0 = 顶层）；子代理的工具注册表拿到的是
 > depth+1 副本（替换共享父实例），因此被委托的子代理的 spawn/delegate/resume
@@ -309,6 +315,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 70 — 2026-08-11（旁路提问——prime-agent side-question.ts）
+- daemon 帧 `{"type":"side_question","text":...,"id":...}`：基于当前会话消息的
+  克隆回答用户问题，**不进会话**——无工具（`ToolRegistry::default()`）、单轮
+  预算（`max_steps: 1`），流式 `side_delta`、回 `side_answer`（回显 `id`）。
+  内存与磁盘会话文件都不写入。
+- 与常规 turn 串行（等进行中的 turn 完成——sigil daemon 是单运行时模型；
+  prime-agent 的 side question 是并行流式）。
+- E2E：一个主 turn（「中国的首都是哪里？」）后，旁路问题（「刚才这个会话里
+  我问了什么？」）被正确回答，而会话文件只保留两条主会话轮次。
 
 ### Phase 69 — 2026-08-11（嵌套深度上限——prime-agent RLM_MAX_DEPTH）
 - prime-agent 的 `RLM_MAX_DEPTH` 默认为 1：顶层 agent 可以委托，但被委托的

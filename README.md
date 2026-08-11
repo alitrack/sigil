@@ -25,6 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 70** — side questions (prime-agent
+> `side-question.ts`): a daemon frame `{"type":"side_question",
+> "text":..., "id":...}` answers against a clone of the session
+> context with NO tools and a single-turn budget, streaming
+> `side_delta` and replying `side_answer` — the session history is
+> untouched. E2E: the daemon answered a side question about its own
+> conversation while the on-disk session kept only the main turns.
+>
 > Status: **Phase 69** — nesting depth cap (prime-agent
 > `RLM_MAX_DEPTH`, default 1): each `DelegateTool` instance carries a
 > `depth` (0 = top level); a sub-agent's tool registry gets a depth+1
@@ -356,6 +364,21 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 70 — 2026-08-11 (side questions — prime-agent side-question.ts)
+- A daemon frame `{"type":"side_question","text":...,"id":...}` lets
+  the user ask the agent a question against the current conversation
+  WITHOUT touching the session: the answer is computed from a clone
+  of the session messages, with NO tools (`ToolRegistry::default()`)
+  and a single-turn budget (`max_steps: 1`), streamed as
+  `side_delta` and returned as `side_answer` (echoing `id`).
+  Memory and the on-disk session file are never written.
+- Serial like a regular turn (waits for any in-flight turn — the
+  sigil daemon model is single-runtime; prime-agent streams side
+  questions in parallel).
+- E2E: after one main turn ("中国的首都是哪里？"), a side question
+  ("刚才这个会话里我问了什么？") was answered correctly while the
+  session file kept exactly the two main turns.
 
 ### Phase 69 — 2026-08-11 (nesting depth cap — prime-agent RLM_MAX_DEPTH)
 - prime-agent's `RLM_MAX_DEPTH` defaults to 1: a top-level agent may

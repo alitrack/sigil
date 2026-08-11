@@ -343,6 +343,66 @@ async fn handle_connection(
                     }
                 }
             }
+            Some("side_question") => {
+                // prime-agent's side-question pattern: the user can ask
+                // the agent a question against the current conversation
+                // context WITHOUT adding anything to the session. The
+                // answer is computed from a clone of the session
+                // messages with NO tools and a single-turn budget, then
+                // reported via a `side_answer` frame — the session
+                // history (memory + on-disk) is untouched. Serial like
+                // a regular turn (waits for any in-flight turn).
+                let text = v["text"].as_str().unwrap_or("").to_string();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let (session_id, session) =
+                    resolve_session(state, sessions_dir, v["session"].as_str()).await?;
+                eprintln!(
+                    "  [daemon] side question (session {}): {:?}",
+                    truncate_log(&session_id, 24),
+                    truncate_log(&text, 40)
+                );
+                let _guard = state.loop_lock.lock().await;
+                let mut sq_msgs = vec![ChatMessage::system(config.system_prompt_for(&text))];
+                {
+                    let messages = session.messages.lock().await;
+                    sq_msgs.extend(messages.clone());
+                }
+                sq_msgs.push(ChatMessage::user(text.clone()));
+                let mut no_tools = ToolRegistry::default();
+                let side_config = AgentConfig {
+                    max_steps: 1,
+                    ..config.clone()
+                };
+                let tx2 = tx.clone();
+                let stream_cb = move |delta: Option<&str>| {
+                    if let Some(d) = delta {
+                        let _ = tx2.send(format!("{}\n", json!({"type": "side_delta", "text": d})));
+                    }
+                };
+                let answer = match run_messages(
+                    provider.as_ref(),
+                    &mut no_tools,
+                    &side_config,
+                    &sq_msgs,
+                    None,
+                    Some(&stream_cb),
+                )
+                .await
+                {
+                    Ok(r) => r.output,
+                    Err(e) => format!("side question failed: {e:#}"),
+                };
+                let _ = tx.send(format!(
+                    "{}\n",
+                    json!({
+                        "type": "side_answer",
+                        "id": v["id"].as_str().unwrap_or(""),
+                        "text": answer,
+                    })
+                ));
+            }
             _ => {}
         }
     }

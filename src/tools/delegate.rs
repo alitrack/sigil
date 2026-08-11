@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{AgentConfig, run_turn};
-use crate::llm::provider::LlmProvider;
+use crate::agent::{AgentConfig, run_messages};
+use crate::llm::provider::{ChatMessage, LlmProvider};
 use crate::tools::subagent;
 use crate::tools::{Tool, ToolOutput, ToolRegistry};
 
@@ -56,6 +56,10 @@ pub struct DelegateState {
     pub task: String,
     /// Handle id this sub-agent was resumed from, if any (lineage).
     pub resume_from: Option<String>,
+    /// Number of agent steps the sub-agent took, once finished.
+    /// (Absent for legacy states written before this field existed.)
+    #[serde(default)]
+    pub steps: Option<usize>,
 }
 
 impl DelegateState {
@@ -263,6 +267,7 @@ impl DelegateTool {
                 error: None,
                 task: task.clone(),
                 resume_from,
+                steps: None,
             })
             .await;
 
@@ -283,14 +288,29 @@ impl DelegateTool {
             // Sub-agents run their own loop, no approver
             // (non-interactive: the gate's default rejection
             // stands). The result lands in the registry.
-            let outcome = run_turn(provider.as_ref(), &mut sub_tools, &config, &task).await;
+            // Use run_messages (not run_turn) so the run metadata —
+            // the step count — is recorded too.
+            let messages = vec![
+                ChatMessage::system(config.system_prompt_for(&task)),
+                ChatMessage::user(task.clone()),
+            ];
+            let outcome = run_messages(
+                provider.as_ref(),
+                &mut sub_tools,
+                &config,
+                &messages,
+                None,
+                None,
+            )
+            .await;
             match outcome {
-                Ok(answer) => {
+                Ok(res) => {
                     delegates
                         .update(&spawn_id, |st| {
                             st.status = DelegateStatus::Completed;
                             st.finished_ts = Some(crate::session::chrono_like_timestamp());
-                            st.result = Some(answer);
+                            st.result = Some(res.output);
+                            st.steps = Some(res.steps as usize);
                         })
                         .await;
                 }
@@ -521,15 +541,20 @@ impl Tool for DelegateTool {
                 }
                 let mut text = String::from("sub-agents:");
                 for st in states.iter() {
+                    let steps = st
+                        .steps
+                        .map(|n| format!(" ({n} steps)"))
+                        .unwrap_or_default();
                     text.push_str(&format!(
-                        "\n- {} [{}] — {}{}",
+                        "\n- {} [{}] — {}{}{}",
                         st.id,
                         st.status.as_str(),
                         st.name,
                         st.resume_from
                             .as_deref()
                             .map(|r| format!(" (resumed from {r})"))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        steps
                     ));
                 }
                 Ok(ToolOutput { text })
@@ -599,6 +624,7 @@ mod tests {
             error: None,
             task: "first task".into(),
             resume_from: None,
+            steps: None,
         })
         .await;
         let snap = reg.snapshot().await;
@@ -635,6 +661,7 @@ mod tests {
                     error: None,
                     task: format!("task-{i}"),
                     resume_from: None,
+                    steps: None,
                 })
                 .await;
                 // Simulate the sub-agent finishing right away.
@@ -678,6 +705,7 @@ mod tests {
             error: None,
             task: "some task".into(),
             resume_from: None,
+            steps: None,
         })
         .await;
         reg.update("d00001", |st| {
@@ -699,6 +727,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steps_survive_persistence_and_legacy_files_default() {
+        // Steps recorded on completion are written to meta.json...
+        let dir = std::env::temp_dir().join(format!("sigil-delegate-steps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = DelegateRegistry::new(Some(dir.clone()));
+        reg.insert(DelegateState {
+            id: "d00001".into(),
+            name: "steppy".into(),
+            status: DelegateStatus::Running,
+            started_ts: "t0".into(),
+            finished_ts: None,
+            result: None,
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: None,
+        })
+        .await;
+        reg.update("d00001", |st| {
+            st.status = DelegateStatus::Completed;
+            st.result = Some("done".into());
+            st.steps = Some(7);
+        })
+        .await;
+        let back: DelegateState = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("d00001").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.steps, Some(7), "steps persisted to meta.json");
+
+        // ...and a legacy meta.json without the field still loads
+        // (serde default → None), so old delegate dirs keep working.
+        std::fs::write(
+            dir.join("d00001").join("meta.json"),
+            serde_json::to_string(&json!({
+                "id": "d00001",
+                "name": "legacy",
+                "status": "Completed",
+                "started_ts": "t0",
+                "finished_ts": null,
+                "result": "old",
+                "error": null,
+                "task": "task",
+                "resume_from": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let legacy: DelegateState = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("d00001").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.steps, None,
+            "legacy meta.json without steps loads fine"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_shows_step_counts_when_present() {
+        let reg = Arc::new(DelegateRegistry::default());
+        reg.insert(DelegateState {
+            id: "d00001".into(),
+            name: "with steps".into(),
+            status: DelegateStatus::Completed,
+            started_ts: "t0".into(),
+            finished_ts: Some("t1".into()),
+            result: Some("done".into()),
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: Some(7),
+        })
+        .await;
+        reg.insert(DelegateState {
+            id: "d00002".into(),
+            name: "no steps".into(),
+            status: DelegateStatus::Running,
+            started_ts: "t0".into(),
+            finished_ts: None,
+            result: None,
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: None,
+        })
+        .await;
+        let tool = DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg.clone(),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        };
+        let out = tool.run(&json!({"action": "list"})).await.unwrap();
+        assert!(
+            out.text.contains("(7 steps)"),
+            "completed sub-agent shows step count: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("no steps") || !out.text.contains("(0 steps)"),
+            "running sub-agent without steps shows no count"
+        );
+        assert!(!out.text.contains("(0 steps)"), "no '0 steps' shown");
+    }
+
+    #[tokio::test]
     async fn registry_recovers_from_disk_and_reindexes_next() {
         let dir =
             std::env::temp_dir().join(format!("sigil-delegate-recover-{}", std::process::id()));
@@ -715,6 +880,7 @@ mod tests {
                 error: None,
                 task: "old task".into(),
                 resume_from: None,
+                steps: None,
             })
             .await;
         }
@@ -788,6 +954,7 @@ mod tests {
             error: None,
             task: "task".into(),
             resume_from: None,
+            steps: None,
         })
         .await;
         let tool = DelegateTool {

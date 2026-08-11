@@ -25,22 +25,21 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 55** — refinement audit ids + merged history (the
-> prime-agent `mergeRefinementHistory` pattern): every `refinements.jsonl`
-> event now carries a stable id — `action:FNV-1a(content fingerprint)`,
-> deliberately scope-independent so the same improvement keeps one id
-> when it moves local → global; `sigil refinements` prints the audit
-> log and `--merged` merges the session-local history in, deduping by
-> id with local entries winning (legacy id-less lines get a
-> content-derived fallback id). Previous: Phase 54 sub-agent typing
-> (AgentDefinition pattern), Phase 53 sub-agent resume + delegate
-> registry persistence, Phase 52 scope strategy, Phase 51 the
-> dual-track itself (--local-harness-dir merged view + scope
-> parameter), Phase 50 Lua sandbox hardening, Phase 49 structured run
-> results (RunResult + provide_final_answer), Phase 48 parallel tools +
-> reactive compaction + planning checkpoints + delegate report
-> templates, 48r daemon deadlock fix, Phase 47 CLI consistency, Phase
-> 46 daemon UX, Phase 45 ratchet in CI.
+> Status: **Phase 56** — sub-agent step visibility (a first slice of
+> metrics): the delegate registry now records how many agent steps each
+> sub-agent took (`steps` in meta.json — `#[serde(default)]`, so legacy
+> delegate dirs keep loading) and `delegate list` shows it as
+> `(N steps)`; sub-agents run via `run_messages` so the RunResult
+> metadata is captured. Previous: Phase 55 refinement audit ids +
+> merged history (the prime-agent `mergeRefinementHistory` pattern),
+> Phase 54 sub-agent typing (AgentDefinition pattern), Phase 53
+> sub-agent resume + delegate registry persistence, Phase 52 scope
+> strategy, Phase 51 the dual-track itself (--local-harness-dir merged
+> view + scope parameter), Phase 50 Lua sandbox hardening, Phase 49
+> structured run results (RunResult + provide_final_answer), Phase 48
+> parallel tools + reactive compaction + planning checkpoints +
+> delegate report templates, 48r daemon deadlock fix, Phase 47 CLI
+> consistency, Phase 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -284,6 +283,19 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 56 — 2026-08-11 (sub-agent step visibility)
+- The delegate registry records how many agent steps each sub-agent
+  took: `DelegateState.steps: Option<usize>` with `#[serde(default)]`
+  so legacy `meta.json` files (written before this field) keep
+  loading.
+- Sub-agents now run through `run_messages` (instead of `run_turn`)
+  so the RunResult metadata — the step count — is captured and
+  written to the registry on completion; `delegate list` shows it as
+  `(N steps)` for finished sub-agents. A first slice of the metrics
+  backlog.
+- 2 new tests: steps survive persistence + legacy files default to
+  None; list shows step counts only when present.
 
 ### Phase 55 — 2026-08-11 (refinement audit ids + merged history)
 - Every `refinements.jsonl` event now carries a stable id:

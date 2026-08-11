@@ -23,21 +23,21 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 55** — refine 审计 id + 合并历史（prime-agent
-> `mergeRefinementHistory` 模式）：refinements.jsonl 每条事件带稳定 id
-> ——`action:FNV-1a(内容指纹)`，刻意不含 scope——同一改进从 local 提升到
-> global 时保持同一 id；`sigil refinements` 打印审计日志，`--merged`
-> 合并会话局部历史、按 id 去重、local 胜出（无 id 的历史行用内容派生
-> 的兜底 id 保持独立）。此前：Phase 54 子 agent 类型化（AgentDefinition
-> 模式）、Phase 53 子任务 resume + delegate 注册表持久化、Phase 52
-> scope 策略（有 local 层时 improve_harness 默认 scope=local）、
-> Phase 51 双轨本身（--local-harness-dir 合并视图 + scope 参数）、
-> Phase 50 Lua 沙箱加固、Phase 49 结构化运行结果（RunResult +
-> provide_final_answer）、Phase 48 外部调研落地（并行工具执行、反应式
-> 压缩重试、规划检查点、子 agent 报告模板）+ 48r daemon 死锁修复、
-> Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、Phase 45
-> ratchet 进 CI + goal turn 预算、Phase 44 daemon、Phase 43 异步委托、
-> Phase 42 持久目标、Phase 41
+> 状态：**Phase 56** — 子代理步数可见性（metrics 的第一片）：delegate
+> 注册表现在记录每个子代理消耗的 agent 步数（meta.json 的 `steps` 字段，
+> `#[serde(default)]` 兼容旧 delegate 目录），`delegate list` 显示
+> `(N steps)`；子代理改走 `run_messages` 以捕获 RunResult 元数据。
+> 此前：Phase 55 refine 审计 id + 合并历史（prime-agent
+> `mergeRefinementHistory` 模式）、Phase 54 子 agent 类型化
+> （AgentDefinition 模式）、Phase 53 子任务 resume + delegate 注册表
+> 持久化、Phase 52 scope 策略（有 local 层时 improve_harness 默认
+> scope=local）、Phase 51 双轨本身（--local-harness-dir 合并视图 +
+> scope 参数）、Phase 50 Lua 沙箱加固、Phase 49 结构化运行结果
+> （RunResult + provide_final_answer）、Phase 48 外部调研落地（并行
+> 工具执行、反应式压缩重试、规划检查点、子 agent 报告模板）+ 48r
+> daemon 死锁修复、Phase 47 CLI 一致性、Phase 46 daemon 体验打磨、
+> Phase 45 ratchet 进 CI + goal turn 预算、Phase 44 daemon、
+> Phase 43 异步委托、Phase 42 持久目标、Phase 41
 > 改进门控 + token 预算压缩、Phase 39
 > 记忆写安全、Phase 38 LLM 故障转移、Phase 36 会话续接与 Phase 35
 > 跨实例知识同步。管道模式、
@@ -256,6 +256,14 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 56 — 2026-08-11（子代理步数可见性）
+- delegate 注册表记录每个子代理消耗的步数：`DelegateState.steps:
+  Option<usize>`（`#[serde(default)]`，旧 meta.json 无此字段也能加载）。
+- 子代理改走 `run_messages`（不再用 `run_turn`）以捕获 RunResult
+  元数据——完成后把步数写入注册表；`delegate list` 对已完成的子代理
+  显示 `(N steps)`。metrics 积压项的第一片。
+- 2 个新测试：steps 持久化 + 旧文件默认 None；list 仅在有时显示步数。
 
 ### Phase 55 — 2026-08-11（refine 审计 id + 合并历史）
 - refinements.jsonl 每条事件带稳定 id：`action:FNV-1a(内容指纹)`

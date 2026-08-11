@@ -25,6 +25,11 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 63** — `delegate spawn` accepts an optional `name`
+> (rlm `session_name` validation: trimmed, non-empty, ≤64 chars —
+> mirrors `normalizeRequestedRlmSubagentSessionName`), recorded on the
+> handle and preserved across `resume`.
+>
 > Status: **Phase 62** — compaction driven by real token usage:
 > `compact_messages_with_budget` now takes the most recent LLM call's
 > real `prompt_tokens` (prime-agent uses actual `usage.totalTokens`
@@ -306,6 +311,19 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 63 — 2026-08-11 (delegate spawn name validation)
+- `delegate spawn` gained an optional `name` argument (rlm
+  `session_name` semantics, mirroring prime-agent's
+  `normalizeRequestedRlmSubagentSessionName`): must be a string,
+  trimmed, non-empty, at most 64 characters. The trimmed value is
+  recorded on the handle and preserved across `resume` (the
+  continuation keeps the original name instead of regenerating it
+  from the new task).
+- Default name stays the first 40 chars of the task.
+- Tests 164 → 165: reject empty/65-char names, trim + record, name
+  survives resume. E2E: model passes `name` from the description and
+  it lands in meta.json.
 
 ### Phase 62 — 2026-08-11 (compaction driven by real token usage)
 - `compact_messages_with_budget` gained a `recent_prompt_tokens`

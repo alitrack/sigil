@@ -23,6 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 63** — `delegate spawn` 接受可选 `name` 参数（rlm
+> `session_name` 校验：trim、非空、≤64 字符——镜像
+> `normalizeRequestedRlmSubagentSessionName`），记录在 handle 上并在
+> `resume` 时保留。
+>
 > 状态：**Phase 62** — 压缩由真实 token 用量驱动：
 > `compact_messages_with_budget` 现在接收最近一次 LLM 调用的真实
 > `prompt_tokens`（prime-agent 用实际 `usage.totalTokens` 而非 chars/4
@@ -271,6 +276,15 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 63 — 2026-08-11（delegate spawn name 校验）
+- `delegate spawn` 新增可选 `name` 参数（rlm `session_name` 语义，镜像
+  prime-agent 的 `normalizeRequestedRlmSubagentSessionName`）：必须是字符串、
+  trim 后非空、≤64 字符。trim 后的值记录在 handle 上，`resume` 时保留
+  （续轮沿用原名，不再按新 task 重生成）。
+- 默认名仍为 task 前 40 字符。
+- 测试 164 → 165：拒绝空名/65 字符名、trim + 落盘、name 跨 resume 保留。
+  E2E：模型按 description 传 `name` 并落盘 meta.json。
 
 ### Phase 62 — 2026-08-11（压缩由真实 token 用量驱动）
 - `compact_messages_with_budget` 新增 `recent_prompt_tokens` 参数：最近一次

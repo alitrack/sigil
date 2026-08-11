@@ -448,6 +448,7 @@ impl DelegateTool {
     async fn spawn_subagent(
         &self,
         task: String,
+        name: Option<String>,
         resume_from: Option<String>,
         subagent_type: Option<&str>,
         model: Option<&str>,
@@ -475,7 +476,10 @@ impl DelegateTool {
         if let Some(m) = model {
             config.model = m.to_string();
         }
-        let name = task.chars().take(40).collect::<String>();
+        let name = match name {
+            Some(n) => n,
+            None => task.chars().take(40).collect::<String>(),
+        };
         let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
         let ts = crate::session::chrono_like_timestamp();
         // The sub-agent can message its parent while running (rlm
@@ -578,6 +582,29 @@ impl DelegateTool {
     }
 }
 
+/// Validate and normalize the optional `name` arg of `delegate spawn`
+/// (mirrors prime-agent's `normalizeRequestedRlmSubagentSessionName`:
+/// trim, non-empty, at most 64 chars). `None` keeps the default name
+/// (first 40 chars of the task).
+fn spawn_name(args: &serde_json::Value) -> anyhow::Result<Option<String>> {
+    let Some(v) = args.get("name") else {
+        return Ok(None);
+    };
+    let raw = v
+        .as_str()
+        .context("delegate spawn 'name' must be a string")?;
+    let trimmed = raw.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty(),
+        "delegate spawn 'name' must not be empty"
+    );
+    anyhow::ensure!(
+        trimmed.chars().count() <= 64,
+        "delegate spawn 'name' must be at most 64 characters"
+    );
+    Ok(Some(trimmed.to_string()))
+}
+
 #[async_trait]
 impl Tool for DelegateTool {
     fn name(&self) -> &'static str {
@@ -594,7 +621,7 @@ impl Tool for DelegateTool {
                 "Delegate a self-contained sub-task to a fresh sub-agent. \
                  Actions: 'spawn' (default — start a sub-agent and return its \
                  handle immediately; it keeps running in the background while \
-                 you work), 'status' (id — running/completed/failed), 'result' \
+                 you work; optional 'name' ≤64 chars, trimmed, non-empty), 'status' (id — running/completed/failed), 'result' \
                  (id — the sub-agent's final summary once completed), 'resume' \
                  (id + task — continue a finished/failed sub-agent with a new \
                  instruction: its original task and final report are fed back \
@@ -674,6 +701,7 @@ impl Tool for DelegateTool {
                 let id = self
                     .spawn_subagent(
                         task,
+                        spawn_name(args)?,
                         None,
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
@@ -723,6 +751,7 @@ impl Tool for DelegateTool {
                 let new_id = self
                     .spawn_subagent(
                         task,
+                        Some(st.name.clone()),
                         Some(st.id.clone()),
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
@@ -1136,6 +1165,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_bad_names_and_keeps_good_one() {
+        let reg = Arc::new(DelegateRegistry::default());
+        let tool = DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg.clone(),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        };
+
+        // Empty (after trim) and >64-char names are rejected — the
+        // rlm normalizeRequestedRlmSubagentSessionName semantics.
+        let err = tool
+            .run(&json!({"action": "spawn", "task": "t", "name": "   "}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"));
+        let long = "x".repeat(65);
+        let err = tool
+            .run(&json!({"action": "spawn", "task": "t", "name": long}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be at most 64 characters"));
+
+        // A valid name is trimmed and recorded on the handle.
+        let ok = tool
+            .run(&json!({"action": "spawn", "task": "t", "name": "  my sub-agent  "}))
+            .await
+            .unwrap();
+        let id = ok
+            .text
+            .split('\'')
+            .nth(1)
+            .expect("spawn output carries the handle id")
+            .to_string();
+        let snap = tool.delegates.snapshot().await;
+        let st = snap.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(st.name, "my sub-agent");
+
+        // Resume keeps the original name on the continuation handle.
+        // The spawned background task hits a dead provider port, so
+        // mark the handle completed before resuming.
+        reg.update(&id, |st| st.status = DelegateStatus::Completed)
+            .await;
+        let resume = tool
+            .run(&json!({"action": "resume", "id": id, "task": "continue"}))
+            .await
+            .unwrap();
+        let new_id = resume
+            .text
+            .split('\'')
+            .nth(1)
+            .expect("resume output carries the new handle id")
+            .to_string();
+        let snap = tool.delegates.snapshot().await;
+        let st = snap.iter().find(|s| s.id == new_id).unwrap();
+        assert_eq!(st.name, "my sub-agent", "name survives resume");
     }
 
     #[tokio::test]

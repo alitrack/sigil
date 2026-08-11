@@ -23,6 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 67** — max_children 上限（OpenHands=5）：同时最多 5 个子代理
+> 在跑——`delegate spawn` 与 `delegate` 批量都在前置检查上限（running 占用
+> 额度，finished 释放额度；超限批量被拒并提示「拆小批」）。E2E：模型先试
+> 6 任务批量被拒，重新规划为 3 任务批量。
+>
 > 状态：**Phase 66** — `delegate` metrics（OpenHands `usage_to_metrics`
 > 视图）：`action=metrics` 列出每个子代理自己的 prompt/completion 用量与
 > 总计——委托账单一眼尽览（用量在完成时记录一次，替换而非合并，resume 永不
@@ -292,6 +297,18 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 67 — 2026-08-11（max_children 上限——OpenHands=5）
+- 同时最多 5 个子代理在跑（`MAX_ACTIVE_SUBAGENTS`，镜像 OpenHands
+  `max_children`）。`delegate spawn` 与阻塞 `delegate` 批量都在前置检查上限：
+  running 子代理占用额度，finished（completed/failed）释放额度；超限批量在任何
+  spawn 发生前即被拒，并提示「拆小批」。
+- 批量的合并检查：`tasks.len() + 已在跑 <= 5`——无 running 时 3 任务批量可行，
+  但已有 3 个子代理在跑时被拒。
+- 测试 170 → 172（spawn 上限含 completed 释放额度；批量上限含 running 占用
+  额度）。E2E：模型先试 6 任务批量被拒（`delegate batch has 6 tasks but at
+  most 5 sub-agents may run at once; split into smaller batches`），重新规划
+  为 3 任务批量并全部正确完成。
 
 ### Phase 66 — 2026-08-11（delegate metrics + loopback 代理修复）
 - 新增 `delegate` `action=metrics`（OpenHands `usage_to_metrics` 视图）：

@@ -582,6 +582,13 @@ impl DelegateTool {
     }
 }
 
+/// How many sub-agents may run at once (OpenHands' `max_children`,
+/// hard-capped at 5). A spawn or delegate batch that would exceed the
+/// cap is rejected up front so a runaway delegation can't exhaust the
+/// parent's runtime. Finished (completed/failed) sub-agents don't
+/// count against the cap.
+const MAX_ACTIVE_SUBAGENTS: usize = 5;
+
 /// Validate and normalize the optional `name` arg of `delegate spawn`
 /// (mirrors prime-agent's `normalizeRequestedRlmSubagentSessionName`:
 /// trim, non-empty, at most 64 chars). `None` keeps the default name
@@ -706,7 +713,8 @@ impl Tool for DelegateTool {
                  as context, and a fresh handle is returned), 'list' \
                  (all sub-agents), 'delete' (id — remove a finished \
                  sub-agent's record and free its handle), 'metrics' \
-                 (per-sub-agent token usage with a grand total). Use for parallel \
+                 (per-sub-agent token usage with a grand total). At most 5 sub-agents \
+                 may run at once (a spawn or batch beyond the cap is rejected). Use for parallel \
                  exploration, research, or \
                  long independent subtasks; the result is a text summary, not \
                  the full transcript. Poll with action=status then collect \
@@ -794,6 +802,18 @@ impl Tool for DelegateTool {
                     .and_then(Value::as_str)
                     .context("delegate spawn requires a 'task' string")?
                     .to_string();
+                let active = self
+                    .delegates
+                    .snapshot()
+                    .await
+                    .iter()
+                    .filter(|s| s.status == DelegateStatus::Running)
+                    .count();
+                anyhow::ensure!(
+                    active < MAX_ACTIVE_SUBAGENTS,
+                    "at most {MAX_ACTIVE_SUBAGENTS} sub-agents may run at once \
+                     ({active} running now); collect or delete finished ones first"
+                );
                 let id = self
                     .spawn_subagent(
                         task,
@@ -824,6 +844,27 @@ impl Tool for DelegateTool {
                 if tasks.is_empty() {
                     anyhow::bail!("delegate 'tasks' must not be empty");
                 }
+                if tasks.len() > MAX_ACTIVE_SUBAGENTS {
+                    anyhow::bail!(
+                        "delegate batch has {} tasks but at most {MAX_ACTIVE_SUBAGENTS} \
+                         sub-agents may run at once; split into smaller batches",
+                        tasks.len()
+                    );
+                }
+                let active = self
+                    .delegates
+                    .snapshot()
+                    .await
+                    .iter()
+                    .filter(|s| s.status == DelegateStatus::Running)
+                    .count();
+                anyhow::ensure!(
+                    tasks.len() + active <= MAX_ACTIVE_SUBAGENTS,
+                    "delegate batch would run {} sub-agents but at most {MAX_ACTIVE_SUBAGENTS} \
+                     may be active at once ({active} already running); collect or delete \
+                     finished ones first",
+                    tasks.len() + active
+                );
                 let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(600);
                 let mut ids = Vec::new();
                 for t in tasks {
@@ -1733,6 +1774,142 @@ mod tests {
             !out.text.contains("d00003"),
             "running sub-agent excluded: {}",
             out.text
+        );
+    }
+
+    /// Insert `n` sub-agents with the given status into `reg`. Uses a
+    /// "seed-" id namespace so it can never collide with the spawn
+    /// id generator's dNNNNN handles.
+    async fn seed_states(reg: &DelegateRegistry, n: usize, status: DelegateStatus) {
+        for i in 0..n {
+            reg.insert(DelegateState {
+                id: format!("seed-{i}"),
+                name: format!("agent-{i}"),
+                status,
+                started_ts: "t0".into(),
+                finished_ts: None,
+                result: None,
+                error: None,
+                task: format!("task-{i}"),
+                resume_from: None,
+                steps: None,
+                model: None,
+                messages: Vec::new(),
+                inbox: Vec::new(),
+                tokens: None,
+            })
+            .await;
+        }
+    }
+
+    fn test_tool(reg: Arc<DelegateRegistry>) -> DelegateTool {
+        DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg,
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_when_max_active_reached() {
+        // Five running sub-agents: the cap is hit, a sixth spawn fails.
+        let reg = Arc::new(DelegateRegistry::default());
+        seed_states(&reg, 5, DelegateStatus::Running).await;
+        let tool = test_tool(reg.clone());
+        let err = tool
+            .run(&json!({"action": "spawn", "task": "one more"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("at most 5 sub-agents"),
+            "cap message: {err}"
+        );
+        // A completed sub-agent frees a slot: 4 running + 1 completed
+        // lets the next spawn through (it fails later on the dead
+        // provider, but the cap check itself passes).
+        let reg2 = Arc::new(DelegateRegistry::default());
+        seed_states(&reg2, 4, DelegateStatus::Running).await;
+        seed_states(&reg2, 1, DelegateStatus::Completed).await;
+        let tool2 = test_tool(reg2.clone());
+        let out = tool2
+            .run(&json!({"action": "spawn", "task": "allowed"}))
+            .await;
+        assert!(
+            out.is_ok(),
+            "spawn with a free slot must pass the cap check: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_rejects_when_over_max() {
+        let reg = Arc::new(DelegateRegistry::default());
+        let tool = test_tool(reg.clone());
+        let tasks: Vec<serde_json::Value> = (0..6)
+            .map(|i| json!({"task": format!("task-{i}")}))
+            .collect();
+        let err = tool
+            .run(&json!({"action": "delegate", "tasks": tasks}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("at most 5 sub-agents"),
+            "batch cap message: {err}"
+        );
+        // Already-running sub-agents eat into the batch budget: 3
+        // running + a 3-task batch is fine, but 3 running + 4 tasks is
+        // rejected even though 4 <= 5.
+        let reg2 = Arc::new(DelegateRegistry::default());
+        seed_states(&reg2, 3, DelegateStatus::Running).await;
+        let tool2 = test_tool(reg2.clone());
+        let ok_tasks: Vec<serde_json::Value> = (0..2)
+            .map(|i| json!({"task": format!("task-{i}")}))
+            .collect();
+        let out = tool2
+            .run(&json!({"action": "delegate", "tasks": ok_tasks}))
+            .await;
+        assert!(
+            out.is_ok(),
+            "3 running + 2-task batch is within cap: {out:?}"
+        );
+        let big_tasks: Vec<serde_json::Value> = (0..3)
+            .map(|i| json!({"task": format!("task-{i}")}))
+            .collect();
+        let err2 = tool2
+            .run(&json!({"action": "delegate", "tasks": big_tasks}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err2}").contains("at most 5"),
+            "running + batch combined cap: {err2}"
         );
     }
 

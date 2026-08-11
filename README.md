@@ -25,6 +25,13 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 67** — max_children cap (OpenHands=5): at most 5
+> sub-agents may run at once — `delegate spawn` and the `delegate`
+> batch both check the cap up front (running sub-agents eat into the
+> budget; finished ones free it; batches over the cap are rejected
+> with a "split into smaller batches" hint). E2E: the model tried a
+> 6-task batch, got rejected, and re-planned into a 3-task batch.
+>
 > Status: **Phase 66** — `delegate` metrics (OpenHands
 > `usage_to_metrics` view): `action=metrics` lists every sub-agent's
 > own prompt/completion usage plus a grand total — the whole
@@ -332,6 +339,22 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 67 — 2026-08-11 (max_children cap — OpenHands=5)
+- At most 5 sub-agents may run at once (`MAX_ACTIVE_SUBAGENTS`, mirrors
+  OpenHands' `max_children`). Both `delegate spawn` and the blocking
+  `delegate` batch check the cap up front: running sub-agents eat into
+  the budget, finished (completed/failed) ones free it, and a batch
+  that would exceed the cap is rejected with a "split into smaller
+  batches" hint before anything spawns.
+- Combined check for batches: `tasks.len() + already-running <= 5`, so
+  a 3-task batch is fine with nothing running but rejected when 3
+  sub-agents are already active.
+- Tests 170 → 172 (spawn cap incl. completed-frees-slot; batch cap
+  incl. running-eats-budget). E2E: the model tried a 6-task batch, got
+  `delegate batch has 6 tasks but at most 5 sub-agents may run at
+  once; split into smaller batches`, and re-planned into a 3-task
+  batch that completed with correct answers.
 
 ### Phase 66 — 2026-08-11 (delegate metrics + loopback proxy fix)
 - New `delegate` `action=metrics` (OpenHands' `usage_to_metrics`

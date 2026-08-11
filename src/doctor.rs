@@ -295,6 +295,9 @@ fn fail_check(checks: &mut Vec<Check>, fail: &mut usize, name: &str, detail: Str
 async fn probe_endpoint(url: &str, api_key: &str) -> Result<Option<usize>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
+        // Same as the LLM client: never let an http_proxy env var
+        // hijack loopback probes.
+        .no_proxy()
         .build()?;
     let mut req = client.get(url);
     if !api_key.is_empty() {

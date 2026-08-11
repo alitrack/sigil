@@ -25,6 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 66** — `delegate` metrics (OpenHands
+> `usage_to_metrics` view): `action=metrics` lists every sub-agent's
+> own prompt/completion usage plus a grand total — the whole
+> delegation bill at a glance (usage is recorded once on completion,
+> replace not merge, so resumes never double-count). Also: reqwest
+> clients now set `no_proxy()` — an `http_proxy` env var was
+> hijacking loopback endpoints (502s broke local LLM endpoints and
+> the fallback tests).
+>
 > Status: **Phase 65** — `delegate` blocking batch (OpenHands
 > `delegate` semantics): `action=delegate` with a `tasks` array spawns
 > every sub-agent concurrently and blocks until they finish, returning
@@ -323,6 +332,24 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 66 — 2026-08-11 (delegate metrics + loopback proxy fix)
+- New `delegate` `action=metrics` (OpenHands' `usage_to_metrics`
+  view): one line per sub-agent with its own prompt/completion usage
+  plus a grand total, so the parent sees the whole delegation bill at
+  a glance. Usage is recorded once on completion (replace, never
+  merged) — resumed handles never double-count. Running sub-agents
+  with no usage yet are skipped, not miscounted.
+- Fixed a real bug the new tests surfaced: the reqwest clients (LLM
+  provider and `sigil doctor` probe) now set `no_proxy()`. With an
+  `http_proxy` env var set, loopback requests to local endpoints were
+  being routed through the proxy, which answered 502 — breaking local
+  LLM endpoints and the endpoint-fallback tests (3 tests flaked
+  exactly this way when the proxy env appeared).
+- Tests 169 → 170 (metrics aggregation, incl. running-sub-agent
+  exclusion). E2E: the model called `action=metrics` and reported the
+  true totals (21,128 prompt = 10560+10568 from the previous E2E's
+  delegates).
 
 ### Phase 65 — 2026-08-11 (delegate blocking batch — OpenHands delegate)
 - New `delegate` action (OpenHands' blocking `delegate` semantics): pass

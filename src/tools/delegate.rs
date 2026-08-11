@@ -705,7 +705,8 @@ impl Tool for DelegateTool {
                  instruction: its original task and final report are fed back \
                  as context, and a fresh handle is returned), 'list' \
                  (all sub-agents), 'delete' (id — remove a finished \
-                 sub-agent's record and free its handle). Use for parallel \
+                 sub-agent's record and free its handle), 'metrics' \
+                 (per-sub-agent token usage with a grand total). Use for parallel \
                  exploration, research, or \
                  long independent subtasks; the result is a text summary, not \
                  the full transcript. Poll with action=status then collect \
@@ -739,8 +740,8 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "delete", "send"],
-                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record; send: queue a message to a running sub-agent (it reads it via check_parent_messages)"
+                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete", "send"],
+                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; metrics: per-sub-agent token usage with a grand total; delete: remove a finished sub-agent's record; send: queue a message to a running sub-agent (it reads it via check_parent_messages)"
                 },
                 "task": {
                     "type": "string",
@@ -1018,6 +1019,42 @@ impl Tool for DelegateTool {
                 }
                 Ok(ToolOutput { text })
             }
+            "metrics" => {
+                // OpenHands usage_to_metrics view, keyed per delegate
+                // id: one line per sub-agent with its own token usage,
+                // plus a grand total so the parent can see the whole
+                // delegation bill at a glance (each sub-agent's usage
+                // is recorded once, on completion — replace, never
+                // merged, so resumed handles don't double-count).
+                let states = self.delegates.snapshot().await;
+                let with_usage: Vec<&DelegateState> =
+                    states.iter().filter(|s| s.tokens.is_some()).collect();
+                if with_usage.is_empty() {
+                    return Ok(ToolOutput {
+                        text: "no sub-agent token usage recorded yet (delegates report usage once they finish)"
+                            .to_string(),
+                    });
+                }
+                let mut total_prompt = 0u64;
+                let mut total_completion = 0u64;
+                let mut text = format!("delegate token usage ({} sub-agents):", with_usage.len());
+                for st in with_usage {
+                    let t = st.tokens.unwrap();
+                    total_prompt += t.prompt_tokens;
+                    total_completion += t.completion_tokens;
+                    text.push_str(&format!(
+                        "\n- {id} {name}: {} prompt + {} completion",
+                        t.prompt_tokens,
+                        t.completion_tokens,
+                        id = st.id,
+                        name = st.name,
+                    ));
+                }
+                text.push_str(&format!(
+                    "\ntotal: {total_prompt} prompt + {total_completion} completion"
+                ));
+                Ok(ToolOutput { text })
+            }
             "delete" => {
                 let id = args
                     .get("id")
@@ -1045,7 +1082,7 @@ impl Tool for DelegateTool {
                 })
             }
             _ => anyhow::bail!(
-                "unknown action '{action}' (spawn|delegate|status|result|resume|list|delete|send)"
+                "unknown action '{action}' (spawn|delegate|status|result|resume|list|metrics|delete|send)"
             ),
         }
     }
@@ -1098,7 +1135,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "spawn", "delegate", "status", "result", "resume", "list", "delete", "send"
+                "spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete",
+                "send"
             ]
         );
     }
@@ -1570,6 +1608,131 @@ mod tests {
         assert!(
             !out.text.contains("no steps") || !out.text.contains("(0 steps)"),
             "running sub-agent without steps shows no count"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_aggregates_token_usage_per_subagent() {
+        let reg = Arc::new(DelegateRegistry::default());
+        reg.insert(DelegateState {
+            id: "d00001".into(),
+            name: "math-agent".into(),
+            status: DelegateStatus::Completed,
+            started_ts: "t0".into(),
+            finished_ts: Some("t1".into()),
+            result: Some("done".into()),
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: Some(2),
+            model: None,
+            messages: Vec::new(),
+            inbox: Vec::new(),
+            tokens: Some(crate::llm::provider::TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 30,
+            }),
+        })
+        .await;
+        reg.insert(DelegateState {
+            id: "d00002".into(),
+            name: "geo-agent".into(),
+            status: DelegateStatus::Completed,
+            started_ts: "t0".into(),
+            finished_ts: Some("t1".into()),
+            result: Some("done".into()),
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: Some(3),
+            model: None,
+            messages: Vec::new(),
+            inbox: Vec::new(),
+            tokens: Some(crate::llm::provider::TokenUsage {
+                prompt_tokens: 200,
+                completion_tokens: 40,
+            }),
+        })
+        .await;
+        // A running sub-agent with no usage yet must not break the total.
+        reg.insert(DelegateState {
+            id: "d00003".into(),
+            name: "slow".into(),
+            status: DelegateStatus::Running,
+            started_ts: "t0".into(),
+            finished_ts: None,
+            result: None,
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: None,
+            model: None,
+            messages: Vec::new(),
+            inbox: Vec::new(),
+            tokens: None,
+        })
+        .await;
+        let tool = DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg.clone(),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        };
+        let out = tool.run(&json!({"action": "metrics"})).await.unwrap();
+        assert!(
+            out.text.contains("delegate token usage (2 sub-agents)"),
+            "only sub-agents with usage counted: {}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("- d00001 math-agent: 100 prompt + 30 completion"),
+            "per-sub-agent line: {}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("- d00002 geo-agent: 200 prompt + 40 completion"),
+            "per-sub-agent line: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("total: 300 prompt + 70 completion"),
+            "grand total sums both sub-agents: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("d00003"),
+            "running sub-agent excluded: {}",
+            out.text
         );
     }
 

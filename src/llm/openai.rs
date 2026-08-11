@@ -72,6 +72,12 @@ impl OpenAiProvider {
     fn build_client() -> anyhow::Result<reqwest::Client> {
         Ok(reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
+            // Never route requests through a proxy from the
+            // environment: sigil's endpoints are local or direct, and
+            // http_proxy would hijack loopback traffic (a proxy
+            // answering 502 to 127.0.0.1 broke local endpoints and
+            // the fallback tests).
+            .no_proxy()
             .build()?)
     }
 

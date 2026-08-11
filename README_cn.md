@@ -23,6 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 66** — `delegate` metrics（OpenHands `usage_to_metrics`
+> 视图）：`action=metrics` 列出每个子代理自己的 prompt/completion 用量与
+> 总计——委托账单一眼尽览（用量在完成时记录一次，替换而非合并，resume 永不
+> 重复计数）。另：reqwest client 现设 `no_proxy()`——`http_proxy` 环境变量
+> 曾劫持 loopback 端点（502 破坏了本地 LLM 端点与 fallback 测试）。
+>
 > 状态：**Phase 65** — `delegate` 阻塞批量（OpenHands `delegate` 语义）：
 > `action=delegate` 传 `tasks` 数组并发 spawn 所有子代理并阻塞等全部完成，
 > 一次调用返回聚合结果（可选 `timeout`，默认 600s；未完成者如实报告而非
@@ -286,6 +292,19 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 66 — 2026-08-11（delegate metrics + loopback 代理修复）
+- 新增 `delegate` `action=metrics`（OpenHands `usage_to_metrics` 视图）：
+  每个子代理一行（自己的 prompt/completion 用量）+ 总计——父代理一眼看清
+  全部委托账单。用量在完成时记录一次（替换而非合并），resume 句柄永不重复
+  计数；无用量记录的 running 子代理跳过而非误计。
+- 修复新测试暴露的真实 bug：reqwest client（LLM provider 与 `sigil doctor`
+  探测）现设 `no_proxy()`。此前设置了 `http_proxy` 环境变量时，到本地端点的
+  loopback 请求被路由进代理、代理回 502——破坏本地 LLM 端点与 fallback 测试
+  （代理环境变量一出现，恰好 3 个测试以这种方式 flake）。
+- 测试 169 → 170（metrics 聚合，含 running 子代理排除）。E2E：模型调用
+  `action=metrics` 报告真实总计（21,128 prompt = 上轮 E2E 两个子代理
+  10560+10568 之和）。
 
 ### Phase 65 — 2026-08-11（delegate 阻塞批量——OpenHands delegate）
 - 新增 `delegate` action（OpenHands 阻塞 `delegate` 语义）：传 `tasks` 数组

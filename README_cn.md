@@ -23,19 +23,19 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 59** — 子→父消息（rlm `agent_message.send` 语义，
-> 最后缺口）：每个子代理工具集注入 `child_message` 工具（在类型
-> allowlist 过滤**之后**注册，任何类型都存活），消息写入
-> `DelegateState.messages`——限最近 50 条、持久化到 meta.json——
-> 父通过 `delegate status` 读取（"messages from sub-agent"）。此前：
-> Phase 58 按子任务选模型（rlm.find_models 最小版）、Phase 57
-> `delegate delete`（rlm registry 语义补全）、Phase 56 子代理步数
-> 可见性（metrics 第一片）、Phase 55 refine 审计 id + 合并历史
-> （prime-agent `mergeRefinementHistory` 模式）、Phase 54
-> 子 agent 类型化（AgentDefinition 模式）、Phase 53 子任务 resume +
-> delegate 注册表持久化、Phase 52 scope 策略、Phase 51 双轨本身
-> （--local-harness-dir 合并视图 + scope 参数）、Phase 50 Lua 沙箱
-> 加固、Phase 49 结构化运行结果（RunResult + provide_final_answer）、
+> 状态：**Phase 60** — 父→子消息（rlm `agent_message.send` 的另一半）：
+> `delegate send` 把消息排入子代理 inbox（限长、持久化到 meta.json），
+> 每个子代理获得 `check_parent_messages` 工具 + 注入的
+> COMMUNICATION RULES 段（提示每步开始先检查）；`resume` 时排队消息
+> 转移到新句柄（transfer_inbox——延续轮继续可见，旧记录不会重复消费）。
+> rlm 的消息语义现已完整覆盖。此前：Phase 59 子→父消息、Phase 58
+> 按子任务选模型（rlm.find_models 最小版）、Phase 57 `delegate delete`
+> （rlm registry 语义补全）、Phase 56 子代理步数可见性（metrics 第一片）、
+> Phase 55 refine 审计 id + 合并历史（prime-agent `mergeRefinementHistory`
+> 模式）、Phase 54 子 agent 类型化（AgentDefinition 模式）、Phase 53
+> 子任务 resume + delegate 注册表持久化、Phase 52 scope 策略、Phase 51
+> 双轨本身（--local-harness-dir 合并视图 + scope 参数）、Phase 50 Lua
+> 沙箱加固、Phase 49 结构化运行结果（RunResult + provide_final_answer）、
 > Phase 48 外部调研落地（并行工具执行、反应式压缩重试、规划检查点、
 > 子 agent 报告模板）+ 48r daemon 死锁修复、Phase 47 CLI 一致性、
 > Phase 46 daemon 体验打磨、Phase 45 ratchet 进 CI + goal turn 预算。
@@ -258,6 +258,16 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 60 — 2026-08-11（父→子消息）
+- `delegate send`（id, text）把消息排入子代理 inbox（`DelegateState.inbox`，
+  限 50 条、持久化到 meta.json）——rlm `agent_message.send` 的另一半。
+- 每个子代理获得 `check_parent_messages` 工具（一次性消费队列、旧的在前）
+  + 任务里注入 COMMUNICATION RULES 段（提示每步开始先检查）。
+- `resume` 把排队消息转移到新句柄（`transfer_inbox`）：延续轮继续看到
+  父消息，旧记录不会重复消费。
+- 2 个新测试：队列/持久化/一次性消费 + send 动作；resume inbox 转移
+  （两个 meta.json 都更新）。
 
 ### Phase 59 — 2026-08-11（子→父消息）
 - 每个子代理工具集注入 `child_message` 工具（rlm `agent_message.send`

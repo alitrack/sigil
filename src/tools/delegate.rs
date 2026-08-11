@@ -445,6 +445,9 @@ impl DelegateTool {
     /// An optional `model` overrides the sub-agent's model (the
     /// rlm.find_models idea: pick a model per sub-task) and is
     /// recorded on the handle.
+    // Internal spawn plumbing — many knobs, all explicit (task, name,
+    // resume, type, model, inbox, per-sub-agent condenser overrides).
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_subagent(
         &self,
         task: String,
@@ -453,6 +456,8 @@ impl DelegateTool {
         subagent_type: Option<&str>,
         model: Option<&str>,
         inbox: Vec<String>,
+        max_context_messages: Option<usize>,
+        max_context_tokens: Option<usize>,
     ) -> anyhow::Result<String> {
         let mut sub_tools = self.registry.clone_shallow();
         let mut config = if let Some(ty) = subagent_type {
@@ -475,6 +480,15 @@ impl DelegateTool {
         };
         if let Some(m) = model {
             config.model = m.to_string();
+        }
+        // Per-sub-agent condenser override (OpenHands
+        // definition.condenser): the sub-agent's context budget can
+        // differ from the parent's global max_context_* settings.
+        if let Some(n) = max_context_messages {
+            config.max_context_messages = n;
+        }
+        if let Some(n) = max_context_tokens {
+            config.max_context_tokens = n;
         }
         let name = match name {
             Some(n) => n,
@@ -757,14 +771,16 @@ impl Tool for DelegateTool {
                 },
                 "tasks": {
                     "type": "array",
-                    "description": "batch of sub-agent tasks for action=delegate: [{task, name?, subagent_type?, model?}, ...] — spawned concurrently and collected together",
+                    "description": "batch of sub-agent tasks for action=delegate: [{task, name?, subagent_type?, model?, max_context_messages?, max_context_tokens?}, ...] — spawned concurrently and collected together",
                     "items": {
                         "type": "object",
                         "properties": {
                             "task": {"type": "string"},
                             "name": {"type": "string"},
                             "subagent_type": {"type": "string"},
-                            "model": {"type": "string"}
+                            "model": {"type": "string"},
+                            "max_context_messages": {"type": "integer"},
+                            "max_context_tokens": {"type": "integer"}
                         }
                     }
                 },
@@ -779,6 +795,14 @@ impl Tool for DelegateTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model override for the sub-agent (rlm.find_models-style per-sub-task model pick; the handle records which model ran)",
+                },
+                "max_context_messages": {
+                    "type": "integer",
+                    "description": "Per-sub-agent condenser override: max messages kept in the sub-agent's context before compaction (OpenHands definition.condenser); defaults to the parent's global setting"
+                },
+                "max_context_tokens": {
+                    "type": "integer",
+                    "description": "Per-sub-agent condenser override: max context tokens for the sub-agent; defaults to the parent's global setting"
                 },
                 "id": {
                     "type": "string",
@@ -822,6 +846,12 @@ impl Tool for DelegateTool {
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
                         Vec::new(),
+                        args.get("max_context_messages")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize),
+                        args.get("max_context_tokens")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize),
                     )
                     .await?;
                 Ok(ToolOutput {
@@ -887,6 +917,12 @@ impl Tool for DelegateTool {
                             t.get("subagent_type").and_then(Value::as_str),
                             t.get("model").and_then(Value::as_str),
                             Vec::new(),
+                            t.get("max_context_messages")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as usize),
+                            t.get("max_context_tokens")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as usize),
                         )
                         .await?;
                     ids.push(id);
@@ -936,6 +972,12 @@ impl Tool for DelegateTool {
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
                         Vec::new(),
+                        args.get("max_context_messages")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize),
+                        args.get("max_context_tokens")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize),
                     )
                     .await?;
                 // The parent's queued messages transfer to the new
@@ -1866,6 +1908,42 @@ mod tests {
         assert!(
             out.is_ok(),
             "spawn with a free slot must pass the cap check: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_accepts_condenser_overrides() {
+        // Per-sub-agent condenser params (max_context_messages /
+        // max_context_tokens) must flow through spawn and the
+        // delegate batch without error. The sub-agent itself fails on
+        // the dead provider, but the cap + parameter plumbing is what
+        // we assert here.
+        let reg = Arc::new(DelegateRegistry::default());
+        let tool = test_tool(reg.clone());
+        let out = tool
+            .run(&json!({
+                "action": "spawn",
+                "task": "condenser test",
+                "max_context_messages": 6,
+                "max_context_tokens": 4000
+            }))
+            .await;
+        assert!(
+            out.is_ok(),
+            "spawn with condenser overrides must pass: {out:?}"
+        );
+        let reg2 = Arc::new(DelegateRegistry::default());
+        let tool2 = test_tool(reg2.clone());
+        let tasks = json!([
+            {"task": "t1", "max_context_messages": 4},
+            {"task": "t2", "max_context_tokens": 2000}
+        ]);
+        let out2 = tool2
+            .run(&json!({"action": "delegate", "tasks": tasks, "timeout": 2}))
+            .await;
+        assert!(
+            out2.is_ok(),
+            "batch with per-task condenser overrides must pass: {out2:?}"
         );
     }
 

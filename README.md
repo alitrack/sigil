@@ -25,6 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 68** — per-agent condenser (OpenHands
+> `definition.condenser`): `spawn` and each `delegate` batch task
+> accept `max_context_messages` / `max_context_tokens` overrides that
+> replace the parent's global context budget for that sub-agent
+> (resume carries them too). E2E: a sub-agent spawned with
+> `max_context_messages: 4` / `max_context_tokens: 3000` completed
+> normally under the tight budget.
+>
 > Status: **Phase 67** — max_children cap (OpenHands=5): at most 5
 > sub-agents may run at once — `delegate spawn` and the `delegate`
 > batch both check the cap up front (running sub-agents eat into the
@@ -339,6 +347,24 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 68 — 2026-08-11 (per-agent condenser — OpenHands definition.condenser)
+- `spawn` and every `delegate` batch task now accept optional
+  `max_context_messages` / `max_context_tokens`: the sub-agent's
+  context budget (the sigil analogue of OpenHands' per-definition
+  `condenser`) overrides the parent's global settings for that
+  sub-agent only; `resume` carries the overrides too.
+- Plumbing: `spawn_subagent` gained the two optional knobs (now 9
+  args — `#[allow(clippy::too_many_arguments)]` on the private
+  function), schema documents them at the top level and inside each
+  task object.
+- Tests 172 → 173 (spawn + batch with condenser overrides pass).
+  E2E: the model spawned a sub-agent with
+  `max_context_messages: 4` / `max_context_tokens: 3000`, polled it,
+  collected the result — answered correctly under the tight budget.
+- This closes the last OpenHands-derived candidate: delegate batch
+  concurrency (P65), per-delegate metrics (P66), max_children (P67),
+  per-agent condenser (P68) are all landed.
 
 ### Phase 67 — 2026-08-11 (max_children cap — OpenHands=5)
 - At most 5 sub-agents may run at once (`MAX_ACTIVE_SUBAGENTS`, mirrors

@@ -23,6 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 68** — per-agent condenser（OpenHands `definition.condenser`）：
+> `spawn` 与 `delegate` 批量的每个 task 接受 `max_context_messages` /
+> `max_context_tokens` 覆盖——该子代理的上下文预算替换父代理全局设置（resume
+> 也携带）。E2E：以 `max_context_messages: 4` / `max_context_tokens: 3000`
+> 派发的子代理在紧预算下正常完成。
+>
 > 状态：**Phase 67** — max_children 上限（OpenHands=5）：同时最多 5 个子代理
 > 在跑——`delegate spawn` 与 `delegate` 批量都在前置检查上限（running 占用
 > 额度，finished 释放额度；超限批量被拒并提示「拆小批」）。E2E：模型先试
@@ -297,6 +303,20 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 68 — 2026-08-11（per-agent condenser——OpenHands definition.condenser）
+- `spawn` 与 `delegate` 批量的每个 task 现在接受可选 `max_context_messages` /
+  `max_context_tokens`：该子代理的上下文预算（OpenHands per-definition
+  `condenser` 的 sigil 对应物）只对该子代理覆盖父代理全局设置；`resume` 也携带
+  覆盖。
+- 管线：`spawn_subagent` 增加两个可选参数（现 9 参数——私有函数加
+  `#[allow(clippy::too_many_arguments)]`），schema 在顶层与每个 task 对象内
+  都说明。
+- 测试 172 → 173（spawn 与批量带 condenser 覆盖均通过）。E2E：模型以
+  `max_context_messages: 4` / `max_context_tokens: 3000` 派发子代理、轮询、
+  收集结果——紧预算下正确回答。
+- 至此 OpenHands 派生候选全部收口：批量并发（P65）、per-delegate metrics
+  （P66）、max_children（P67）、per-agent condenser（P68）全部落地。
 
 ### Phase 67 — 2026-08-11（max_children 上限——OpenHands=5）
 - 同时最多 5 个子代理在跑（`MAX_ACTIVE_SUBAGENTS`，镜像 OpenHands

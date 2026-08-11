@@ -64,6 +64,12 @@ pub struct DelegateState {
     /// (rlm.find_models-style per-sub-task model pick).
     #[serde(default)]
     pub model: Option<String>,
+    /// Messages the sub-agent sent to its parent via `child_message`
+    /// while running (rlm `agent_message.send` semantics); the parent
+    /// reads them with `delegate status`. Bounded to the most recent
+    /// [`MAX_CHILD_MESSAGES`].
+    #[serde(default)]
+    pub messages: Vec<String>,
 }
 
 impl DelegateState {
@@ -185,6 +191,78 @@ impl DelegateRegistry {
         }
         Ok(())
     }
+
+    /// Append a message the sub-agent sent to its parent (via the
+    /// `child_message` tool). Bounded to the most recent
+    /// [`MAX_CHILD_MESSAGES`]; unknown ids are ignored (e.g. the
+    /// record was deleted mid-run).
+    async fn push_message(&self, id: &str, msg: &str) {
+        self.update(id, |st| {
+            st.messages.push(msg.to_string());
+            if st.messages.len() > MAX_CHILD_MESSAGES {
+                let excess = st.messages.len() - MAX_CHILD_MESSAGES;
+                st.messages.drain(..excess);
+            }
+        })
+        .await;
+    }
+}
+
+/// Cap on queued child→parent messages (keeps `delegate status` from
+/// growing without bound when a chatty sub-agent streams updates).
+const MAX_CHILD_MESSAGES: usize = 50;
+
+/// Tool injected into every sub-agent's tool set so it can send
+/// messages to its parent while running (the rlm `agent_message.send`
+/// semantics): the text lands in the delegate's `messages` queue,
+/// which the parent reads via `delegate status`.
+pub struct ChildMessageTool {
+    delegates: Arc<DelegateRegistry>,
+    id: String,
+}
+
+impl ChildMessageTool {
+    pub fn new(delegates: Arc<DelegateRegistry>, id: String) -> Self {
+        Self { delegates, id }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for ChildMessageTool {
+    fn name(&self) -> &str {
+        "child_message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to the parent agent. Only available to sub-agents; \
+         the parent reads your messages with delegate status. Use it for \
+         progress updates, intermediate findings, or anything the parent \
+         should know before you finish."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "the message to send to the parent"
+                }
+            },
+            "required": ["text"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .context("child_message requires a 'text' string")?;
+        self.delegates.push_message(&self.id, text).await;
+        Ok(ToolOutput {
+            text: "message sent to parent".to_string(),
+        })
+    }
 }
 
 /// Tool that delegates a sub-task to a fresh agent turn.
@@ -287,6 +365,13 @@ impl DelegateTool {
         let name = task.chars().take(40).collect::<String>();
         let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
         let ts = crate::session::chrono_like_timestamp();
+        // The sub-agent can message its parent while running (rlm
+        // agent_message.send semantics). Registered after the type's
+        // allowlist filter so it survives every sub-agent type.
+        sub_tools.register(Arc::new(ChildMessageTool::new(
+            self.delegates.clone(),
+            id.clone(),
+        )));
         self.delegates
             .insert(DelegateState {
                 id: id.clone(),
@@ -300,6 +385,7 @@ impl DelegateTool {
                 resume_from,
                 steps: None,
                 model: model.map(|m| m.to_string()),
+                messages: Vec::new(),
             })
             .await;
 
@@ -527,21 +613,26 @@ impl Tool for DelegateTool {
                     .iter()
                     .find(|s| s.id == id)
                     .context("no such delegate id (see action=list)")?;
-                Ok(ToolOutput {
-                    text: match st.status {
-                        DelegateStatus::Running => {
-                            format!("delegate '{id}' is running (spawned {})", st.started_ts)
-                        }
-                        DelegateStatus::Completed => format!(
-                            "delegate '{id}' completed (finished {}). Collect with action=result.",
-                            st.finished_ts.as_deref().unwrap_or("?")
-                        ),
-                        DelegateStatus::Failed => format!(
-                            "delegate '{id}' failed: {}",
-                            st.error.as_deref().unwrap_or("unknown error")
-                        ),
-                    },
-                })
+                let mut text = match st.status {
+                    DelegateStatus::Running => {
+                        format!("delegate '{id}' is running (spawned {})", st.started_ts)
+                    }
+                    DelegateStatus::Completed => format!(
+                        "delegate '{id}' completed (finished {}). Collect with action=result.",
+                        st.finished_ts.as_deref().unwrap_or("?")
+                    ),
+                    DelegateStatus::Failed => format!(
+                        "delegate '{id}' failed: {}",
+                        st.error.as_deref().unwrap_or("unknown error")
+                    ),
+                };
+                if !st.messages.is_empty() {
+                    text.push_str("\nmessages from sub-agent:");
+                    for m in &st.messages {
+                        text.push_str(&format!("\n- {m}"));
+                    }
+                }
+                Ok(ToolOutput { text })
             }
             "result" => {
                 let id = args
@@ -686,6 +777,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         let snap = reg.snapshot().await;
@@ -724,6 +816,7 @@ mod tests {
                     resume_from: None,
                     steps: None,
                     model: None,
+                    messages: Vec::new(),
                 })
                 .await;
                 // Simulate the sub-agent finishing right away.
@@ -769,6 +862,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         reg.update("d00001", |st| {
@@ -807,6 +901,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         reg.update("d00001", |st| {
@@ -876,6 +971,7 @@ mod tests {
             resume_from: None,
             steps: Some(7),
             model: Some("model-x".into()),
+            messages: vec!["ping from child".into()],
         })
         .await;
         reg.insert(DelegateState {
@@ -890,6 +986,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         let tool = DelegateTool {
@@ -945,6 +1042,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_messages_are_bounded_persisted_and_shown_in_status() {
+        let dir = std::env::temp_dir().join(format!("sigil-delegate-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = Arc::new(DelegateRegistry::new(Some(dir.clone())));
+        reg.insert(DelegateState {
+            id: "d00001".into(),
+            name: "chatty".into(),
+            status: DelegateStatus::Running,
+            started_ts: "t0".into(),
+            finished_ts: None,
+            result: None,
+            error: None,
+            task: "task".into(),
+            resume_from: None,
+            steps: None,
+            model: None,
+            messages: Vec::new(),
+        })
+        .await;
+        // A chatty sub-agent streams more than the cap.
+        for i in 0..60 {
+            reg.push_message("d00001", &format!("msg {i:02}")).await;
+        }
+        // Bounded to the most recent MAX_CHILD_MESSAGES.
+        let snap = reg.snapshot().await;
+        let st = snap.iter().find(|s| s.id == "d00001").unwrap();
+        assert_eq!(st.messages.len(), 50, "queue is bounded");
+        assert_eq!(st.messages.first().map(String::as_str), Some("msg 10"));
+        assert_eq!(st.messages.last().map(String::as_str), Some("msg 59"));
+        // Persisted to meta.json.
+        let back: DelegateState = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("d00001").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.messages.len(), 50, "messages persisted to meta.json");
+        // Unknown ids are ignored (record deleted mid-run etc).
+        reg.push_message("d99999", "nobody home").await;
+        // `delegate status` surfaces the messages to the parent.
+        let tool = DelegateTool {
+            provider: Arc::new(
+                crate::llm::openai::OpenAiProvider::with_fallbacks(
+                    crate::llm::openai::OpenAiConfig {
+                        base_url: "http://localhost:1/v1".into(),
+                        api_key: "x".into(),
+                    },
+                    vec![],
+                )
+                .unwrap(),
+            ),
+            registry: ToolRegistry::default(),
+            config: AgentConfig {
+                model: "test".into(),
+                max_steps: 3,
+                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::harness::PromptState {
+                        system_prompt: "sys".into(),
+                        skills: vec![],
+                        fingerprint: None,
+                    },
+                )),
+                max_inline_skills: 0,
+                sync_dir: None,
+                max_context_messages: 0,
+                max_context_tokens: 0,
+                goals: None,
+                goals_dir: None,
+                planning_interval: 0,
+            },
+            delegates: reg.clone(),
+            agents: Arc::new(subagent::AgentRegistry::new(None)),
+            description: std::sync::OnceLock::new(),
+        };
+        let out = tool
+            .run(&json!({
+                "action": "status",
+                "id": "d00001",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.text.contains("messages from sub-agent"),
+            "status shows the messages section: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("msg 59"),
+            "status shows the message text: {}",
+            out.text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn delete_removes_record_and_disk_dir() {
         let dir = std::env::temp_dir().join(format!("sigil-delegate-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -961,6 +1151,7 @@ mod tests {
             resume_from: None,
             steps: Some(3),
             model: Some("model-y".into()),
+            messages: Vec::new(),
         })
         .await;
         assert!(dir.join("d00001").join("meta.json").exists());
@@ -1035,6 +1226,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         let err = tool
@@ -1073,6 +1265,7 @@ mod tests {
                 resume_from: None,
                 steps: None,
                 model: None,
+                messages: Vec::new(),
             })
             .await;
         }
@@ -1148,6 +1341,7 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
+            messages: Vec::new(),
         })
         .await;
         let tool = DelegateTool {

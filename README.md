@@ -25,23 +25,25 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 58** — per-sub-task model pick (the `rlm.find_models`
-> idea): `delegate spawn` (and `resume`) accept an optional `model`
-> override — since `ChatRequest.model` is per-request, the sub-agent's
-> config is simply overridden before it runs; the handle records which
-> model ran (`model` in meta.json, `#[serde(default)]`) and
-> `delegate list` shows it as `(model: …)`. Previous: Phase 57
-> `delegate delete` (rlm registry completion), Phase 56 sub-agent
-> step visibility (a first slice of metrics), Phase 55 refinement
-> audit ids + merged history (the prime-agent `mergeRefinementHistory`
-> pattern), Phase 54 sub-agent typing (AgentDefinition pattern),
-> Phase 53 sub-agent resume + delegate registry persistence, Phase 52
-> scope strategy, Phase 51 the dual-track itself (--local-harness-dir
-> merged view + scope parameter), Phase 50 Lua sandbox hardening,
-> Phase 49 structured run results (RunResult + provide_final_answer),
-> Phase 48 parallel tools + reactive compaction + planning checkpoints
-> + delegate report templates, 48r daemon deadlock fix, Phase 47 CLI
-> consistency, Phase 46 daemon UX, Phase 45 ratchet in CI.
+> Status: **Phase 59** — child→parent messaging (the rlm
+> `agent_message.send` semantics, last gap): every sub-agent gets a
+> `child_message` tool (registered after the type's allowlist filter
+> so it survives every type) whose text lands in
+> `DelegateState.messages` — bounded to the most recent 50, persisted
+> to meta.json — and the parent reads them via `delegate status`
+> ("messages from sub-agent"). Previous: Phase 58 per-sub-task model
+> pick (rlm.find_models), Phase 57 `delegate delete` (rlm registry
+> completion), Phase 56 sub-agent step visibility (a first slice of
+> metrics), Phase 55 refinement audit ids + merged history (the
+> prime-agent `mergeRefinementHistory` pattern), Phase 54 sub-agent
+> typing (AgentDefinition pattern), Phase 53 sub-agent resume +
+> delegate registry persistence, Phase 52 scope strategy, Phase 51 the
+> dual-track itself (--local-harness-dir merged view + scope
+> parameter), Phase 50 Lua sandbox hardening, Phase 49 structured run
+> results (RunResult + provide_final_answer), Phase 48 parallel tools
+> + reactive compaction + planning checkpoints + delegate report
+> templates, 48r daemon deadlock fix, Phase 47 CLI consistency,
+> Phase 46 daemon UX, Phase 45 ratchet in CI.
 > ratchet-in-CI + goal turn-budgets, Phase 44 daemon, Phase 43 async
 > delegation, Phase 42 goals, Phase 41's harness refinement gate +
 > token-budget compression, Phase 39's memory write
@@ -285,6 +287,17 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 59 — 2026-08-11 (child→parent messaging)
+- Every sub-agent gets a `child_message` tool (the rlm
+  `agent_message.send` semantics — the last semantic gap): the text
+  lands in `DelegateState.messages`, bounded to the most recent 50
+  and persisted to meta.json; the parent reads them via
+  `delegate status` ("messages from sub-agent").
+- Registered *after* the sub-agent type's allowlist filter, so the
+  tool survives every type.
+- 1 new test: queue is bounded (60 pushes → 50 kept, oldest
+  dropped), persisted, unknown ids ignored, status surfaces them.
 
 ### Phase 58 — 2026-08-11 (per-sub-task model pick)
 - `delegate spawn` (and `resume`) accept an optional `model` override —

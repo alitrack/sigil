@@ -220,6 +220,75 @@ fn record_refinement(harness_dir: &std::path::Path, event: &Value) {
     }
 }
 
+/// Stable refinement id: `action:scope-independent content fingerprint`.
+/// Scope is deliberately NOT part of the id — the same improvement
+/// applied first as scope=local and later promoted to scope=global
+/// keeps one id, so the merged audit can dedupe them (local wins).
+pub fn refinement_id(action: &str, fingerprint: &str) -> String {
+    format!("{action}:{}", fnv1a_hex(fingerprint))
+}
+
+/// FNV-1a 64-bit, first 8 hex chars. Stable across processes (unlike
+/// std's DefaultHasher, which seeds randomly per process — ids must
+/// survive restarts and match across the local/global files).
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", h)
+}
+
+/// Load every refinement event from one `refinements.jsonl`
+/// (bad lines are skipped — append-only logs can be truncated).
+pub fn load_refinements(dir: &std::path::Path) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(dir.join("refinements.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Merge the global and session-local refinement histories into one
+/// view (the prime-agent `mergeRefinementHistory` pattern): events
+/// are keyed by their stable id, local entries win over same-id
+/// global ones, and ordering follows first appearance. Events without
+/// an id (legacy lines) get a content-derived fallback id so they are
+/// never collapsed onto each other.
+pub fn load_merged_refinements(
+    local: Option<&std::path::Path>,
+    global: &std::path::Path,
+) -> Vec<Value> {
+    let mut by_id: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut push = |ev: Value| {
+        let id = ev
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| fnv1a_hex(&serde_json::to_string(&ev).unwrap_or_default()));
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, ev); // later insert (local) wins
+    };
+    for ev in load_refinements(global) {
+        push(ev);
+    }
+    if let Some(local) = local {
+        for ev in load_refinements(local) {
+            push(ev);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
 #[async_trait]
 impl Tool for ImproveHarnessTool {
     fn name(&self) -> &str {
@@ -375,6 +444,7 @@ impl Tool for ImproveHarnessTool {
                     &target_dir,
                     &json!({
                         "ts": crate::session::chrono_like_timestamp(),
+                        "id": refinement_id("edit_prompt", content),
                         "action": "edit_prompt",
                         "scope": scope,
                         "reason": reason,
@@ -449,6 +519,7 @@ impl Tool for ImproveHarnessTool {
                     &target_dir,
                     &json!({
                         "ts": crate::session::chrono_like_timestamp(),
+                        "id": refinement_id("add_skill", &format!("{safe}\n{content}")),
                         "action": "add_skill",
                         "scope": scope,
                         "name": safe,
@@ -499,5 +570,123 @@ impl Tool for ImproveHarnessTool {
             }
             other => anyhow::bail!("unknown action: {other}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("sigil-evolve-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn refinement_id_is_stable_and_scope_independent() {
+        let a = refinement_id("edit_prompt", "same content");
+        let b = refinement_id("edit_prompt", "same content");
+        assert_eq!(a, b, "same content → same id");
+        let c = refinement_id("edit_prompt", "different content");
+        assert_ne!(a, c, "different content → different id");
+        let d = refinement_id("add_skill", "same content");
+        assert_ne!(a, d, "different action → different id");
+        // FNV-1a ids are deterministic across processes (no random
+        // seed, unlike DefaultHasher) — the property the merged audit
+        // relies on.
+        let e = fnv1a_hex("same content");
+        assert_eq!(e, fnv1a_hex("same content"));
+    }
+
+    #[test]
+    fn load_refinements_skips_bad_lines() {
+        let dir = tmp_dir("load");
+        std::fs::write(
+            dir.join("refinements.jsonl"),
+            "{\"id\": \"a\"}\nnot json\n{\"id\": \"b\"}\n",
+        )
+        .unwrap();
+        let evs = load_refinements(&dir);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0]["id"], "a");
+        assert_eq!(evs[1]["id"], "b");
+        // Missing file → empty.
+        assert!(load_refinements(&std::env::temp_dir()).is_empty());
+    }
+
+    #[test]
+    fn merged_refinements_local_wins_same_id() {
+        let global = tmp_dir("g");
+        let local = tmp_dir("l");
+        std::fs::write(
+            global.join("refinements.jsonl"),
+            serde_json::to_string(&json!({
+                "id": "edit_prompt:abc123",
+                "ts": "t1",
+                "action": "edit_prompt",
+                "scope": "global",
+                "reason": "global version"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            local.join("refinements.jsonl"),
+            serde_json::to_string(&json!({
+                "id": "edit_prompt:abc123",
+                "ts": "t2",
+                "action": "edit_prompt",
+                "scope": "local",
+                "reason": "local version"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let merged = load_merged_refinements(Some(&local), &global);
+        assert_eq!(merged.len(), 1, "same id deduped to one entry");
+        assert_eq!(merged[0]["scope"], "local", "local wins");
+        assert_eq!(merged[0]["reason"], "local version");
+    }
+
+    #[test]
+    fn merged_refinements_keeps_distinct_ids_in_order() {
+        let global = tmp_dir("g2");
+        let local = tmp_dir("l2");
+        std::fs::write(
+            global.join("refinements.jsonl"),
+            "{\"id\": \"g1\", \"ts\": \"1\", \"reason\": \"g1\"}\n\
+             {\"id\": \"g2\", \"ts\": \"2\", \"reason\": \"g2\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            local.join("refinements.jsonl"),
+            "{\"id\": \"l1\", \"ts\": \"3\", \"reason\": \"l1\"}\n",
+        )
+        .unwrap();
+
+        let merged = load_merged_refinements(Some(&local), &global);
+        let ids: Vec<&str> = merged.iter().filter_map(|ev| ev["id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["g1", "g2", "l1"],
+            "global order first, local appended"
+        );
+    }
+
+    #[test]
+    fn merged_refinements_legacy_lines_without_id_not_collapsed() {
+        let global = tmp_dir("g3");
+        std::fs::write(
+            global.join("refinements.jsonl"),
+            "{\"ts\": \"1\", \"reason\": \"legacy one\"}\n\
+             {\"ts\": \"2\", \"reason\": \"legacy two\"}\n",
+        )
+        .unwrap();
+        let merged = load_merged_refinements(None, &global);
+        assert_eq!(merged.len(), 2, "id-less legacy lines stay distinct");
     }
 }

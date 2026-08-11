@@ -25,16 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-> Status: **Phase 54** — sub-agent typing (the OpenHands
-> AgentDefinition pattern): a sub-agent type is a Markdown file with a
-> TOML frontmatter (`description` + optional `tools` allowlist) whose
-> body becomes a system-prompt **suffix** appended to a deep copy of
-> the parent's prompt (the shared Arc is never mutated); types are
-> discovered from `<harness-dir>/agents/` (project) then
-> `~/.sigil/agents/` (user fallback), and `delegate spawn` takes
-> `subagent_type` — the type's tool allowlist is enforced by dropping
-> every tool outside it, and the tool description lists the available
-> types dynamically. Previous: Phase 53 sub-agent resume + delegate
+> Status: **Phase 55** — refinement audit ids + merged history (the
+> prime-agent `mergeRefinementHistory` pattern): every `refinements.jsonl`
+> event now carries a stable id — `action:FNV-1a(content fingerprint)`,
+> deliberately scope-independent so the same improvement keeps one id
+> when it moves local → global; `sigil refinements` prints the audit
+> log and `--merged` merges the session-local history in, deduping by
+> id with local entries winning (legacy id-less lines get a
+> content-derived fallback id). Previous: Phase 54 sub-agent typing
+> (AgentDefinition pattern), Phase 53 sub-agent resume + delegate
 > registry persistence, Phase 52 scope strategy, Phase 51 the
 > dual-track itself (--local-harness-dir merged view + scope
 > parameter), Phase 50 Lua sandbox hardening, Phase 49 structured run
@@ -285,6 +284,22 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 55 — 2026-08-11 (refinement audit ids + merged history)
+- Every `refinements.jsonl` event now carries a stable id:
+  `action:FNV-1a(content fingerprint)` (FNV-1a is used instead of
+  std's `DefaultHasher`, which seeds randomly per process — ids must
+  match across restarts and across the local/global files). Scope is
+  deliberately not part of the id, so the same improvement keeps one
+  id when it moves local → global.
+- New `sigil refinements` command prints the audit log (timestamp,
+  scope, action, id, reason); `--merged` merges the session-local
+  history in via `load_merged_refinements` (the prime-agent
+  `mergeRefinementHistory` pattern): dedup by id, local entries win,
+  order follows first appearance, and legacy id-less lines get a
+  content-derived fallback id so they are never collapsed together.
+- 5 new tests: id stability/scope-independence, bad-line skipping,
+  local-wins dedup, ordering, legacy-line preservation.
 
 ### Phase 54 — 2026-08-11 (sub-agent typing: AgentDefinition pattern)
 - New `src/tools/subagent.rs`: a sub-agent type is a Markdown file

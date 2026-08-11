@@ -18,6 +18,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde_json::Value;
 use std::io::Write;
 
 use crate::cli::{Cli, Command};
@@ -306,6 +307,44 @@ async fn main() -> Result<()> {
                 });
             }
             mcp::server::serve(&tools, &resources).await
+        }
+        Some(Command::Refinements { merged }) => {
+            let global_dir = cli
+                .harness_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(harness::default_harness_dir);
+            let local_dir = cli
+                .local_harness_dir
+                .as_deref()
+                .map(std::path::PathBuf::from);
+            let events = if *merged {
+                tools::evolve::load_merged_refinements(local_dir.as_deref(), &global_dir)
+            } else {
+                tools::evolve::load_refinements(&global_dir)
+            };
+            if events.is_empty() {
+                println!(
+                    "no refinements yet (harness dir: {}). Run the agent and \
+                     improve_harness writes here.",
+                    global_dir.display()
+                );
+            }
+            for ev in &events {
+                let ts = ev.get("ts").and_then(Value::as_str).unwrap_or("-");
+                let id = ev.get("id").and_then(Value::as_str).unwrap_or("-");
+                let action = ev.get("action").and_then(Value::as_str).unwrap_or("?");
+                let scope = ev.get("scope").and_then(Value::as_str).unwrap_or("?");
+                let reason = ev.get("reason").and_then(Value::as_str).unwrap_or("");
+                let name = ev.get("name").and_then(Value::as_str).unwrap_or("");
+                let name_part = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {name}")
+                };
+                println!("{ts} [{scope}] {action}{name_part} {id} — {reason}");
+            }
+            Ok(())
         }
         _ if repl::should_enter_repl(&sub_prompt) => {
             // Interactive mode: multi-turn conversation with human

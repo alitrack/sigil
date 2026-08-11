@@ -23,14 +23,14 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-> 状态：**Phase 54** — 子 agent 类型化（OpenHands AgentDefinition
-> 模式）：子代理类型 = Markdown 文件 + TOML frontmatter（`description`
-> + 可选 `tools` 白名单），文件 body 作为系统提示词**后缀**追加到父
-> prompt 的深拷贝上（共享 Arc 永不改动）；类型从 `<harness-dir>/agents/`
-> （项目级）与 `~/.sigil/agents/`（用户级兜底）发现，`delegate spawn`
-> 支持 `subagent_type`——白名单外的工具全部剔除，工具描述动态列出
-> 可用类型。此前：Phase 53 子任务 resume + delegate 注册表持久化、
-> Phase 52 scope 策略（有 local 层时 improve_harness 默认 scope=local）、
+> 状态：**Phase 55** — refine 审计 id + 合并历史（prime-agent
+> `mergeRefinementHistory` 模式）：refinements.jsonl 每条事件带稳定 id
+> ——`action:FNV-1a(内容指纹)`，刻意不含 scope——同一改进从 local 提升到
+> global 时保持同一 id；`sigil refinements` 打印审计日志，`--merged`
+> 合并会话局部历史、按 id 去重、local 胜出（无 id 的历史行用内容派生
+> 的兜底 id 保持独立）。此前：Phase 54 子 agent 类型化（AgentDefinition
+> 模式）、Phase 53 子任务 resume + delegate 注册表持久化、Phase 52
+> scope 策略（有 local 层时 improve_harness 默认 scope=local）、
 > Phase 51 双轨本身（--local-harness-dir 合并视图 + scope 参数）、
 > Phase 50 Lua 沙箱加固、Phase 49 结构化运行结果（RunResult +
 > provide_final_answer）、Phase 48 外部调研落地（并行工具执行、反应式
@@ -256,6 +256,19 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 55 — 2026-08-11（refine 审计 id + 合并历史）
+- refinements.jsonl 每条事件带稳定 id：`action:FNV-1a(内容指纹)`
+  （用 FNV-1a 而非 std 的 DefaultHasher——后者每进程随机种子，id 必须
+  跨重启、跨 local/global 文件一致）。刻意不含 scope：同一改进从
+  local 提升到 global 时保持同一 id。
+- 新增 `sigil refinements` 命令打印审计日志（时间戳、scope、action、
+  id、reason）；`--merged` 经 `load_merged_refinements` 合并会话局部
+  历史（prime-agent `mergeRefinementHistory` 模式）：按 id 去重、
+  local 胜出、按首次出现排序；无 id 的历史行用内容派生兜底 id 保持
+  独立不互相覆盖。
+- 5 个新测试：id 稳定性/scope 无关性、坏行跳过、local 胜出去重、
+  排序、历史行保留。
 
 ### Phase 54 — 2026-08-11（子 agent 类型化：AgentDefinition 模式）
 - 新增 `src/tools/subagent.rs`：子代理类型 = Markdown 文件 + 可选

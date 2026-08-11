@@ -135,6 +135,17 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+
+    /// Show the harness refinement audit log (refinements.jsonl).
+    /// Each event carries a stable id (content fingerprint) so the
+    /// same improvement can be traced across scopes.
+    Refinements {
+        /// Also merge in the session-local refinements: local entries
+        /// win over same-id global ones (the prime-agent
+        /// mergeRefinementHistory pattern).
+        #[arg(long)]
+        merged: bool,
+    },
 }
 
 /// Actions for `sigil session`.

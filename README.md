@@ -25,6 +25,12 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 64** — daemon multi-session (herdr's pane model):
+> one daemon hosts parallel sessions; `sigil send --session foo`
+> opens a fresh session on first use and keeps appending to it;
+> `{"type":"session","action":"list"|"new"}` lists/starts sessions.
+> Each session keeps its own history and persists independently.
+>
 > Status: **Phase 63** — `delegate spawn` accepts an optional `name`
 > (rlm `session_name` validation: trimmed, non-empty, ≤64 chars —
 > mirrors `normalizeRequestedRlmSubagentSessionName`), recorded on the
@@ -311,6 +317,25 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 64 — 2026-08-11 (daemon multi-session — herdr pane model)
+- The daemon now hosts parallel sessions ("panes" in herdr terms):
+  `DaemonState` grew from one message list to a `HashMap<id,
+  SessionState>`; each session has its own history and persists
+  independently under `sessions_dir`.
+- `sigil send --session <id>` / `sigil attach --session <id>` target a
+  session; an unknown id starts a fresh session (persisted as
+  `<id>.jsonl` via the new `session::start_with_id`) and later sends
+  keep appending to it — no `--resume` juggling for side conversations.
+- New socket frames: `{"type":"session","action":"list"}` replies with
+  `{"type":"sessions","sessions":[{id,turns,preview},...]}`;
+  `{"type":"session","action":"new"}` starts a pane and replies
+  `{"type":"session_created","id":...}`.
+- Turns stay serialized across sessions (one `loop_lock`, herdr's
+  single-runtime model) — no concurrent agent loops.
+- Tests 165 → 167 (session frame targeting + resolve_session fallback/
+  fresh-start). E2E: pane-math (1+1=2, remembers its own context) and
+  pane-geo (Paris) stay isolated; `list` shows all three sessions.
 
 ### Phase 63 — 2026-08-11 (delegate spawn name validation)
 - `delegate spawn` gained an optional `name` argument (rlm

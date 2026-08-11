@@ -23,6 +23,11 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 64** — daemon 多会话（herdr pane 模型）：一个 daemon
+> 并行承载多个会话；`sigil send --session foo` 首次使用时开新会话并持续
+> 追加；`{"type":"session","action":"list"|"new"}` 列出/新建会话。每会话
+> 独立历史、独立持久化。
+>
 > 状态：**Phase 63** — `delegate spawn` 接受可选 `name` 参数（rlm
 > `session_name` 校验：trim、非空、≤64 字符——镜像
 > `normalizeRequestedRlmSubagentSessionName`），记录在 handle 上并在
@@ -276,6 +281,23 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 64 — 2026-08-11（daemon 多会话——herdr pane 模型）
+- daemon 现在并行承载多个会话（herdr 术语 pane）：`DaemonState` 从单一消息
+  列表升级为 `HashMap<id, SessionState>`；每会话独立历史，独立持久化到
+  `sessions_dir`。
+- `sigil send --session <id>` / `sigil attach --session <id>` 指定会话；
+  未知 id 自动开新会话（以 `<id>.jsonl` 落盘，新增 `session::start_with_id`），
+  后续 send 持续追加——侧线对话无需 `--resume` 切换。
+- 新 socket 帧：`{"type":"session","action":"list"}` 回复
+  `{"type":"sessions","sessions":[{id,turns,preview},...]}`；
+  `{"type":"session","action":"new"}` 开新 pane 并回复
+  `{"type":"session_created","id":...}`。
+- 跨会话 turn 仍串行（单一 `loop_lock`，herdr 单运行时模型）——不并发跑
+  多个 agent 循环。
+- 测试 165 → 167（session 帧定向 + resolve_session 回退/新建）。
+  E2E：pane-math（1+1=2，记得自己会话的上下文）与 pane-geo（巴黎）互不
+  干扰；`list` 显示全部三个会话。
 
 ### Phase 63 — 2026-08-11（delegate spawn name 校验）
 - `delegate spawn` 新增可选 `name` 参数（rlm `session_name` 语义，镜像

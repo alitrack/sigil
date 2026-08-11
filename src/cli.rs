@@ -100,6 +100,9 @@ pub enum Command {
         /// Socket path (default: ~/.sigil/daemon.sock).
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Session id to talk to (default: the daemon's default session).
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Send one message to a running daemon and print the reply.
@@ -109,6 +112,10 @@ pub enum Command {
         /// Socket path (default: ~/.sigil/daemon.sock).
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Session id to send to (default: the daemon's default
+        /// session; an unknown id starts a fresh session).
+        #[arg(long)]
+        session: Option<String>,
         /// Seconds to wait for the daemon's reply (0 = wait forever).
         #[arg(long, default_value_t = 300)]
         timeout: u64,

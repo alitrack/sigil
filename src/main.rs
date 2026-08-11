@@ -269,17 +269,18 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::Attach { socket }) => {
+        Some(Command::Attach { socket, session }) => {
             let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-            daemon::attach(&socket).await
+            daemon::attach(&socket, session.as_deref()).await
         }
         Some(Command::Send {
             message,
             socket,
             timeout,
+            session,
         }) => {
             let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-            let answer = daemon::send_once(&socket, message, *timeout).await?;
+            let answer = daemon::send_once(&socket, message, *timeout, session.as_deref()).await?;
             println!("{answer}");
             Ok(())
         }

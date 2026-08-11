@@ -40,6 +40,16 @@ pub fn start(sessions_dir: &Path) -> std::io::Result<String> {
     Ok(id)
 }
 
+/// Start a session under an explicit id (daemon panes keep the name
+/// the client asked for — `sigil send --session foo` persists as
+/// `foo.jsonl`, not a generated timestamp).
+pub fn start_with_id(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
+    fs::create_dir_all(sessions_dir)?;
+    let path = sessions_dir.join(format!("{id}.jsonl"));
+    OpenOptions::new().create(true).append(true).open(&path)?;
+    Ok(())
+}
+
 /// Append one turn to a session file. If the turn has no `ts` yet, it is
 /// stamped with the current timestamp (callers can supply an explicit `ts`
 /// for replay/import of historical turns).

@@ -25,6 +25,14 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Phase 61** — token usage accounting: the provider's
+> `usage` block is parsed from both the streaming SSE (final chunk)
+> and tool-call replay completions, accumulated across the run
+> (`RunResult.tokens`), persisted on the delegate handle and shown in
+> `delegate status/list` (e.g. `10598 prompt + 328 completion
+> tokens`). This closes the metrics gap in the rlm/OpenHands
+> comparison — no provider change was needed, only parsing.
+>
 > Status: **Phase 60** — parent→child messaging (the other half of
 > rlm `agent_message.send`): `delegate send` queues a message to a
 > sub-agent's inbox (bounded, persisted to meta.json) and every
@@ -289,6 +297,19 @@ Four mechanisms borrowed from the research round landed:
   connections outnumbered workers (N=8 on an 8-core box, while N≤6
   passed). Fixed by switching to `tokio::sync::mpsc::unbounded`
   (async `recv().await`); N=16 now passes 16/16.
+
+### Phase 61 — 2026-08-11 (token usage accounting)
+- Parse the provider's `usage` block from the streaming SSE (final
+  chunk) **and** the tool-call replay completions; accumulate across
+  the whole run into `RunResult.tokens` (`TokenUsage { prompt,
+  completion }`).
+- Persist usage on the delegate handle (meta.json) and show it in
+  `delegate status` / `delegate list` (`N prompt + M completion
+  tokens`). E2E: a sub-agent run reported 10598 prompt + 328
+  completion tokens end-to-end.
+- The "metrics" gap in the rlm comparison was a parsing gap, not an
+  upstream one — the OpenAI-compatible endpoint already returned
+  `usage`; sigil just dropped it.
 
 ### Phase 60 — 2026-08-11 (parent→child messaging)
 - `delegate send` (id, text) queues a message to a sub-agent's inbox

@@ -111,6 +111,36 @@ pub struct ChatChunk {
     /// `finish_reason == "tool_calls"` — the model wants to call tools;
     /// the call details arrive in the non-streaming replay.
     pub tool_calls_requested: bool,
+    /// Token usage, when the provider includes a `usage` block in the
+    /// final chunk of a streamed completion.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token usage reported by the provider for one completion
+/// (OpenAI-compatible `usage` block). `None` means the provider did
+/// not report usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Total tokens across prompt and completion.
+    #[cfg(test)]
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
+impl std::ops::Add for TokenUsage {
+    type Output = TokenUsage;
+    fn add(self, rhs: TokenUsage) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens + rhs.prompt_tokens,
+            completion_tokens: self.completion_tokens + rhs.completion_tokens,
+        }
+    }
 }
 
 /// A complete (non-streaming) completion result.
@@ -118,6 +148,8 @@ pub struct ChatChunk {
 pub struct ChatComplete {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage, when the provider includes a `usage` block.
+    pub usage: Option<TokenUsage>,
 }
 
 /// The provider contract. All backends implement this.

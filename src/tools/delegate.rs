@@ -70,12 +70,14 @@ pub struct DelegateState {
     /// [`MAX_MESSAGES`].
     #[serde(default)]
     pub messages: Vec<String>,
-    /// Messages the parent sent to the sub-agent via `delegate send`
-    /// (the parent→child direction of rlm `agent_message.send`); the
-    /// sub-agent consumes them with `check_parent_messages`. Bounded
-    /// to the most recent [`MAX_MESSAGES`].
+    /// Parent→sub-agent queued messages (`delegate send`); consumed by
+    /// the sub-agent's `check_parent_messages` tool.
     #[serde(default)]
     pub inbox: Vec<String>,
+    /// Cumulative token usage reported by the provider for the run
+    /// (None when the provider does not report usage).
+    #[serde(default)]
+    pub tokens: Option<crate::llm::provider::TokenUsage>,
 }
 
 impl DelegateState {
@@ -502,6 +504,7 @@ impl DelegateTool {
                 model: model.map(|m| m.to_string()),
                 messages: Vec::new(),
                 inbox,
+                tokens: None,
             })
             .await;
 
@@ -556,6 +559,7 @@ impl DelegateTool {
                             st.finished_ts = Some(crate::session::chrono_like_timestamp());
                             st.result = Some(res.output);
                             st.steps = Some(res.steps as usize);
+                            st.tokens = res.tokens;
                         })
                         .await;
                 }
@@ -766,6 +770,12 @@ impl Tool for DelegateTool {
                         text.push_str(&format!("\n- {m}"));
                     }
                 }
+                if let Some(t) = st.tokens {
+                    text.push_str(&format!(
+                        "\nusage: {} prompt + {} completion tokens",
+                        t.prompt_tokens, t.completion_tokens
+                    ));
+                }
                 Ok(ToolOutput { text })
             }
             "result" => {
@@ -816,8 +826,17 @@ impl Tool for DelegateTool {
                         .as_deref()
                         .map(|m| format!(" (model: {m})"))
                         .unwrap_or_default();
+                    let tokens = st
+                        .tokens
+                        .map(|t| {
+                            format!(
+                                " ({} prompt + {} completion tokens)",
+                                t.prompt_tokens, t.completion_tokens
+                            )
+                        })
+                        .unwrap_or_default();
                     text.push_str(&format!(
-                        "\n- {} [{}] — {}{}{}{}",
+                        "\n- {} [{}] — {}{}{}{}{}",
                         st.id,
                         st.status.as_str(),
                         st.name,
@@ -826,7 +845,8 @@ impl Tool for DelegateTool {
                             .map(|r| format!(" (resumed from {r})"))
                             .unwrap_or_default(),
                         steps,
-                        model
+                        model,
+                        tokens
                     ));
                 }
                 Ok(ToolOutput { text })
@@ -933,6 +953,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         let snap = reg.snapshot().await;
@@ -973,6 +994,7 @@ mod tests {
                     model: None,
                     messages: Vec::new(),
                     inbox: Vec::new(),
+                    tokens: None,
                 })
                 .await;
                 // Simulate the sub-agent finishing right away.
@@ -1020,6 +1042,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         reg.update("d00001", |st| {
@@ -1060,6 +1083,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         reg.update("d00001", |st| {
@@ -1131,6 +1155,10 @@ mod tests {
             model: Some("model-x".into()),
             messages: vec!["ping from child".into()],
             inbox: vec!["ping from parent".into()],
+            tokens: Some(crate::llm::provider::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+            }),
         })
         .await;
         reg.insert(DelegateState {
@@ -1147,6 +1175,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         let tool = DelegateTool {
@@ -1194,6 +1223,11 @@ mod tests {
             "model override shown on the handle: {}",
             out.text
         );
+        assert!(
+            out.text.contains("(10 prompt + 5 completion tokens)"),
+            "token usage shown on the handle: {}",
+            out.text
+        );
         assert!(!out.text.contains("(0 steps)"), "no '0 steps' shown");
         assert!(
             !out.text.contains("no steps") || !out.text.contains("(0 steps)"),
@@ -1220,6 +1254,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         // A chatty sub-agent streams more than the cap.
@@ -1314,6 +1349,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         // The parent queues two messages (the rlm parent→child send).
@@ -1403,6 +1439,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: vec!["pending message".into()],
+            tokens: None,
         })
         .await;
         reg.insert(DelegateState {
@@ -1419,6 +1456,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         // The continuation inherits the parent's queued messages…
@@ -1456,6 +1494,7 @@ mod tests {
             model: Some("model-y".into()),
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         assert!(dir.join("d00001").join("meta.json").exists());
@@ -1532,6 +1571,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         let err = tool
@@ -1572,6 +1612,7 @@ mod tests {
                 model: None,
                 messages: Vec::new(),
                 inbox: Vec::new(),
+                tokens: None,
             })
             .await;
         }
@@ -1649,6 +1690,7 @@ mod tests {
             model: None,
             messages: Vec::new(),
             inbox: Vec::new(),
+            tokens: None,
         })
         .await;
         let tool = DelegateTool {

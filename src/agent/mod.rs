@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 
-use crate::llm::provider::{ChatComplete, ChatMessage, ChatRequest, LlmProvider, Role};
+use crate::llm::provider::{ChatComplete, ChatMessage, ChatRequest, LlmProvider, Role, TokenUsage};
 use crate::safety;
 use crate::tools::ToolRegistry;
 
@@ -323,6 +323,19 @@ pub struct RunResult {
     /// Number of agent-loop iterations consumed.
     pub steps: u32,
     pub state: RunState,
+    /// Cumulative token usage across the run's completions, when the
+    /// provider reported usage (streamed + tool-call replays).
+    pub tokens: Option<TokenUsage>,
+}
+
+/// Fold one completion's usage into the running total (None-safe).
+fn accumulate_usage(tokens: &mut Option<TokenUsage>, u: Option<TokenUsage>) {
+    if let Some(u) = u {
+        *tokens = Some(match *tokens {
+            None => u,
+            Some(t) => t + u,
+        });
+    }
 }
 
 /// The core agent loop over a pre-built message list
@@ -340,6 +353,7 @@ pub async fn run_messages(
 
     let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;
+    let mut tokens: Option<TokenUsage> = None;
 
     loop {
         // Cross-instance sync: if another sigil process edited the
@@ -408,16 +422,23 @@ pub async fn run_messages(
             // happened to be streaming — run one final, tool-less LLM
             // call asking for a wrap-up summary so the caller always
             // gets a real answer, tagged with StepLimitReached.
-            let summary = provide_final_answer(provider, config, &messages, stream_cb).await;
+            let (summary, summary_tokens) =
+                match provide_final_answer(provider, config, &messages, stream_cb).await {
+                    Ok((s, t)) => (s, t),
+                    Err(e) => (
+                        format!(
+                            "step limit ({}) reached — summary unavailable ({e})",
+                            config.max_steps
+                        ),
+                        None,
+                    ),
+                };
+            accumulate_usage(&mut tokens, summary_tokens);
             return Ok(RunResult {
-                output: summary.unwrap_or_else(|e| {
-                    format!(
-                        "step limit ({}) reached — summary unavailable ({e})",
-                        config.max_steps
-                    )
-                }),
+                output: summary,
                 steps: step,
                 state: RunState::StepLimitReached,
+                tokens,
             });
         }
         step += 1;
@@ -474,6 +495,7 @@ pub async fn run_messages(
         let mut tool_calls_requested = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading stream")?;
+            accumulate_usage(&mut tokens, chunk.usage);
             if !chunk.thinking {
                 text.push_str(&chunk.delta);
                 if let Some(cb) = stream_cb {
@@ -496,6 +518,7 @@ pub async fn run_messages(
                 .chat_complete(req)
                 .await
                 .context("replaying completion for tool calls")?;
+            accumulate_usage(&mut tokens, complete.usage);
             if complete.tool_calls.is_empty() {
                 // Model asked for tools but sent none; treat text as answer.
                 let answer = if text.trim().is_empty() {
@@ -507,6 +530,7 @@ pub async fn run_messages(
                     output: answer.trim().to_string(),
                     steps: step,
                     state: RunState::Success,
+                    tokens,
                 });
             }
             messages.push(ChatMessage::assistant_with_tools(
@@ -616,6 +640,7 @@ pub async fn run_messages(
             output: text.trim().to_string(),
             steps: step,
             state: RunState::Success,
+            tokens,
         });
     }
 }
@@ -630,7 +655,7 @@ async fn provide_final_answer(
     config: &AgentConfig,
     messages: &[ChatMessage],
     stream_cb: Option<&StreamCb>,
-) -> Result<String> {
+) -> Result<(String, Option<TokenUsage>)> {
     let mut msgs = messages.to_vec();
     msgs.push(ChatMessage::system(
         "Step budget exhausted. Do not call any tools. \
@@ -645,8 +670,10 @@ async fn provide_final_answer(
     };
     let mut stream = provider.chat_stream(req).await.context("final summary")?;
     let mut text = String::new();
+    let mut tokens: Option<TokenUsage> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading final summary")?;
+        accumulate_usage(&mut tokens, chunk.usage);
         if !chunk.thinking {
             text.push_str(&chunk.delta);
             if let Some(cb) = stream_cb {
@@ -660,7 +687,7 @@ async fn provide_final_answer(
     if text.trim().is_empty() {
         anyhow::bail!("final summary came back empty");
     }
-    Ok(text.trim().to_string())
+    Ok((text.trim().to_string(), tokens))
 }
 
 /// Classify a provider error: can compaction recover from it? OpenHands
@@ -762,12 +789,14 @@ mod parallel_tests {
                         thinking: false,
                         done: false,
                         tool_calls_requested: true,
+                        usage: None,
                     }),
                     Ok(crate::llm::provider::ChatChunk {
                         delta: String::new(),
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        usage: None,
                     }),
                 ])))
             } else {
@@ -790,6 +819,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        usage: None,
                     },
                 )])))
             }
@@ -812,6 +842,7 @@ mod parallel_tests {
                         arguments: serde_json::json!({}),
                     },
                 ],
+                usage: None,
             })
         }
     }
@@ -914,6 +945,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        usage: None,
                     },
                 )])))
             }
@@ -1013,6 +1045,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        usage: None,
                     },
                 )]))),
                 _ => Ok(Box::new(futures_util::stream::iter(vec![Ok(
@@ -1021,6 +1054,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        usage: None,
                     },
                 )]))),
             }
@@ -1033,6 +1067,7 @@ mod parallel_tests {
                     name: "fast_tool".into(),
                     arguments: serde_json::json!({}),
                 }],
+                usage: None,
             })
         }
     }
@@ -1127,6 +1162,7 @@ mod parallel_tests {
                     thinking: false,
                     done: true,
                     tool_calls_requested: !is_summary,
+                    usage: None,
                 },
             )])))
         }
@@ -1138,6 +1174,7 @@ mod parallel_tests {
                     name: "fast_tool".into(),
                     arguments: serde_json::json!({}),
                 }],
+                usage: None,
             })
         }
     }
@@ -1189,6 +1226,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        usage: None,
                     },
                 )])))
             } else {
@@ -1209,6 +1247,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        usage: None,
                     },
                 )])))
             }
@@ -1229,6 +1268,7 @@ mod parallel_tests {
                         arguments: serde_json::json!({}),
                     },
                 ],
+                usage: None,
             })
         }
     }

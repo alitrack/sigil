@@ -23,6 +23,12 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**Phase 61** — token 用量计量：解析 provider 的 `usage` 块
+> （流式 SSE 末块 + 工具回放 completion 两条路径），跨整次运行累计进
+> `RunResult.tokens`，持久化到 delegate handle 并在 `delegate status/list`
+> 显示（如 `10598 prompt + 328 completion tokens`）。rlm/OpenHands 对照的
+> metrics 缺口由此关闭——不需要 provider 改动，只差解析。
+>
 > 状态：**Phase 60** — 父→子消息（rlm `agent_message.send` 的另一半）：
 > `delegate send` 把消息排入子代理 inbox（限长、持久化到 meta.json），
 > 每个子代理获得 `check_parent_messages` 工具 + 注入的
@@ -258,6 +264,15 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   连接数超过 worker 数时整个 daemon 冻结（8 核机器上 N=8 复现，
   N≤6 正常）。修复：改用 `tokio::sync::mpsc::unbounded`
   （异步 `recv().await`）；N=16 现 16/16 全过。
+
+### Phase 61 — 2026-08-11（token 用量计量）
+- 解析 provider 的 `usage` 块：流式 SSE 末块 + 工具回放 completion 两条路径，
+  跨整次运行累计进 `RunResult.tokens`（`TokenUsage { prompt, completion }`）。
+- 持久化到 delegate handle（meta.json）并在 `delegate status/list` 显示
+  （`N prompt + M completion tokens`）。E2E 实证：子代理运行报告
+  10598 prompt + 328 completion tokens 全链路。
+- 「metrics 缺口」实为解析缺口而非上游缺口——OpenAI 兼容端点本就在返回
+  `usage`，sigil 只是把它丢了。
 
 ### Phase 60 — 2026-08-11（父→子消息）
 - `delegate send`（id, text）把消息排入子代理 inbox（`DelegateState.inbox`，

@@ -7,7 +7,8 @@ use futures_util::Stream;
 use serde_json::{Value, json};
 
 use super::provider::{
-    ChatChunk, ChatComplete, ChatMessage, ChatRequest, ChatStream, LlmProvider, ToolCall,
+    ChatChunk, ChatComplete, ChatMessage, ChatRequest, ChatStream, LlmProvider, TokenUsage,
+    ToolCall,
 };
 
 /// Configuration for an OpenAI-compatible provider.
@@ -163,7 +164,11 @@ impl LlmProvider for OpenAiProvider {
             .unwrap_or("")
             .to_string();
         let tool_calls = parse_tool_calls(&v);
-        Ok(ChatComplete { text, tool_calls })
+        Ok(ChatComplete {
+            text,
+            tool_calls,
+            usage: parse_usage(&v),
+        })
     }
 }
 
@@ -225,6 +230,17 @@ fn message_to_json(m: &ChatMessage) -> Value {
     v
 }
 
+/// Extract an OpenAI-compatible `usage` block (absent → None).
+pub fn parse_usage(v: &Value) -> Option<TokenUsage> {
+    let usage = v.get("usage")?;
+    let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
+    let completion_tokens = usage.get("completion_tokens")?.as_u64()?;
+    Some(TokenUsage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
 /// Chunk stream parser. Handles both plain SSE lines and wrapped
 /// `data: {...}` frames. Robust to trailing whitespace and `[DONE]`.
 pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<ChatChunk>> {
@@ -247,11 +263,15 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        usage: None,
                     }));
                 }
                 let parsed: Result<Value, _> = serde_json::from_str(payload);
                 match parsed {
                     Ok(v) => {
+                        // Some providers (incl. the sigil local test
+                        // endpoint) attach `usage` to the final chunk.
+                        let usage = parse_usage(&v);
                         let delta = v["choices"][0]["delta"]["content"]
                             .as_str()
                             .unwrap_or("")
@@ -268,6 +288,7 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
                             thinking: !reasoning.is_empty(),
                             done: finish == Some("stop") || tool_calls_requested,
                             tool_calls_requested,
+                            usage,
                         }))
                     }
                     Err(e) => Some(Err(anyhow::anyhow!("bad chunk: {e}"))),
@@ -300,6 +321,7 @@ pub fn parse_tool_calls(v: &Value) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
     use std::io::{Read, Write};
 
     /// Spin up a tiny HTTP server that answers every POST with the given
@@ -396,5 +418,45 @@ mod tests {
             msg.contains("all 2 endpoint(s) failed"),
             "expected chain exhaustion message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn usage_parsed_from_response_block() {
+        let v = serde_json::json!({
+            "usage": { "prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46 }
+        });
+        let u = parse_usage(&v).expect("usage block present");
+        assert_eq!(u.prompt_tokens, 12);
+        assert_eq!(u.completion_tokens, 34);
+        assert_eq!(u.total(), 46);
+        // Absent or partial usage blocks yield None (no crash).
+        assert!(parse_usage(&serde_json::json!({})).is_none());
+        assert!(parse_usage(&serde_json::json!({ "usage": {} })).is_none());
+        assert!(parse_usage(&serde_json::json!({ "usage": { "prompt_tokens": 1 } })).is_none());
+    }
+
+    #[test]
+    fn stream_chunk_carries_usage_when_provider_sends_it() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n",
+            "data: [DONE]\n"
+        );
+        let chunks: Vec<ChatChunk> = futures_util::StreamExt::collect::<
+            Vec<anyhow::Result<ChatChunk>>,
+        >(parse_stream(sse.as_bytes().to_vec()))
+        .now_or_never()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.unwrap())
+        .collect();
+        let with_usage = chunks
+            .iter()
+            .find(|c| c.usage.is_some())
+            .expect("the finish_reason chunk carries usage");
+        let u = with_usage.usage.expect("final chunk carries usage");
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.completion_tokens, 3);
     }
 }

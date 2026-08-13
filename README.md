@@ -404,8 +404,9 @@ Four mechanisms borrowed from the research round landed:
 - Serial like a regular turn (waits for any in-flight turn — the
   sigil daemon model is single-runtime; prime-agent streams side
   questions in parallel).
-- E2E: after one main turn ("中国的首都是哪里？"), a side question
-  ("刚才这个会话里我问了什么？") was answered correctly while the
+- E2E: after one main turn (a Chinese-language question, e.g. asking
+  for the capital of China), a side question (asking what the previous
+  turn had said) was answered correctly while the
   session file kept exactly the two main turns.
 
 ### Phase 69 — 2026-08-11 (nesting depth cap — prime-agent RLM_MAX_DEPTH)
@@ -1073,4 +1074,4 @@ cargo test
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 alitrack.
 
-中文版说明见 [README_cn.md](README_cn.md).
+Chinese version: [README_cn.md](README_cn.md).

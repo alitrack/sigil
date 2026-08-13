@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(unix))]
             {
-                let _ = (socket, provider_arc, tools, agent_config, cli);
+                let _ = (socket, provider_arc, tools, agent_config, &cli);
                 anyhow::bail!("sigil daemon uses a Unix socket and is not available on Windows")
             }
         }
@@ -324,7 +324,8 @@ async fn main() -> Result<()> {
             #[cfg(unix)]
             {
                 let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-                let answer = daemon::send_once(&socket, message, *timeout, session.as_deref()).await?;
+                let answer =
+                    daemon::send_once(&socket, message, *timeout, session.as_deref()).await?;
                 println!("{answer}");
                 Ok(())
             }

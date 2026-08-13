@@ -337,6 +337,30 @@ fn inject_goals_block(messages: &mut Vec<ChatMessage>, block: &str) {
 /// Returns true to run it (interactive override).
 pub type Approver = dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync;
 
+/// A question the agent asks the human mid-turn (brainstorming /
+/// requestUserInput-style flows). The host answers via the AskCb; the
+/// answer text is handed back to the agent loop as the `ask` tool's
+/// result.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AskRequest {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+/// The human's answer to an [`AskRequest`].
+#[derive(Debug, Clone)]
+pub struct AskAnswer {
+    pub text: String,
+}
+
+/// Asynchronous human-input callback: given a question, return the
+/// human's answer. Runs across an async boundary (the host may need to
+/// ask a UI and wait), so it returns a future.
+pub type AskCb = dyn Fn(AskRequest) -> futures_util::future::BoxFuture<'static, anyhow::Result<AskAnswer>>
+    + Send
+    + Sync;
+
 /// Stream callback: called with each chunk of assistant text as it
 /// arrives (UI streaming). Also called with `None` when a tool call
 /// interrupts the text stream (so the UI can flush).

@@ -14,6 +14,7 @@ use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
 pub mod acp;
+pub mod ask;
 pub mod bash;
 pub mod delegate;
 pub mod evolve;

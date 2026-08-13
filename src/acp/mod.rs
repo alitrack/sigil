@@ -47,6 +47,16 @@ pub enum Out {
     },
     /// client/session.update notification.
     Notification { session_id: String, update: Value },
+    /// A prompt was accepted: the turn executor runs in the background
+    /// and `done` yields its outcome. The serve loop watches these
+    /// (FuturesUnordered) so the stdio loop stays free to process
+    /// other messages — required for mid-turn questions
+    /// (`agent/request.input`) which arrive while a turn is running.
+    Deferred {
+        id: Value,
+        session_id: String,
+        done: tokio::sync::oneshot::Receiver<Result<String>>,
+    },
 }
 
 /// How one agent turn runs: prompt → future of the final answer.
@@ -63,7 +73,13 @@ pub struct AcpState {
     /// `agent/request.input`, which resolves it. This is the sigil
     /// extension that turns a one-shot prompt into a two-way
     /// conversation (brainstorming UI, requestUserInput-style flows).
-    pending_inputs: std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>,
+    ///
+    /// Shared (Arc<Mutex>) so the background turn executor — which
+    /// runs outside `handle_message` — can register requests while the
+    /// message loop answers them.
+    pending_inputs: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+    >,
     /// How to run one agent turn (injected; real runs use the agent
     /// loop, tests use a fake). Returns a future so the prompt handler
     /// can await the (long-running) agent loop without blocking.
@@ -85,10 +101,20 @@ impl AcpState {
     /// client's answer would queue behind the prompt on stdin). The
     /// turn executor must therefore run concurrently with the message
     /// loop (spawn + select) once mid-turn questions are used.
+    #[allow(dead_code)] // used by tests and host integrations
     pub fn register_input(&mut self, request_id: String) -> tokio::sync::oneshot::Receiver<Value> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_inputs.insert(request_id, tx);
+        self.pending_inputs.lock().unwrap().insert(request_id, tx);
         rx
+    }
+
+    /// The shared pending-input table (used by the AskCb built in
+    /// [`serve`], which runs outside `handle_message`).
+    pub fn pending_inputs(
+        &self,
+    ) -> Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>>>
+    {
+        self.pending_inputs.clone()
     }
 }
 
@@ -169,47 +195,20 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 })
                 .unwrap_or_default();
 
-            let result = match &state.turn {
-                Some(turn) => (turn)(prompt_text).await,
-                None => Err(anyhow::anyhow!("no turn executor installed")),
-            };
-
-            match result {
-                Ok(text) => {
-                    // Stream: chunk + complete notifications, then response.
-                    outs.push(Out::Notification {
-                        session_id: session_id.clone(),
-                        update: json!({
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": text }
-                        }),
-                    });
-                    outs.push(Out::Notification {
-                        session_id: session_id.clone(),
-                        update: json!({
-                            "sessionUpdate": "agent_message_complete",
-                            "role": "assistant",
-                            "content": [{ "type": "text", "text": text }],
-                            "stopReason": "end_turn"
-                        }),
-                    });
-                    outs.push(Out::Response {
-                        id: id.unwrap_or(Value::Null),
-                        result: Some(json!({ "stopReason": "end_turn" })),
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    outs.push(Out::Response {
-                        id: id.unwrap_or(Value::Null),
-                        result: None,
-                        error: Some(json!({
-                            "code": -32603,
-                            "message": format!("agent error: {e}")
-                        })),
-                    });
-                }
-            }
+            let turn = state.turn.clone();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let result = match &turn {
+                    Some(t) => (t)(prompt_text).await,
+                    None => Err(anyhow::anyhow!("no turn executor installed")),
+                };
+                let _ = done_tx.send(result);
+            });
+            outs.push(Out::Deferred {
+                id: id.unwrap_or(Value::Null),
+                session_id,
+                done: done_rx,
+            });
         }
         "agent/session.close" => {
             let sid = params
@@ -242,7 +241,7 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .unwrap_or("")
                 .to_string();
             let response = params.get("response").cloned().unwrap_or(Value::Null);
-            match state.pending_inputs.remove(&request_id) {
+            match state.pending_inputs.lock().unwrap().remove(&request_id) {
                 Some(tx) => {
                     let _ = tx.send(response);
                     outs.push(Out::Response {
@@ -283,16 +282,76 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
 }
 
 /// Run the ACP server loop on stdin/stdout until EOF.
+///
+/// The loop is concurrent: prompts spawn a background turn and yield
+/// an [`Out::Deferred`], so the stdio loop stays free to answer
+/// mid-turn messages (`agent/request.input`) while a turn runs —
+/// without this, a turn that asks the host a question would deadlock
+/// (its answer would queue on stdin behind the prompt).
 pub async fn serve(
-    tools: ToolRegistry,
+    mut tools: ToolRegistry,
     agent_config: AgentConfig,
     provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>,
 ) -> Result<()> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
 
     let mut state = AcpState::new();
+
+    // Mid-turn question notifications flow from the background turn
+    // executor (AskCb) to the stdio loop over this channel.
+    let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<Out>();
+
+    // The AskCb: surface `agent_request_input` to the host and wait
+    // for its `agent/request.input` answer.
+    {
+        let pending_inputs = state.pending_inputs();
+        let notif_tx_for_ask = notif_tx.clone();
+        let ask_cb: Arc<crate::agent::AskCb> = Arc::new(move |req: crate::agent::AskRequest| {
+            let pending_inputs = pending_inputs.clone();
+            let notif_tx = notif_tx_for_ask.clone();
+            Box::pin(async move {
+                let request_id = format!(
+                    "in-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                pending_inputs
+                    .lock()
+                    .unwrap()
+                    .insert(request_id.clone(), tx);
+                notif_tx
+                    .send(Out::Notification {
+                        session_id: String::new(), // the client matches by requestId
+                        update: json!({
+                            "sessionUpdate": "agent_request_input",
+                            "requestId": request_id,
+                            "question": req.question,
+                            "options": req.options,
+                        }),
+                    })
+                    .map_err(|_| anyhow::anyhow!("host disconnected while asking"))?;
+                let answer = rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("host never answered the question"))?;
+                Ok(crate::agent::AskAnswer {
+                    text: answer
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+        });
+        tools.register(Arc::new(crate::tools::ask::AskTool { cb: ask_cb }));
+    }
+
     // Real turn executor: full agent loop with this run's tools/config.
     let turn = Arc::new(
         move |prompt: String| -> futures_util::future::BoxFuture<'static, Result<String>> {
@@ -304,50 +363,156 @@ pub async fn serve(
     );
     state.turn = Some(turn);
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let outs = handle_message(&mut state, &msg).await?;
-        for out in outs {
-            match out {
-                Out::Response { id, result, error } => {
-                    let mut payload = serde_json::Map::new();
-                    payload.insert("jsonrpc".into(), Value::String("2.0".into()));
-                    if !id.is_null() {
-                        payload.insert("id".into(), id);
+    // Background turns awaiting completion: (request id, session id, outcome).
+    type PendingTurn = (
+        Value,
+        String,
+        Result<String>,
+    );
+    let mut pending: FuturesUnordered<
+        std::pin::Pin<Box<dyn futures_util::Future<Output = PendingTurn>>>,
+    > = FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) if !line.trim().is_empty() => {
+                        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let outs = handle_message(&mut state, &msg).await?;
+                        for out in outs {
+                            match out {
+                                Out::Deferred { id, session_id, done } => {
+                                    pending.push(Box::pin(async move {
+                                        let outcome = done
+                                            .await
+                                            .unwrap_or_else(|_| Err(anyhow::anyhow!("turn dropped")));
+                                        (id, session_id, outcome)
+                                    }));
+                                }
+                                other => write_out(&mut stdout, other).await?,
+                            }
+                        }
                     }
-                    if let Some(r) = result {
-                        payload.insert("result".into(), r);
-                    }
-                    if let Some(e) = error {
-                        payload.insert("error".into(), e);
-                    }
-                    let mut s = serde_json::to_string(&Value::Object(payload))?;
-                    s.push('\n');
-                    stdout.write_all(s.as_bytes()).await?;
-                    stdout.flush().await?;
-                }
-                Out::Notification { session_id, update } => {
-                    let mut payload = serde_json::Map::new();
-                    payload.insert("jsonrpc".into(), Value::String("2.0".into()));
-                    payload.insert(
-                        "method".into(),
-                        Value::String("client/session.update".into()),
-                    );
-                    payload.insert(
-                        "params".into(),
-                        json!({ "sessionId": session_id, "update": update }),
-                    );
-                    let mut s = serde_json::to_string(&Value::Object(payload))?;
-                    s.push('\n');
-                    stdout.write_all(s.as_bytes()).await?;
-                    stdout.flush().await?;
+                    Ok(Some(_)) => continue, // blank line
+                    Ok(None) => break,       // EOF
+                    Err(e) => return Err(e.into()),
                 }
             }
+            Some((id, session_id, result)) = pending.next() => {
+                write_turn_outcome(&mut stdout, id, session_id, result).await?;
+            }
+            Some(out) = notif_rx.recv() => {
+                // Mid-turn question (or any AskCb-emitted) notification.
+                write_out(&mut stdout, out).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write one immediate `Out` (response or notification) to stdout.
+async fn write_out(stdout: &mut tokio::io::Stdout, out: Out) -> Result<()> {
+    match out {
+        Out::Response { id, result, error } => {
+            let mut payload = serde_json::Map::new();
+            payload.insert("jsonrpc".into(), Value::String("2.0".into()));
+            if !id.is_null() {
+                payload.insert("id".into(), id);
+            }
+            if let Some(r) = result {
+                payload.insert("result".into(), r);
+            }
+            if let Some(e) = error {
+                payload.insert("error".into(), e);
+            }
+            let mut s = serde_json::to_string(&Value::Object(payload))?;
+            s.push('\n');
+            stdout.write_all(s.as_bytes()).await?;
+            stdout.flush().await?;
+        }
+        Out::Notification { session_id, update } => {
+            let mut payload = serde_json::Map::new();
+            payload.insert("jsonrpc".into(), Value::String("2.0".into()));
+            payload.insert(
+                "method".into(),
+                Value::String("client/session.update".into()),
+            );
+            payload.insert(
+                "params".into(),
+                json!({ "sessionId": session_id, "update": update }),
+            );
+            let mut s = serde_json::to_string(&Value::Object(payload))?;
+            s.push('\n');
+            stdout.write_all(s.as_bytes()).await?;
+            stdout.flush().await?;
+        }
+        Out::Deferred { .. } => {
+            anyhow::bail!("internal: deferred must be handled by the serve loop")
+        }
+    }
+    Ok(())
+}
+
+/// Write the final outcome of a background turn: streaming chunk +
+/// complete notifications, then the prompt response (or an error).
+async fn write_turn_outcome(
+    stdout: &mut tokio::io::Stdout,
+    id: Value,
+    session_id: String,
+    result: Result<String>,
+) -> Result<()> {
+    match result {
+        Ok(text) => {
+            write_out(
+                stdout,
+                Out::Notification {
+                    session_id: session_id.clone(),
+                    update: json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": text }
+                    }),
+                },
+            )
+            .await?;
+            write_out(
+                stdout,
+                Out::Notification {
+                    session_id: session_id.clone(),
+                    update: json!({
+                        "sessionUpdate": "agent_message_complete",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": text }],
+                        "stopReason": "end_turn"
+                    }),
+                },
+            )
+            .await?;
+            write_out(
+                stdout,
+                Out::Response {
+                    id,
+                    result: Some(json!({ "stopReason": "end_turn" })),
+                    error: None,
+                },
+            )
+            .await?;
+        }
+        Err(e) => {
+            write_out(
+                stdout,
+                Out::Response {
+                    id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32603,
+                        "message": format!("agent error: {e}")
+                    })),
+                },
+            )
+            .await?;
         }
     }
     Ok(())

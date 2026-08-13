@@ -68,7 +68,8 @@ mod acp_tests {
             _ => panic!("expected session id"),
         };
 
-        // prompt
+        // prompt — now deferred: the turn executor runs in the
+        // background so the loop can answer mid-turn messages.
         let outs = handle_message(
             &mut s,
             &json!({
@@ -78,28 +79,19 @@ mod acp_tests {
         )
         .await
         .unwrap();
-        assert_eq!(outs.len(), 3); // chunk + complete + response
-        // First is a chunk notification.
-        match &outs[0] {
-            Out::Notification {
-                session_id: sid,
-                update,
-            } => {
-                assert_eq!(sid, &session_id);
-                assert_eq!(update["sessionUpdate"], "agent_message_chunk");
-                assert_eq!(update["content"]["text"], "fake-echo: hi");
-            }
-            _ => panic!("expected notification"),
-        }
-        // Last is the response.
-        match &outs[2] {
-            Out::Response { id, result, error } => {
-                assert_eq!(id, &json!(3));
-                assert!(error.is_none());
-                assert_eq!(result.as_ref().unwrap()["stopReason"], "end_turn");
-            }
-            _ => panic!("expected response"),
-        }
+        assert_eq!(outs.len(), 1);
+        let (deferred_id, deferred_sid, done) = match outs.into_iter().next().unwrap() {
+            Out::Deferred {
+                id,
+                session_id,
+                done,
+            } => (id, session_id, done),
+            _ => panic!("expected deferred prompt"),
+        };
+        assert_eq!(deferred_id, json!(3));
+        assert_eq!(deferred_sid, session_id);
+        let text = done.await.unwrap().unwrap();
+        assert_eq!(text, "fake-echo: hi");
 
         // close
         let outs = handle_message(
@@ -155,13 +147,12 @@ mod acp_tests {
         .await
         .unwrap();
         assert_eq!(outs.len(), 1);
-        match &outs[0] {
-            Out::Response { error: Some(e), .. } => {
-                assert_eq!(e["code"], -32603);
-                assert!(e["message"].as_str().unwrap().contains("boom"));
-            }
-            _ => panic!("expected error response"),
-        }
+        let done = match outs.into_iter().next().unwrap() {
+            Out::Deferred { done, .. } => done,
+            _ => panic!("expected deferred prompt"),
+        };
+        let err = done.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("boom"), "err: {err}");
     }
 
     #[tokio::test]
@@ -202,8 +193,7 @@ mod acp_tests {
         // Server side registers a question (as the AskCb would);
         // the host answers; the answer reaches the waiting AskCb.
         let mut s = AcpState::new();
-        let mut rx = s.register_input("req-1".to_string());
-
+        let rx = s.register_input("req-1".to_string());
         let outs = handle_message(
             &mut s,
             &json!({
@@ -242,29 +232,23 @@ mod acp_tests {
         .await
         .unwrap();
         match &outs[0] {
-            Out::Response {
-                error: Some(e), ..
-            } => assert_eq!(e["code"], -32602),
+            Out::Response { error: Some(e), .. } => assert_eq!(e["code"], -32602),
             _ => panic!("expected error response"),
         }
     }
 
     #[tokio::test]
-    async fn turn_executor_can_wait_for_input_round_trip() {
-        // Mechanism proof: a turn executor that pauses on a oneshot
-        // (exactly what the AskCb will do) and resumes once the answer
-        // arrives — the protocol-level half of the mid-turn question
-        // flow. (The serve loop itself needs a concurrent select to
-        // avoid deadlock; that is the documented follow-up.)
+    async fn prompt_with_mid_turn_question_round_trip() {
+        // Full mid-turn question flow on a single state: the prompt
+        // returns a Deferred (turn runs in background), the turn
+        // blocks on the registered input, the host answers via
+        // `agent/request.input`, and the turn resumes with the answer
+        // woven into its output.
         let mut s = AcpState::new();
         let rx = s.register_input("req-2".to_string());
         let rx_slot: Arc<std::sync::Mutex<Option<_>>> = Arc::new(std::sync::Mutex::new(Some(rx)));
         let rx_slot2 = rx_slot.clone();
-
-        // Separate state for the prompt side (its turn executor
-        // references the pending input registered on `s`).
-        let mut s2 = AcpState::new();
-        s2.turn = Some(Arc::new(move |prompt: String| {
+        s.turn = Some(Arc::new(move |prompt: String| {
             let rx_slot2 = rx_slot2.clone();
             Box::pin(async move {
                 let rx = rx_slot2
@@ -278,17 +262,20 @@ mod acp_tests {
             })
         }));
 
-        // Kick the prompt in the background (its turn will block on rx).
-        let prompt_handle = tokio::spawn(async move {
-            handle_message(
-                &mut s2,
-                &json!({
-                    "jsonrpc": "2.0", "id": 11, "method": "agent/session.prompt",
-                    "params": { "sessionId": "x", "prompt": [{ "type": "text", "text": "方案A还是B?" }] }
-                }),
-            )
-            .await
-        });
+        // Prompt → deferred; the background turn blocks on the question.
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 11, "method": "agent/session.prompt",
+                "params": { "sessionId": "x", "prompt": [{ "type": "text", "text": "方案A还是B?" }] }
+            }),
+        )
+        .await
+        .unwrap();
+        let done = match outs.into_iter().next().unwrap() {
+            Out::Deferred { done, .. } => done,
+            _ => panic!("expected deferred prompt"),
+        };
 
         // Give the turn a moment to block on the question, then answer.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -301,17 +288,16 @@ mod acp_tests {
         )
         .await
         .unwrap();
-        assert!(matches!(&outs[0], Out::Response { result: Some(_), .. }));
+        assert!(matches!(
+            &outs[0],
+            Out::Response {
+                result: Some(_),
+                ..
+            }
+        ));
 
-        // The turn finished with the answer woven into its output.
-        let prompt_outs = prompt_handle.await.unwrap().unwrap();
-        let text = prompt_outs
-            .iter()
-            .find_map(|o| match o {
-                Out::Notification { update, .. } => update["content"]["text"].as_str(),
-                _ => None,
-            })
-            .unwrap_or("");
+        // The deferred turn finished with the answer in its output.
+        let text = done.await.unwrap().unwrap();
         assert!(text.contains("chose 方案B"), "text was: {text}");
     }
 }

@@ -1029,6 +1029,28 @@ plus one doc correction:
   after the cutoff (same format as turn timestamps). Untimestamped legacy
   turns are always kept; an export that would be empty fails cleanly.
 
+### v0.2.0 — 2026-08-13
+Delegation & sub-agents, daemon + cron, robustness, and the thin-core
+roadmap (Lua policy layer). Highlights:
+
+- **Sub-agent delegation**: typed agents (TOML frontmatter, tool
+  allowlists), spawn / resume / delete / status, per-agent model and
+  context budget, parent↔child messaging, token usage metrics, nesting
+  capped at depth 1.
+- **Daemon + cron**: `sigil daemon` attach/send with session persistence;
+  cron jobs (`once` / every N seconds); side questions.
+- **Robustness**: parallel tool execution, reactive compaction, planning
+  checkpoints, LLM failover chain, versioned harness rollback, local/global
+  harness layers (prime-agent style).
+- **Lua sandbox hardening**: stdlib IO/OS removed, host helpers only,
+  require whitelist.
+- **MCP**: streamable HTTP transport for MCP clients.
+- **Thin-core roadmap (P-A/P-B/P-C)**: Lua hooks at agent-loop points
+  (`on_turn_start` / `on_tool_result` / `on_prompt_build`), model-authored
+  policy hooks via `improve_harness` with versioned rollback — the model
+  evolves its own instruction layer at runtime, with no restart.
+- 194 unit & integration tests.
+
 ### v0.1.0 — 2026-08-09
 First tagged release. Full agent core: pipe / REPL / ACP / MCP modes,
 vendored LuaJIT with real FFI, self-evolution (Lua tools + harness

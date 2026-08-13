@@ -843,6 +843,25 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 - **`session export --since <cutoff>`**：只导出 cutoff 及之后写入的轮次
   （格式与轮次时间戳相同）。无时间戳的旧轮次始终保留；过滤后为空则干净报错。
 
+### v0.2.0 — 2026-08-13
+委托与子代理、daemon + cron、健壮性、以及薄化路线（Lua 策略层）。要点：
+
+- **子代理委托**：类型化代理（TOML frontmatter、工具白名单）、
+  spawn / resume / delete / status、按子代理独立模型与上下文预算、
+  父子双向消息、token 用量统计、嵌套深度上限 1。
+- **Daemon + cron**：`sigil daemon` attach/send 会话持久化；
+  cron 任务（`once` / 每 N 秒）；旁路提问。
+- **健壮性**：并行工具执行、反应式压缩、规划检查点、
+  LLM 故障转移链、版本化 harness 回滚、local/global 双轨 harness
+  （prime-agent 风格）。
+- **Lua 沙箱加固**：stdlib IO/OS 移除、只走 host helpers、require 白名单。
+- **MCP**：MCP 客户端 Streamable HTTP 传输。
+- **薄化路线（P-A/P-B/P-C）**：agent loop 钩子
+  （`on_turn_start` / `on_tool_result` / `on_prompt_build`）、
+  `improve_harness` 模型自写策略钩子 + 版本化回滚——模型可在运行时
+  无重启地进化自身指令层。
+- 194 个单元与集成测试。
+
 ### v0.1.0 — 2026-08-09
 首个正式发布版本。完整 agent 核心：管道 / REPL / ACP / MCP 模式、
 vendored LuaJIT 真实 FFI、自进化（Lua 工具 + harness 指令层）、

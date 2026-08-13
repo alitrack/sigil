@@ -10,6 +10,15 @@
 # max_steps = 10            # tool-call budget per turn (0 = unlimited)
 # system_prompt = "..."     # optional override of the default system prompt
 
+# Agent-loop Lua hooks (default: ~/.sigil/hooks/).
+# Hook files follow the scripted-tool contract: return a function taking
+# the context table; returning a string injects/rewrites, nil is a no-op.
+#   on_turn_start.lua   -> returned string becomes a per-turn system message
+#   on_tool_result.lua  -> returned string replaces the tool result text
+# Example on_tool_result.lua:
+#   return function(ctx) return ctx.result .. '\n[note: results are logged]' end
+# hooks_dir = "~/.sigil/hooks"
+
 # MCP client: spawn stdio MCP servers; their tools become
 # mcp_<server>_<tool> in sigil's registry.
 # [[mcp.servers]]

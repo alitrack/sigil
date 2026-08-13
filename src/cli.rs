@@ -33,6 +33,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tools_dir: Option<String>,
 
+    /// Directory with agent-loop Lua hooks (default: ~/.sigil/hooks/).
+    /// Hook files follow the scripted-tool contract and run at loop
+    /// points: on_turn_start.lua (per-turn system injection),
+    /// on_tool_result.lua (tool output rewrite).
+    #[arg(long, global = true)]
+    pub hooks_dir: Option<String>,
+
     /// Harness bundle directory (system prompt + skills; default: ~/.sigil/harness/).
     #[arg(long, global = true)]
     pub harness_dir: Option<String>,

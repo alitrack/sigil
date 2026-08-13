@@ -7,6 +7,7 @@ mod daemon;
 mod doctor;
 mod goals;
 mod harness;
+mod hooks;
 mod llm;
 mod lua;
 mod mcp;
@@ -97,6 +98,19 @@ async fn main() -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(harness::default_harness_dir);
     let goals = std::sync::Arc::new(std::sync::RwLock::new(goals::load_goals(&goals_dir)));
+
+    // Agent-loop Lua hooks (P-A thin-core roadmap): hook files under
+    // the hooks dir (default ~/.sigil/hooks) run at agent-loop points.
+    let hooks_dir = cli
+        .hooks_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(hooks::default_hooks_dir);
+    let hooks_lua = std::sync::Arc::new(std::sync::Mutex::new(
+        lua::LuaRuntime::new().expect("lua runtime init"),
+    ));
+    let hooks = std::sync::Arc::new(hooks::HookRunner::new(hooks_lua, hooks_dir));
+
     let mut tools = ToolRegistry::with_tools(
         Some(tools_dir.as_path()),
         cli.harness_dir.as_deref().map(std::path::Path::new),
@@ -153,6 +167,8 @@ async fn main() -> Result<()> {
         model: config.model.clone(),
         max_steps: config.max_steps,
         prompt_state: prompt_state.clone(),
+        // Agent-loop Lua hooks (P-A thin-core roadmap).
+        hooks: Some(hooks.clone()),
         // Dynamic skill selection: inline at most 3 relevant skills
         // per turn (keyword-overlap ranked).
         max_inline_skills: 3,

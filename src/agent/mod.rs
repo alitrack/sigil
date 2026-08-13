@@ -60,6 +60,11 @@ pub struct AgentConfig {
     /// `planning_interval`): every N agent-loop steps the model is
     /// asked to restate its plan before continuing. `0` disables.
     pub planning_interval: u32,
+    /// Agent-loop Lua hooks (P-A thin-core roadmap). `None` = hooks
+    /// disabled. When set, hook files under the runner's directory
+    /// (e.g. `on_tool_result.lua`, `on_turn_start.lua`) run at their
+    /// loop points; absent files are a no-op.
+    pub hooks: Option<std::sync::Arc<crate::hooks::HookRunner>>,
 }
 
 /// Planning checkpoint prompt injected every `planning_interval` steps.
@@ -466,6 +471,19 @@ pub async fn run_messages(
         }
         step += 1;
 
+        // P-A hook: on_turn_start can inject context at the top of
+        // each turn (returned string becomes a system message).
+        if let Some(hooks) = &config.hooks
+            && let Some(text) = hooks
+                .run(
+                    "on_turn_start",
+                    serde_json::json!({ "step": step, "model": config.model }),
+                )
+                .await?
+        {
+            messages.push(ChatMessage::system(text));
+        }
+
         let req = ChatRequest {
             model: config.model.clone(),
             messages: messages.clone(),
@@ -657,6 +675,22 @@ pub async fn run_messages(
                         .remove(&i)
                         .unwrap_or_else(|| "error: tool produced no result".into()),
                 };
+                // P-A hook: on_tool_result can rewrite what the model
+                // sees (returned string replaces the result text).
+                let msg = match &config.hooks {
+                    Some(hooks) => hooks
+                        .run(
+                            "on_tool_result",
+                            serde_json::json!({
+                                "name": plan.call.name,
+                                "args": plan.call.arguments,
+                                "result": msg,
+                            }),
+                        )
+                        .await?
+                        .unwrap_or(msg),
+                    None => msg,
+                };
                 messages.push(ChatMessage::tool_result(msg, plan.call.id));
             }
             // Evolution: hot-register any tools the model created this
@@ -748,7 +782,7 @@ mod parallel_tests {
     use super::*;
     use crate::llm::provider::{ChatComplete, ChatRequest, ChatStream, LlmProvider, ToolCall};
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -896,6 +930,7 @@ mod parallel_tests {
             goals: None,
             goals_dir: None,
             planning_interval: 0,
+            hooks: None,
         }
     }
 
@@ -926,6 +961,7 @@ mod parallel_tests {
             goals: None,
             goals_dir: None,
             planning_interval: 0,
+            hooks: None,
         };
         // 10 user turns -> well over the 6-message budget.
         let mut msgs = vec![ChatMessage::system("SYS")];
@@ -1027,6 +1063,7 @@ mod parallel_tests {
             goals: None,
             goals_dir: None,
             planning_interval: 2,
+            hooks: None,
         };
         let answer = run_messages(
             &provider,
@@ -1137,6 +1174,223 @@ mod parallel_tests {
         assert!(
             gap < 150,
             "fast tool started {gap}ms after slow tool — expected <150ms (concurrent), got serial execution"
+        );
+    }
+
+    /// Returns "OUT" immediately — the tool the hook tests drive.
+    struct EchoTool;
+    #[async_trait]
+    impl crate::tools::Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+        fn description(&self) -> &str {
+            "echo for hook test"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(&self, _args: &serde_json::Value) -> anyhow::Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput { text: "OUT".into() })
+        }
+    }
+
+    /// Step 0: one tool call. Step 1: verifies the tool_result message
+    /// was rewritten by the on_tool_result hook, then answers.
+    #[derive(Debug)]
+    struct HookResultProvider {
+        calls: AtomicUsize,
+        saw_rewrite: AtomicBool,
+    }
+    #[async_trait]
+    impl LlmProvider for HookResultProvider {
+        fn name(&self) -> &str {
+            "hook-result-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: true,
+                        usage: None,
+                    },
+                )]))),
+                _ => {
+                    let rewritten = req
+                        .messages
+                        .iter()
+                        .filter(|m| matches!(m.role, crate::llm::provider::Role::Tool))
+                        .any(|m| m.content.contains("[hook]"));
+                    self.saw_rewrite.store(rewritten, Ordering::SeqCst);
+                    Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                        crate::llm::provider::ChatChunk {
+                            delta: "HOOKED-DONE".into(),
+                            thinking: false,
+                            done: true,
+                            tool_calls_requested: false,
+                            usage: None,
+                        },
+                    )])))
+                }
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn on_tool_result_hook_rewrites_tool_output() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("result");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("on_tool_result.lua"),
+            "return function(ctx) return ctx.result .. ' [hook]' end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let provider = HookResultProvider {
+            calls: AtomicUsize::new(0),
+            saw_rewrite: AtomicBool::new(false),
+        };
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("run echo")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "HOOKED-DONE");
+        assert!(
+            provider.saw_rewrite.load(Ordering::SeqCst),
+            "tool_result must be rewritten by the on_tool_result hook"
+        );
+    }
+
+    /// Step 0: verifies the first request carries the on_turn_start
+    /// hook's injected system message, then emits a tool call; step 1
+    /// answers.
+    #[derive(Debug)]
+    struct TurnStartProvider {
+        calls: AtomicUsize,
+        saw_inject: AtomicBool,
+    }
+    #[async_trait]
+    impl LlmProvider for TurnStartProvider {
+        fn name(&self) -> &str {
+            "hook-turn-start-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => {
+                    let injected = req
+                        .messages
+                        .iter()
+                        .filter(|m| matches!(m.role, crate::llm::provider::Role::System))
+                        .any(|m| m.content.contains("TURN-START-HOOK"));
+                    self.saw_inject.store(injected, Ordering::SeqCst);
+                    Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                        crate::llm::provider::ChatChunk {
+                            delta: String::new(),
+                            thinking: false,
+                            done: true,
+                            tool_calls_requested: true,
+                            usage: None,
+                        },
+                    )])))
+                }
+                _ => Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "INJECTED-DONE".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                        usage: None,
+                    },
+                )]))),
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn on_turn_start_hook_injects_system_message() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("turn-start");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("on_turn_start.lua"),
+            "return function(ctx) return 'TURN-START-HOOK step=' .. ctx.step end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let provider = TurnStartProvider {
+            calls: AtomicUsize::new(0),
+            saw_inject: AtomicBool::new(false),
+        };
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("run echo")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "INJECTED-DONE");
+        assert!(
+            provider.saw_inject.load(Ordering::SeqCst),
+            "on_turn_start hook text must appear in the first request"
         );
     }
 

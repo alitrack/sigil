@@ -364,11 +364,7 @@ pub async fn serve(
     state.turn = Some(turn);
 
     // Background turns awaiting completion: (request id, session id, outcome).
-    type PendingTurn = (
-        Value,
-        String,
-        Result<String>,
-    );
+    type PendingTurn = (Value, String, Result<String>);
     let mut pending: FuturesUnordered<
         std::pin::Pin<Box<dyn futures_util::Future<Output = PendingTurn>>>,
     > = FuturesUnordered::new();

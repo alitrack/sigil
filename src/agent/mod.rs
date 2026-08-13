@@ -21,7 +21,7 @@ use crate::tools::ToolRegistry;
 mod tests;
 
 /// Agent loop configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentConfig {
     pub model: String,
     /// 0 = no step limit (a turn runs until the model stops calling tools).
@@ -65,6 +65,12 @@ pub struct AgentConfig {
     /// (e.g. `on_tool_result.lua`, `on_turn_start.lua`) run at their
     /// loop points; absent files are a no-op.
     pub hooks: Option<std::sync::Arc<crate::hooks::HookRunner>>,
+    /// Event sink for event-sourced session logging (Phase 63). When
+    /// set, the agent loop emits `ToolCall` / `ToolResult` events as
+    /// tools execute; the owner (REPL/daemon) appends them to the
+    /// session log. `None` = no session-event recording (pipe mode,
+    /// tests, delegates).
+    pub session_sink: Option<std::sync::Arc<dyn Fn(crate::session::Event) + Send + Sync>>,
 }
 
 /// Planning checkpoint prompt injected every `planning_interval` steps.
@@ -677,6 +683,19 @@ pub async fn run_messages(
             }
             let mut plans: Vec<Plan> = Vec::with_capacity(complete.tool_calls.len());
             let mut executables: Vec<usize> = Vec::new(); // plan indices to run
+            // Session event sink (Phase 63 event-sourced logging): emit
+            // one ToolCall event per requested call before gating, so
+            // the raw log records what the model asked for even when
+            // approval later blocks it.
+            if let Some(sink) = &config.session_sink {
+                for call in &complete.tool_calls {
+                    sink(crate::session::Event::ToolCall {
+                        ts: None,
+                        name: call.name.clone(),
+                        args: call.arguments.to_string(),
+                    });
+                }
+            }
             for call in &complete.tool_calls {
                 // Approval gate: reject destructive commands in
                 // non-interactive mode before they ever run. In
@@ -745,12 +764,25 @@ pub async fn run_messages(
                 executed.into_iter().collect();
 
             for (i, plan) in plans.into_iter().enumerate() {
-                let msg = match plan.blocked {
-                    Some(m) => m,
+                let blocked = plan.blocked.clone();
+                let msg = match &blocked {
+                    Some(m) => m.clone(),
                     None => results_by_plan
                         .remove(&i)
                         .unwrap_or_else(|| "error: tool produced no result".into()),
                 };
+                // Session event sink: emit ToolResult with the observed
+                // outcome (ok = executed and not an error-prefixed string;
+                // blocked/rejected calls emit ok=false).
+                if let Some(sink) = &config.session_sink {
+                    let ok = blocked.is_none() && !msg.starts_with("error:");
+                    sink(crate::session::Event::ToolResult {
+                        ts: None,
+                        name: plan.call.name.clone(),
+                        ok,
+                        output: msg.clone(),
+                    });
+                }
                 // P-A hook: on_tool_result can rewrite what the model
                 // sees (returned string replaces the result text).
                 let msg = match &config.hooks {
@@ -1007,6 +1039,7 @@ mod parallel_tests {
             goals_dir: None,
             planning_interval: 0,
             hooks: None,
+            session_sink: None,
         }
     }
 
@@ -1038,6 +1071,7 @@ mod parallel_tests {
             goals_dir: None,
             planning_interval: 0,
             hooks: None,
+            session_sink: None,
         };
         // 10 user turns -> well over the 6-message budget.
         let mut msgs = vec![ChatMessage::system("SYS")];
@@ -1140,6 +1174,7 @@ mod parallel_tests {
             goals_dir: None,
             planning_interval: 2,
             hooks: None,
+            session_sink: None,
         };
         let answer = run_messages(
             &provider,
@@ -1251,6 +1286,78 @@ mod parallel_tests {
             gap < 150,
             "fast tool started {gap}ms after slow tool — expected <150ms (concurrent), got serial execution"
         );
+    }
+
+    #[tokio::test]
+    async fn session_sink_emits_tool_call_and_result_events() {
+        // Phase 63 event-sourced logging: with a session_sink wired,
+        // the loop must emit one ToolCall event per requested call and
+        // one ToolResult per outcome, in order.
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(SlowTool(Arc::new(Mutex::new(Vec::new())))));
+        tools.register(Arc::new(FastTool(Arc::new(Mutex::new(Vec::new())))));
+
+        let provider = TwoCallProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let events: Arc<Mutex<Vec<crate::session::Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut config = test_config();
+        let sink = events.clone();
+        config.session_sink = Some(std::sync::Arc::new(move |ev| sink.lock().unwrap().push(ev)));
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("run both tools")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "DONE");
+
+        {
+            let evs = events.lock().unwrap();
+            // 2 ToolCall (slow_tool, fast_tool) + 2 ToolResult, in order:
+            // both calls emitted before any result (calls are emitted at
+            // plan time, results after execution).
+            assert_eq!(evs.len(), 4, "expected 2 calls + 2 results, got {evs:?}");
+            assert_eq!(evs[0].kind(), "tool_call");
+            assert_eq!(evs[1].kind(), "tool_call");
+            assert_eq!(evs[2].kind(), "tool_result");
+            assert_eq!(evs[3].kind(), "tool_result");
+            // Names match the requested tools; both succeeded.
+            match &evs[0] {
+                crate::session::Event::ToolCall { name, .. } => assert_eq!(name, "slow_tool"),
+                other => panic!("expected tool_call, got {other:?}"),
+            }
+            match &evs[2] {
+                crate::session::Event::ToolResult { ok, output, .. } => {
+                    assert!(*ok, "slow_tool should succeed");
+                    assert!(!output.is_empty());
+                }
+                other => panic!("expected tool_result, got {other:?}"),
+            }
+        } // lock released here, before the second turn awaits
+        // No session_sink → turn still succeeds (regression guard).
+        let config2 = test_config();
+        let provider2 = TwoCallProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let mut tools2 = crate::tools::ToolRegistry::new();
+        tools2.register(Arc::new(SlowTool(Arc::new(Mutex::new(Vec::new())))));
+        tools2.register(Arc::new(FastTool(Arc::new(Mutex::new(Vec::new())))));
+        let _ = run_messages(
+            &provider2,
+            &mut tools2,
+            &config2,
+            &[ChatMessage::user("run both tools")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
     }
 
     /// Returns "OUT" immediately — the tool the hook tests drive.

@@ -189,6 +189,7 @@ async fn main() -> Result<()> {
         // auto-pauses there (same dir the manage_goals tool writes).
         goals_dir: Some(goals_dir),
         planning_interval: 0,
+        session_sink: None,
     };
 
     // Sub-agent delegation: the model can spin off independent tasks.

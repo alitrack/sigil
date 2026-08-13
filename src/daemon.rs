@@ -169,10 +169,23 @@ pub async fn serve(
                     let messages = session.messages.lock().await;
                     run_msgs.extend(messages.clone());
                 }
+                // Phase 63 event-sourced logging: per-job config clone
+                // with a sink pinned to this job's session id (daemon
+                // runs jobs concurrently, so a shared sink would cross
+                // sessions).
+                let mut job_config = cron_config.clone();
+                {
+                    let sink_dir = cron_sessions_dir.clone();
+                    let sink_sid = sid.clone();
+                    job_config.session_sink =
+                        Some(std::sync::Arc::new(move |ev: crate::session::Event| {
+                            let _ = crate::session::append_event(&sink_dir, &sink_sid, &ev);
+                        }));
+                }
                 if let Ok(result) = run_messages(
                     cron_provider.as_ref(),
                     &mut cron_tools,
-                    &cron_config,
+                    &job_config,
                     &run_msgs,
                     None,
                     None,

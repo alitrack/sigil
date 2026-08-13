@@ -243,6 +243,7 @@ async fn self_evolution_loop_hook_goes_live_same_session() {
             lua,
             hooks.clone(),
         ))),
+        session_sink: None,
     };
 
     /// Echo tool the model's hook will rewrite the output of.

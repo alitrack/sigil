@@ -68,6 +68,25 @@ pub async fn run(
     };
     let mut session_id = resume_id;
     let mut history = crate::session::load(sessions_dir, &session_id)?;
+
+    // Phase 63 event-sourced session logging: wire a session sink into
+    // the agent config so tool calls/results inside the loop are
+    // appended to the current session's event log. `session_id` is
+    // mutable (`/session <id>` switches mid-REPL), so the sink reads
+    // the current id through a shared cell.
+    let sid_shared = std::sync::Arc::new(std::sync::Mutex::new(session_id.clone()));
+    let mut config = config.clone();
+    {
+        let sink_dir = sessions_dir.to_path_buf();
+        let sink_id = sid_shared.clone();
+        config.session_sink = Some(std::sync::Arc::new(move |ev: crate::session::Event| {
+            let id = match sink_id.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            let _ = crate::session::append_event(&sink_dir, &id, &ev);
+        }));
+    }
     if !history.is_empty() {
         println!(
             "{}",
@@ -159,6 +178,9 @@ pub async fn run(
                 match crate::session::load(sessions_dir, &target) {
                     Ok(turns) => {
                         session_id = target.to_string();
+                        if let Ok(mut g) = sid_shared.lock() {
+                            *g = session_id.clone();
+                        }
                         history = turns.clone();
                         messages.clear();
                         for t in &history {
@@ -266,7 +288,7 @@ pub async fn run(
         let result = match crate::agent::run_messages(
             provider,
             tools,
-            config,
+            &config,
             &messages,
             Some(&approver),
             Some(&stream_cb),

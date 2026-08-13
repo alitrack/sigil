@@ -2,10 +2,24 @@
 //! (`~/.sigil/sessions/<timestamp>.jsonl`); `--resume <id>` loads a
 //! session's history so a conversation continues across invocations.
 //!
-//! Format: one JSON object per line — `{"role": "user"|"assistant",
-//! "text": "..."}`. Sessions are plain text history (the harness and
-//! memory tools provide the durable knowledge store; this is the
-//! conversational transcript).
+//! Storage format is an **event-sourced log** (Phase 63, borrowing the
+//! DeepSeek Harness session-log design): each line is a typed event —
+//! user/assistant messages, tool calls, tool results — and the line
+//! number doubles as the monotonic event `seq` (no stored counter, so
+//! concurrent appenders cannot corrupt a shared sequence). Replay is
+//! deterministic: the raw log is never rewritten, so future features
+//! (fork/resume branches, tool-call visualization, audit trails) can
+//! re-derive any projection.
+//!
+//! Line shapes:
+//! - New: `{"e":"user","ts":"...","text":"..."}` (event tag `e`)
+//! - Legacy (pre-Phase 63): `{"role":"user","text":"...","ts":"..."}`
+//!   — recognized by the absence of `e` and projected into events on load.
+//!
+//! The public `append(Turn)` / `load() -> Vec<Turn>` surface is
+//! unchanged; `append` writes event lines, `load` projects events back
+//! to turns, so existing callers (REPL, daemon, export/import) are
+//! untouched.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -19,7 +33,8 @@ pub fn default_sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
-/// A single recorded turn.
+/// A single recorded turn (the conversation-level projection of events;
+/// tool events are not part of this view).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Turn {
     pub role: String, // "user" | "assistant"
@@ -28,6 +43,104 @@ pub struct Turn {
     /// precision). `None` for legacy JSONL lines written before Phase 31.
     #[serde(default)]
     pub ts: Option<String>,
+}
+
+/// A typed session-log event (Phase 63 event-sourced format).
+///
+/// `seq` is assigned by the reader as the 1-based line number — it is
+/// NOT stored in the file, so appends never need to read back the tail
+/// to compute the next sequence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "e", rename_all = "snake_case")]
+pub enum Event {
+    /// A user message (also the start of a turn).
+    User {
+        #[serde(default)]
+        ts: Option<String>,
+        text: String,
+    },
+    /// An assistant reply text (final answer or streamed text).
+    Assistant {
+        #[serde(default)]
+        ts: Option<String>,
+        text: String,
+    },
+    /// A tool invocation requested by the model.
+    ToolCall {
+        #[serde(default)]
+        ts: Option<String>,
+        name: String,
+        args: String,
+    },
+    /// The outcome of a tool invocation.
+    ToolResult {
+        #[serde(default)]
+        ts: Option<String>,
+        name: String,
+        /// `true` = tool succeeded; `false` = error output.
+        ok: bool,
+        output: String,
+    },
+}
+
+impl Event {
+    /// Stable display tag for tooling (same strings as the `e` tag).
+    /// Used by tests today; wired to the P1 `/session events` viewer.
+    #[allow(dead_code)]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Event::User { .. } => "user",
+            Event::Assistant { .. } => "assistant",
+            Event::ToolCall { .. } => "tool_call",
+            Event::ToolResult { .. } => "tool_result",
+        }
+    }
+
+    /// Timestamp, if the event carried one.
+    #[allow(dead_code)]
+    pub fn ts(&self) -> Option<&str> {
+        match self {
+            Event::User { ts, .. }
+            | Event::Assistant { ts, .. }
+            | Event::ToolCall { ts, .. }
+            | Event::ToolResult { ts, .. } => ts.as_deref(),
+        }
+    }
+
+    /// Human-readable one-line summary (P1 `/session events` viewer).
+    #[allow(dead_code)]
+    pub fn summary(&self) -> String {
+        match self {
+            Event::User { text, .. } => {
+                format!("user: {}", flat_preview(text, 60))
+            }
+            Event::Assistant { text, .. } => {
+                format!("assistant: {}", flat_preview(text, 60))
+            }
+            Event::ToolCall { name, args, .. } => {
+                format!("tool_call: {name}({})", flat_preview(args, 40))
+            }
+            Event::ToolResult {
+                name, ok, output, ..
+            } => {
+                let status = if *ok { "ok" } else { "err" };
+                format!(
+                    "tool_result: {name} [{status}] {}",
+                    flat_preview(output, 40)
+                )
+            }
+        }
+    }
+}
+
+/// First N chars of text with whitespace flattened to single spaces.
+fn flat_preview(s: &str, n: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(n).collect();
+    if flat.chars().count() > n {
+        out.push('…');
+    }
+    out
 }
 
 /// Start a new session file, returning its id (file stem).
@@ -50,38 +163,130 @@ pub fn start_with_id(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Append one turn to a session file. If the turn has no `ts` yet, it is
-/// stamped with the current timestamp (callers can supply an explicit `ts`
-/// for replay/import of historical turns).
-pub fn append(sessions_dir: &Path, id: &str, turn: &Turn) -> std::io::Result<()> {
+/// Append one event to a session file. If the event has no `ts` yet, it
+/// is stamped with the current timestamp.
+pub fn append_event(sessions_dir: &Path, id: &str, ev: &Event) -> std::io::Result<()> {
     let path = sessions_dir.join(format!("{id}.jsonl"));
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    let mut stamped = turn.clone();
-    if stamped.ts.is_none() {
-        stamped.ts = Some(chrono_like_timestamp());
-    }
+    let stamped = stamp_event(ev);
     let line = serde_json::to_string(&stamped).map_err(std::io::Error::other)?;
     writeln!(f, "{line}")
 }
 
-/// Load a session's turns (empty if the session doesn't exist).
-pub fn load(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Turn>> {
+/// Append one turn (compat wrapper: writes the equivalent event line).
+/// If the turn has no `ts` yet, it is stamped with the current timestamp
+/// (callers can supply an explicit `ts` for replay/import of historical
+/// turns).
+pub fn append(sessions_dir: &Path, id: &str, turn: &Turn) -> std::io::Result<()> {
+    let ev = match turn.role.as_str() {
+        "assistant" => Event::Assistant {
+            ts: turn.ts.clone(),
+            text: turn.text.clone(),
+        },
+        _ => Event::User {
+            ts: turn.ts.clone(),
+            text: turn.text.clone(),
+        },
+    };
+    append_event(sessions_dir, id, &ev)
+}
+
+/// Stamp a missing timestamp onto a clone of the event.
+fn stamp_event(ev: &Event) -> Event {
+    let ts = ev
+        .ts()
+        .map(|s| s.to_string())
+        .unwrap_or_else(chrono_like_timestamp);
+    match ev {
+        Event::User { text, .. } => Event::User {
+            ts: Some(ts),
+            text: text.clone(),
+        },
+        Event::Assistant { text, .. } => Event::Assistant {
+            ts: Some(ts),
+            text: text.clone(),
+        },
+        Event::ToolCall { name, args, .. } => Event::ToolCall {
+            ts: Some(ts),
+            name: name.clone(),
+            args: args.clone(),
+        },
+        Event::ToolResult {
+            name, ok, output, ..
+        } => Event::ToolResult {
+            ts: Some(ts),
+            name: name.clone(),
+            ok: *ok,
+            output: output.clone(),
+        },
+    }
+}
+
+/// Load a session's event log with 1-based `seq` assigned per line.
+/// Legacy lines (no `e` tag) are parsed as turns and projected into
+/// events on the fly, so old session files keep working unchanged.
+/// Returns `(events, next_seq)`.
+pub fn load_events(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Event>> {
     let path = sessions_dir.join(format!("{id}.jsonl"));
     if !path.exists() {
         return Ok(Vec::new());
     }
     let f = fs::File::open(path)?;
-    let mut turns = Vec::new();
+    let mut events = Vec::new();
     for line in BufReader::new(f).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(t) = serde_json::from_str::<Turn>(&line) {
-            turns.push(t);
+        let ev: Option<Event> = serde_json::from_str(&line).ok();
+        match ev {
+            Some(e) => events.push(e),
+            // Legacy line without `e` tag → parse as a turn.
+            None => {
+                if let Ok(t) = serde_json::from_str::<Turn>(&line) {
+                    let e = match t.role.as_str() {
+                        "assistant" => Event::Assistant {
+                            ts: t.ts.clone(),
+                            text: t.text.clone(),
+                        },
+                        _ => Event::User {
+                            ts: t.ts.clone(),
+                            text: t.text.clone(),
+                        },
+                    };
+                    events.push(e);
+                }
+            }
         }
     }
-    Ok(turns)
+    Ok(events)
+}
+
+/// Project an event log to conversation turns (user/assistant only).
+/// Tool events are not part of the turn view — they remain in the raw
+/// log for replay/audit.
+pub fn events_to_turns(events: &[Event]) -> Vec<Turn> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::User { ts, text } => Some(Turn {
+                role: "user".into(),
+                text: text.clone(),
+                ts: ts.clone(),
+            }),
+            Event::Assistant { ts, text } => Some(Turn {
+                role: "assistant".into(),
+                text: text.clone(),
+                ts: ts.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Load a session's turns (empty if the session doesn't exist).
+pub fn load(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Turn>> {
+    Ok(events_to_turns(&load_events(sessions_dir, id)?))
 }
 
 /// List session ids (newest first) for `--resume` discovery.
@@ -124,14 +329,7 @@ pub fn summaries(sessions_dir: &Path) -> std::io::Result<Vec<SessionSummary>> {
         let preview = turns
             .iter()
             .find(|t| t.role == "user")
-            .map(|t| {
-                let flat: String = t.text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let mut s: String = flat.chars().take(60).collect();
-                if flat.chars().count() > 60 {
-                    s.push('…');
-                }
-                s
-            })
+            .map(|t| flat_preview(&t.text, 60))
             .unwrap_or_default();
         let last_ts = turns.iter().rev().find_map(|t| t.ts.clone());
         out.push(SessionSummary {
@@ -367,6 +565,126 @@ mod tests {
         assert!(turns[2].ts.is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_log_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-events-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::User {
+                ts: None,
+                text: "list files".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::ToolCall {
+                ts: None,
+                name: "bash".into(),
+                args: "ls -la".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::ToolResult {
+                ts: None,
+                name: "bash".into(),
+                ok: true,
+                output: "total 8".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::Assistant {
+                ts: None,
+                text: "done".into(),
+            },
+        )
+        .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].kind(), "user");
+        assert_eq!(events[1].kind(), "tool_call");
+        assert_eq!(events[2].kind(), "tool_result");
+        assert_eq!(events[3].kind(), "assistant");
+        // All stamped.
+        assert!(events.iter().all(|e| e.ts().is_some()));
+
+        // Turn projection drops tool events.
+        let turns = load(&dir, &id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].text, "list files");
+        assert_eq!(turns[1].text, "done");
+
+        // Raw file uses the event format (no role field).
+        let raw = fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap();
+        assert!(raw.contains("\"e\":\"user\""));
+        assert!(!raw.contains("\"role\""));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_lines_project_into_events() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        // Write legacy + event lines interleaved by hand.
+        let path = dir.join(format!("{id}.jsonl"));
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{{\"role\":\"user\",\"text\":\"legacy q\"}}")?;
+                writeln!(f, "{{\"e\":\"assistant\",\"ts\":\"2026-22000-100000-000000000\",\"text\":\"event a\"}}")?;
+                writeln!(f, "{{\"role\":\"assistant\",\"text\":\"legacy a\",\"ts\":\"2026-22000-110000-000000000\"}}")
+            })
+            .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind(), "user");
+        assert_eq!(events[0].ts(), None);
+        assert_eq!(events[1].kind(), "assistant");
+        assert_eq!(events[1].ts(), Some("2026-22000-100000-000000000"));
+        assert_eq!(events[2].kind(), "assistant");
+        assert_eq!(events[2].ts(), Some("2026-22000-110000-000000000"));
+
+        let turns = load(&dir, &id).unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].text, "legacy a");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_summary_and_kind() {
+        let ev = Event::ToolCall {
+            ts: None,
+            name: "create_lua_tool".into(),
+            args: "{\"name\":\"x\"}".into(),
+        };
+        assert_eq!(ev.kind(), "tool_call");
+        let s = ev.summary();
+        assert!(s.contains("create_lua_tool"));
+        assert!(s.contains("tool_call"));
     }
 
     #[test]

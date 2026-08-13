@@ -116,7 +116,12 @@ async fn main() -> Result<()> {
     // MCP servers: connect, discover tools, register as mcp_<server>_<tool>.
     let mut mcp_servers: Vec<(String, std::sync::Arc<mcp::McpClient>)> = Vec::new();
     for server in &config.mcp_servers {
-        match mcp::McpClient::connect(&server.name, &server.command, &server.args).await {
+        let connected = if let Some(url) = &server.url {
+            mcp::McpClient::connect_http(&server.name, url, server.bearer_token.as_deref()).await
+        } else {
+            mcp::McpClient::connect(&server.name, &server.command, &server.args).await
+        };
+        match connected {
             Ok((client, infos)) => {
                 let client = std::sync::Arc::new(client);
                 let n = infos.len();

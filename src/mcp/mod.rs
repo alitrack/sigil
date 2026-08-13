@@ -40,10 +40,55 @@ pub struct McpClient {
     /// Server name (for diagnostics; kept for future multi-server logs).
     #[allow(dead_code)]
     name: String,
-    stdin: Mutex<ChildStdin>,
-    /// id → response channel (tx dropped on error; reader pushes Err).
-    pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Result<Value>>>>>,
+    transport: McpTransport,
     next_id: std::sync::atomic::AtomicU64,
+}
+
+enum McpTransport {
+    /// Subprocess speaking NDJSON on stdin/stdout.
+    Stdio {
+        stdin: Mutex<ChildStdin>,
+        /// id → response channel (tx dropped on error; reader pushes Err).
+        pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Result<Value>>>>>,
+    },
+    /// Streamable HTTP: one POST per request (JSON-RPC 2.0 over HTTP).
+    Http {
+        client: reqwest::Client,
+        url: String,
+        token: Option<String>,
+    },
+}
+
+/// Parse a `tools/list` result into tool infos.
+fn parse_tools(tools_result: Value) -> Vec<McpToolInfo> {
+    tools_result
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| McpToolInfo {
+            name: t
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            description: t
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            schema: t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or(json!({"type": "object"})),
+        })
+        .collect()
+}
+
+/// First 200 chars of a string (for error messages).
+fn preview(s: &str) -> String {
+    s.chars().take(200).collect()
 }
 
 impl McpClient {
@@ -71,13 +116,18 @@ impl McpClient {
 
         let client = McpClient {
             name: name.to_string(),
-            stdin: Mutex::new(stdin),
-            pending: Arc::default(),
+            transport: McpTransport::Stdio {
+                stdin: Mutex::new(stdin),
+                pending: Arc::default(),
+            },
             next_id: std::sync::atomic::AtomicU64::new(1),
         };
 
         // Reader task: parse NDJSON, route by id.
-        let pending = client.pending.clone();
+        let pending = match &client.transport {
+            McpTransport::Stdio { pending, .. } => pending.clone(),
+            McpTransport::Http { .. } => unreachable!(),
+        };
         let name_owned = name.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -126,29 +176,54 @@ impl McpClient {
 
         // Discover tools.
         let tools_result = client.request("tools/list", json!({})).await?;
-        let tools = tools_result
-            .get("tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| McpToolInfo {
-                name: t
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_string(),
-                description: t
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                schema: t
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or(json!({"type": "object"})),
-            })
-            .collect();
+        let tools = parse_tools(tools_result);
+
+        Ok((client, tools))
+    }
+
+    /// Connect to a Streamable HTTP MCP server (JSON-RPC 2.0 over HTTP).
+    ///
+    /// One POST per request; responses come back as a plain JSON body.
+    /// `token` is sent as `Authorization: Bearer <token>` when present.
+    pub async fn connect_http(
+        name: &str,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<(McpClient, Vec<McpToolInfo>)> {
+        let http = reqwest::Client::builder()
+            // loopback must never go through http_proxy (P66: proxy hijack)
+            .no_proxy()
+            .build()
+            .context("building reqwest client for MCP HTTP transport")?;
+        let client = McpClient {
+            name: name.to_string(),
+            transport: McpTransport::Http {
+                client: http,
+                url: url.to_string(),
+                token: token.map(str::to_string),
+            },
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        };
+
+        // Initialize handshake.
+        let init_result = client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "sigil", "version": "0.1.0" }
+                }),
+            )
+            .await?;
+        let _ = init_result;
+
+        // Notify initialized (fire-and-forget).
+        client.notify("notifications/initialized", json!({})).await;
+
+        // Discover tools.
+        let tools_result = client.request("tools/list", json!({})).await?;
+        let tools = parse_tools(tools_result);
 
         Ok((client, tools))
     }
@@ -158,28 +233,59 @@ impl McpClient {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        self.pending.lock().await.insert(id, tx);
-
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
         });
-        let mut line = serde_json::to_string(&frame)?;
-        line.push('\n');
-        self.stdin
-            .lock()
-            .await
-            .write_all(line.as_bytes())
-            .await
-            .context("writing to MCP server")?;
-        self.stdin.lock().await.flush().await.ok();
 
-        rx.recv()
-            .await
-            .context(format!("MCP request '{method}' timed out or server died"))?
+        match &self.transport {
+            McpTransport::Stdio { stdin, pending } => {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                pending.lock().await.insert(id, tx);
+
+                let mut line = serde_json::to_string(&frame)?;
+                line.push('\n');
+                stdin
+                    .lock()
+                    .await
+                    .write_all(line.as_bytes())
+                    .await
+                    .context("writing to MCP server")?;
+                stdin.lock().await.flush().await.ok();
+
+                rx.recv()
+                    .await
+                    .context(format!("MCP request '{method}' timed out or server died"))?
+            }
+            McpTransport::Http { client, url, token } => {
+                let body = serde_json::to_string(&frame)?;
+                let mut req = client
+                    .post(url)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .body(body);
+                if let Some(t) = token {
+                    req = req.bearer_auth(t);
+                }
+                let resp = req.send().await.context("MCP HTTP request")?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Err(anyhow!(
+                        "MCP HTTP {status} for '{method}': {}",
+                        preview(&body)
+                    ));
+                }
+                let v: Value = serde_json::from_str(&body)
+                    .with_context(|| format!("MCP HTTP bad JSON: {}", preview(&body)))?;
+                if let Some(err) = v.get("error") {
+                    return Err(anyhow!("MCP error: {err}"));
+                }
+                Ok(v.get("result").cloned().unwrap_or(Value::Null))
+            }
+        }
     }
 
     /// Fire-and-forget notification.
@@ -189,10 +295,25 @@ impl McpClient {
             "method": method,
             "params": params,
         });
-        if let Ok(mut line) = serde_json::to_string(&frame) {
-            line.push('\n');
-            let _ = self.stdin.lock().await.write_all(line.as_bytes()).await;
-            let _ = self.stdin.lock().await.flush().await;
+        match &self.transport {
+            McpTransport::Stdio { stdin, .. } => {
+                if let Ok(mut line) = serde_json::to_string(&frame) {
+                    line.push('\n');
+                    let _ = stdin.lock().await.write_all(line.as_bytes()).await;
+                    let _ = stdin.lock().await.flush().await;
+                }
+            }
+            McpTransport::Http { client, url, token } => {
+                let body = serde_json::to_string(&frame).unwrap_or_default();
+                let mut req = client
+                    .post(url)
+                    .header("Content-Type", "application/json")
+                    .body(body);
+                if let Some(t) = token {
+                    req = req.bearer_auth(t);
+                }
+                let _ = req.send().await;
+            }
         }
     }
 

@@ -58,10 +58,23 @@ struct AgentFileConfig {
     system_prompt: Option<String>,
 }
 
-/// An MCP server to spawn at startup (stdio transport).
+/// An MCP server to connect at startup.
+///
+/// Two transports:
+/// - stdio: `command` + `args` spawn a subprocess (default)
+/// - streamable HTTP: `url` (optional `bearer_token`) — when `url` is set,
+///   `command`/`args` are ignored
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
+    /// Streamable HTTP endpoint (e.g. http://localhost:4214/_mcp).
+    /// When set, transport is HTTP; otherwise stdio via `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Bearer token for the HTTP transport (sent as Authorization header).
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,

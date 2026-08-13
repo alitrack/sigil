@@ -16,3 +16,9 @@
 # name = "echo"
 # command = "python3"
 # args = ["/path/to/echo_server.py"]
+
+# Streamable HTTP transport (e.g. duckdb_dash /_mcp):
+# [[mcp.servers]]
+# name = "duckdb-dash"
+# url = "http://localhost:4214/_mcp"
+# bearer_token = "secret-token-123"   # optional; sent as Authorization: Bearer

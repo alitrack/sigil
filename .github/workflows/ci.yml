@@ -33,6 +33,22 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+  windows-check:
+    name: Windows compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # daemon uses a Unix socket; keep it compiling on Windows
+      # (cfg(unix) gate) — a regression here only used to surface at
+      # release time.
+      - name: Check (Windows)
+        run: cargo check --locked
+
   ratchet-check:
     name: Ratchet config & anchor drift check
     runs-on: ubuntu-latest

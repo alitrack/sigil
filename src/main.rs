@@ -3,6 +3,7 @@ mod agent;
 mod cli;
 mod config;
 mod cron;
+#[cfg(unix)]
 mod daemon;
 mod doctor;
 mod goals;
@@ -278,25 +279,41 @@ async fn main() -> Result<()> {
             acp::serve(tools, agent_config, provider_arc).await
         }
         Some(Command::Daemon { socket }) => {
-            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-            let sessions_dir = cli
-                .sessions_dir
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(session::default_sessions_dir);
-            daemon::serve(
-                &socket,
-                provider_arc.clone(),
-                &mut tools,
-                &agent_config,
-                &sessions_dir,
-                cli.resume.as_deref(),
-            )
-            .await
+            #[cfg(unix)]
+            {
+                let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+                let sessions_dir = cli
+                    .sessions_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(session::default_sessions_dir);
+                daemon::serve(
+                    &socket,
+                    provider_arc.clone(),
+                    &mut tools,
+                    &agent_config,
+                    &sessions_dir,
+                    cli.resume.as_deref(),
+                )
+                .await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (socket, provider_arc, tools, agent_config, cli);
+                anyhow::bail!("sigil daemon uses a Unix socket and is not available on Windows")
+            }
         }
         Some(Command::Attach { socket, session }) => {
-            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-            daemon::attach(&socket, session.as_deref()).await
+            #[cfg(unix)]
+            {
+                let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+                daemon::attach(&socket, session.as_deref()).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (socket, session);
+                anyhow::bail!("sigil daemon uses a Unix socket and is not available on Windows")
+            }
         }
         Some(Command::Send {
             message,
@@ -304,10 +321,18 @@ async fn main() -> Result<()> {
             timeout,
             session,
         }) => {
-            let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
-            let answer = daemon::send_once(&socket, message, *timeout, session.as_deref()).await?;
-            println!("{answer}");
-            Ok(())
+            #[cfg(unix)]
+            {
+                let socket = socket.clone().unwrap_or_else(daemon::default_socket_path);
+                let answer = daemon::send_once(&socket, message, *timeout, session.as_deref()).await?;
+                println!("{answer}");
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (socket, message, timeout, session);
+                anyhow::bail!("sigil daemon uses a Unix socket and is not available on Windows")
+            }
         }
         Some(Command::Mcp) => {
             eprintln!(

@@ -57,6 +57,13 @@ pub type TurnFn =
 #[derive(Default)]
 pub struct AcpState {
     sessions: std::collections::HashMap<String, mpsc::UnboundedSender<Value>>,
+    /// Mid-turn human-input requests: requestId → responder. The
+    /// server-side AskCb registers a oneshot here before emitting an
+    /// `agent_request_input` notification; the client answers with
+    /// `agent/request.input`, which resolves it. This is the sigil
+    /// extension that turns a one-shot prompt into a two-way
+    /// conversation (brainstorming UI, requestUserInput-style flows).
+    pending_inputs: std::collections::HashMap<String, tokio::sync::oneshot::Sender<Value>>,
     /// How to run one agent turn (injected; real runs use the agent
     /// loop, tests use a fake). Returns a future so the prompt handler
     /// can await the (long-running) agent loop without blocking.
@@ -66,6 +73,22 @@ pub struct AcpState {
 impl AcpState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register a mid-turn input request and return the receiver the
+    /// server-side AskCb awaits. The host answers via
+    /// `agent/request.input` (see [`handle_message`]), which resolves
+    /// this channel.
+    ///
+    /// NOTE: the stdio loop is serial today — a blocking await here
+    /// while `handle_message` is mid-prompt would deadlock (the
+    /// client's answer would queue behind the prompt on stdin). The
+    /// turn executor must therefore run concurrently with the message
+    /// loop (spawn + select) once mid-turn questions are used.
+    pub fn register_input(&mut self, request_id: String) -> tokio::sync::oneshot::Receiver<Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_inputs.insert(request_id, tx);
+        rx
     }
 }
 
@@ -207,6 +230,36 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 result: Some(json!({ "cancelled": true })),
                 error: None,
             });
+        }
+        // sigil extension: the host answers a mid-turn question that
+        // the agent raised via an `agent_request_input` notification.
+        // `requestId` must match the one from the notification; the
+        // `response` payload is handed back to the paused agent loop.
+        "agent/request.input" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let response = params.get("response").cloned().unwrap_or(Value::Null);
+            match state.pending_inputs.remove(&request_id) {
+                Some(tx) => {
+                    let _ = tx.send(response);
+                    outs.push(Out::Response {
+                        id: id.unwrap_or(Value::Null),
+                        result: Some(json!({ "answered": true })),
+                        error: None,
+                    });
+                }
+                None => outs.push(Out::Response {
+                    id: id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(json!({
+                        "code": -32602,
+                        "message": format!("unknown requestId {request_id}")
+                    })),
+                }),
+            }
         }
         "ping" => {
             outs.push(Out::Response {

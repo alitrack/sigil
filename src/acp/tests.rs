@@ -194,4 +194,124 @@ mod acp_tests {
             _ => panic!("expected ok response"),
         }
     }
+
+    // ---- sigil extension: mid-turn human input (`agent/request.input`) ----
+
+    #[tokio::test]
+    async fn request_input_resolves_pending_question() {
+        // Server side registers a question (as the AskCb would);
+        // the host answers; the answer reaches the waiting AskCb.
+        let mut s = AcpState::new();
+        let mut rx = s.register_input("req-1".to_string());
+
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 9, "method": "agent/request.input",
+                "params": { "requestId": "req-1", "response": { "answers": ["方案B"] } }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The agent loop (AskCb) received the answer.
+        let answered = rx.await.unwrap();
+        assert_eq!(answered["answers"][0], json!("方案B"));
+        // The host got a confirmation response.
+        assert_eq!(outs.len(), 1);
+        match &outs[0] {
+            Out::Response { id, result, error } => {
+                assert_eq!(id, &json!(9));
+                assert_eq!(result.as_ref().unwrap()["answered"], true);
+                assert!(error.is_none());
+            }
+            _ => panic!("expected response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_input_unknown_request_id_errors() {
+        let mut s = AcpState::new();
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 10, "method": "agent/request.input",
+                "params": { "requestId": "nope", "response": {} }
+            }),
+        )
+        .await
+        .unwrap();
+        match &outs[0] {
+            Out::Response {
+                error: Some(e), ..
+            } => assert_eq!(e["code"], -32602),
+            _ => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_executor_can_wait_for_input_round_trip() {
+        // Mechanism proof: a turn executor that pauses on a oneshot
+        // (exactly what the AskCb will do) and resumes once the answer
+        // arrives — the protocol-level half of the mid-turn question
+        // flow. (The serve loop itself needs a concurrent select to
+        // avoid deadlock; that is the documented follow-up.)
+        let mut s = AcpState::new();
+        let rx = s.register_input("req-2".to_string());
+        let rx_slot: Arc<std::sync::Mutex<Option<_>>> = Arc::new(std::sync::Mutex::new(Some(rx)));
+        let rx_slot2 = rx_slot.clone();
+
+        // Separate state for the prompt side (its turn executor
+        // references the pending input registered on `s`).
+        let mut s2 = AcpState::new();
+        s2.turn = Some(Arc::new(move |prompt: String| {
+            let rx_slot2 = rx_slot2.clone();
+            Box::pin(async move {
+                let rx = rx_slot2
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("input already taken"))?;
+                let answer = rx.await.map_err(|_| anyhow::anyhow!("input dropped"))?;
+                let choice = answer["answers"][0].as_str().unwrap_or("?");
+                Ok::<String, anyhow::Error>(format!("{prompt} → chose {choice}"))
+            })
+        }));
+
+        // Kick the prompt in the background (its turn will block on rx).
+        let prompt_handle = tokio::spawn(async move {
+            handle_message(
+                &mut s2,
+                &json!({
+                    "jsonrpc": "2.0", "id": 11, "method": "agent/session.prompt",
+                    "params": { "sessionId": "x", "prompt": [{ "type": "text", "text": "方案A还是B?" }] }
+                }),
+            )
+            .await
+        });
+
+        // Give the turn a moment to block on the question, then answer.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 12, "method": "agent/request.input",
+                "params": { "requestId": "req-2", "response": { "answers": ["方案B"] } }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&outs[0], Out::Response { result: Some(_), .. }));
+
+        // The turn finished with the answer woven into its output.
+        let prompt_outs = prompt_handle.await.unwrap().unwrap();
+        let text = prompt_outs
+            .iter()
+            .find_map(|o| match o {
+                Out::Notification { update, .. } => update["content"]["text"].as_str(),
+                _ => None,
+            })
+            .unwrap_or("");
+        assert!(text.contains("chose 方案B"), "text was: {text}");
+    }
 }

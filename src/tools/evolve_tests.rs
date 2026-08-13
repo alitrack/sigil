@@ -189,6 +189,7 @@ async fn improve_harness_edits_prompt() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     let out = tool
         .run(&json!({
@@ -216,6 +217,7 @@ async fn improve_harness_adds_and_lists_skills() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
 
     // Add a skill.
@@ -277,6 +279,7 @@ async fn improve_harness_rejects_unknown_action() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     let err = tool
         .run(&json!({ "action": "nuke_everything" }))
@@ -303,6 +306,7 @@ async fn edit_prompt_updates_live_prompt_state() {
         harness_dir: dir.clone(),
         local_dir: None,
         prompt_state: Some(state.clone()),
+        hooks_dir: None,
     };
     let out = tool
         .run(&json!({
@@ -336,6 +340,7 @@ async fn refinement_gate_rejects_missing_reason() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     // No reason → rejected before any write.
     let err = tool
@@ -367,6 +372,7 @@ async fn refinement_gate_rejects_noop_rewrites() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     // Identical content (just whitespace difference) → rejected.
     let err = tool
@@ -408,6 +414,7 @@ async fn refinement_gate_rejects_noise_and_bad_shape() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     // Too short to be a full prompt replacement.
     let err = tool
@@ -449,6 +456,7 @@ async fn accepted_edits_are_audited_in_refinements_jsonl() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     tool.run(&json!({
         "action": "edit_prompt",
@@ -490,6 +498,7 @@ async fn scope_local_writes_to_local_dir_when_configured() {
         harness_dir: harness.clone(),
         local_dir: Some(local.clone()),
         prompt_state: None,
+        hooks_dir: None,
     };
 
     // scope=local edit_prompt → lands in the local dir, not the global one.
@@ -524,6 +533,7 @@ async fn scope_local_without_local_dir_is_rejected() {
         harness_dir: harness.clone(),
         local_dir: None,
         prompt_state: None,
+        hooks_dir: None,
     };
     let err = tool
         .run(&json!({
@@ -553,6 +563,7 @@ async fn default_scope_is_local_when_local_layer_exists() {
         harness_dir: harness.clone(),
         local_dir: Some(local.clone()),
         prompt_state: None,
+        hooks_dir: None,
     };
 
     // No scope arg → lands in the local layer (prime-agent semantics).
@@ -587,6 +598,7 @@ async fn explicit_global_scope_writes_global_even_with_local_layer() {
         harness_dir: harness.clone(),
         local_dir: Some(local.clone()),
         prompt_state: None,
+        hooks_dir: None,
     };
 
     // Explicit scope=global bypasses the local default.
@@ -633,6 +645,7 @@ async fn scope_local_add_skill_and_refresh_state_merge() {
         harness_dir: harness.clone(),
         local_dir: Some(local.clone()),
         prompt_state: Some(state.clone()),
+        hooks_dir: None,
     };
 
     // Local add_skill shadows the global same-named skill.

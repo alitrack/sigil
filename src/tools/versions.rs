@@ -16,6 +16,8 @@ pub struct SkillHistoryTool {
     pub harness_dir: std::path::PathBuf,
     /// Tools dir (scripted Lua tools live here).
     pub tools_dir: std::path::PathBuf,
+    /// Hooks dir (agent-loop Lua policy modules live here).
+    pub hooks_dir: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -25,7 +27,7 @@ impl Tool for SkillHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "List archived versions of a harness asset (skill, the system prompt, or a scripted Lua tool). Params: kind (skills | prompt | tools), name (asset base name, e.g. math, or 'system_prompt' for prompt). Each write performed by improve_harness / create_lua_tool snapshots the previous content, so you can inspect what changed and roll back a bad edit with skill_rollback."
+        "List archived versions of a harness asset (skill, the system prompt, a scripted Lua tool, or an agent-loop Lua hook). Params: kind (skills | prompt | tools | hooks), name (asset base name, e.g. math, 'system_prompt' for prompt, or on_tool_result for a hook). Each write performed by improve_harness / create_lua_tool snapshots the previous content, so you can inspect what changed and roll back a bad edit with skill_rollback."
     }
 
     fn parameters(&self) -> Value {
@@ -34,12 +36,12 @@ impl Tool for SkillHistoryTool {
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["skills", "prompt", "tools"],
-                    "description": "Asset kind: skills (skill markdown), prompt (system_prompt.md), tools (scripted Lua tool)"
+                    "enum": ["skills", "prompt", "tools", "hooks"],
+                    "description": "Asset kind: skills (skill markdown), prompt (system_prompt.md), tools (scripted Lua tool), hooks (agent-loop Lua hook)"
                 },
                 "name": {
                     "type": "string",
-                    "description": "Asset base name: a skill name, 'system_prompt', or a tool name"
+                    "description": "Asset base name: a skill name, 'system_prompt', a tool name, or a hook base name (e.g. on_tool_result)"
                 }
             },
             "required": ["kind", "name"]
@@ -55,6 +57,11 @@ impl Tool for SkillHistoryTool {
         let base = match kind {
             "skills" | "prompt" => &self.harness_dir,
             "tools" => &self.tools_dir,
+            "hooks" => self.hooks_dir.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "kind=hooks requires a hooks dir — start sigil with --hooks-dir <dir>"
+                )
+            })?,
             other => anyhow::bail!("unknown kind: {other}"),
         };
         let versions = versions::versions_of(base, kind, name);
@@ -83,6 +90,8 @@ pub struct SkillRollbackTool {
     pub harness_dir: std::path::PathBuf,
     /// Tools dir.
     pub tools_dir: std::path::PathBuf,
+    /// Hooks dir (agent-loop Lua policy modules).
+    pub hooks_dir: Option<std::path::PathBuf>,
     /// Hook to hot-register a scripted tool after a rollback (so the
     /// restored code is live in the current session, not just on disk).
     pub register: Option<crate::tools::evolve::RegisterHook>,
@@ -98,7 +107,7 @@ impl Tool for SkillRollbackTool {
     }
 
     fn description(&self) -> &str {
-        "Restore a harness asset (skill, system prompt, or scripted Lua tool) to an archived version. Params: kind (skills | prompt | tools), name (asset base name), version (the stamp shown by skill_history). Use after a bad edit — the harness self-evolution loop is reversible."
+        "Restore a harness asset (skill, system prompt, scripted Lua tool, or agent-loop Lua hook) to an archived version. Params: kind (skills | prompt | tools | hooks), name (asset base name), version (the stamp shown by skill_history). Use after a bad edit — the harness self-evolution loop is reversible."
     }
 
     fn parameters(&self) -> Value {
@@ -107,7 +116,7 @@ impl Tool for SkillRollbackTool {
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["skills", "prompt", "tools"],
+                    "enum": ["skills", "prompt", "tools", "hooks"],
                     "description": "Asset kind"
                 },
                 "name": {
@@ -136,6 +145,11 @@ impl Tool for SkillRollbackTool {
         let base = match kind {
             "skills" | "prompt" => &self.harness_dir,
             "tools" => &self.tools_dir,
+            "hooks" => self.hooks_dir.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "kind=hooks requires a hooks dir — start sigil with --hooks-dir <dir>"
+                )
+            })?,
             other => anyhow::bail!("unknown kind: {other}"),
         };
         // Rollback is a write (restore overwrites the live asset) — take
@@ -186,6 +200,8 @@ pub struct VersionsGcTool {
     pub harness_dir: std::path::PathBuf,
     /// Tools dir.
     pub tools_dir: std::path::PathBuf,
+    /// Hooks dir (agent-loop Lua policy modules).
+    pub hooks_dir: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -195,7 +211,7 @@ impl Tool for VersionsGcTool {
     }
 
     fn description(&self) -> &str {
-        "Prune archived versions of a harness asset, keeping only the newest N. Params: kind (skills | prompt | tools), name (asset base name), keep (how many versions to retain; default 5). Backups auto-prune at 50 per asset, so use this when you want tighter retention."
+        "Prune archived versions of a harness asset, keeping only the newest N. Params: kind (skills | prompt | tools | hooks), name (asset base name), keep (how many versions to retain; default 5). Backups auto-prune at 50 per asset, so use this when you want tighter retention."
     }
 
     fn parameters(&self) -> Value {
@@ -204,7 +220,7 @@ impl Tool for VersionsGcTool {
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["skills", "prompt", "tools"],
+                    "enum": ["skills", "prompt", "tools", "hooks"],
                     "description": "Asset kind"
                 },
                 "name": {
@@ -231,6 +247,11 @@ impl Tool for VersionsGcTool {
         let base = match kind {
             "skills" | "prompt" => &self.harness_dir,
             "tools" => &self.tools_dir,
+            "hooks" => self.hooks_dir.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "kind=hooks requires a hooks dir — start sigil with --hooks-dir <dir>"
+                )
+            })?,
             other => anyhow::bail!("unknown kind: {other}"),
         };
         // GC deletes archived files — serialize with other writers.

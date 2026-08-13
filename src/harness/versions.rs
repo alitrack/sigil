@@ -37,7 +37,7 @@ pub fn backup(harness_dir: &Path, kind: &str, name: &str, content: &str) {
         return;
     };
     let ext = match kind {
-        "tools" => "lua",
+        "tools" | "hooks" => "lua",
         _ => "md",
     };
     let path = dir.join(format!("{name}.{}.{ext}", now_stamp()));
@@ -84,7 +84,7 @@ pub fn restore(
     version: &str,
 ) -> anyhow::Result<String> {
     let ext = match kind {
-        "tools" => "lua",
+        "tools" | "hooks" => "lua",
         _ => "md",
     };
     let path = kind_dir(harness_dir, kind).join(format!("{name}.{version}.{ext}"));
@@ -96,8 +96,9 @@ pub fn restore(
         "skills" => harness_dir.join("skills").join(format!("{name}.md")),
         // For tools, the base dir passed in IS the tools dir (the
         // evolution tools call backup/restore with tools_dir as root),
-        // so the live tool lives directly under it.
-        "tools" => harness_dir.join(format!("{name}.lua")),
+        // so the live tool lives directly under it. Hooks are the same:
+        // the hooks dir IS the live dir.
+        "tools" | "hooks" => harness_dir.join(format!("{name}.lua")),
         other => anyhow::bail!("unknown asset kind: {other}"),
     };
     std::fs::write(&target, &content)?;

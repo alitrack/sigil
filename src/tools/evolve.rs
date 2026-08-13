@@ -184,6 +184,10 @@ pub struct ImproveHarnessTool {
     /// Live prompt state to update after writes (so the running agent
     /// sees edits immediately). `None` = isolated (tests).
     pub prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
+    /// Agent-loop Lua hooks dir (P-C: the model edits its own policy
+    /// modules). `None` = hooks actions rejected with a hint (start
+    /// sigil with --hooks-dir to enable).
+    pub hooks_dir: Option<std::path::PathBuf>,
 }
 
 /// Require an evidence-backed `reason` for a harness write (the
@@ -300,7 +304,11 @@ impl Tool for ImproveHarnessTool {
          'edit_prompt' (replace system_prompt.md — content is the new full \
          prompt), 'add_skill' (create a skill markdown file whose first \
          line is '> short description', reusable by future sessions), \
-         'list_skills' (list existing skills). \
+         'list_skills' (list existing skills), \
+         'edit_hook' (write an agent-loop Lua hook, e.g. on_tool_result.lua \
+         — content is the full Lua source and must return a function; it \
+         becomes live from the very next turn, no restart), 'delete_hook' \
+         (remove a hook), 'list_hooks' (list hook files). \
          Optional 'scope': 'global' edits the shared harness \
          that persists across sessions; 'local' edits the session-local \
          harness (available when sigil was started with --local-harness-dir). \
@@ -324,7 +332,7 @@ impl Tool for ImproveHarnessTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["edit_prompt", "add_skill", "list_skills"],
+                    "enum": ["edit_prompt", "add_skill", "list_skills", "edit_hook", "delete_hook", "list_hooks"],
                     "description": "What to do"
                 },
                 "scope": {
@@ -334,15 +342,15 @@ impl Tool for ImproveHarnessTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "For edit_prompt: the new full system prompt text. For add_skill: the full skill markdown (first line: '> short description')."
+                    "description": "For edit_prompt: the new full system prompt text. For add_skill: the full skill markdown (first line: '> short description'). For edit_hook: the full Lua source (must return a function taking the ctx table)."
                 },
                 "name": {
                     "type": "string",
-                    "description": "For add_skill: skill file name (no extension)."
+                    "description": "For add_skill: skill file name (no extension). For edit_hook/delete_hook: hook file name WITH the on_ prefix and .lua extension (e.g. on_tool_result.lua)."
                 },
                 "reason": {
                     "type": "string",
-                    "description": "REQUIRED for edit_prompt/add_skill: one sentence of evidence why this change is a durable improvement. Rejected if missing."
+                    "description": "REQUIRED for edit_prompt/add_skill/edit_hook/delete_hook: one sentence of evidence why this change is a durable improvement. Rejected if missing."
                 }
             },
             "required": ["action"]
@@ -567,6 +575,142 @@ impl Tool for ImproveHarnessTool {
                 Ok(ToolOutput {
                     text: lines.join("\n"),
                 })
+            }
+            "list_hooks" => {
+                let hooks_dir = self.hooks_dir.clone().ok_or_else(|| {
+                    anyhow::anyhow!("list_hooks: no hooks dir — start sigil with --hooks-dir <dir>")
+                })?;
+                let mut names: Vec<String> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&hooks_dir) {
+                    for e in entries.flatten() {
+                        if e.path().extension().map(|x| x == "lua").unwrap_or(false)
+                            && let Some(stem) = e.path().file_name().and_then(|s| s.to_str())
+                        {
+                            names.push(stem.to_string());
+                        }
+                    }
+                    names.sort();
+                }
+                Ok(ToolOutput {
+                    text: if names.is_empty() {
+                        "no hooks yet — write one with edit_hook (e.g. on_tool_result.lua)"
+                            .to_string()
+                    } else {
+                        format!("hooks: {}", names.join(", "))
+                    },
+                })
+            }
+            "edit_hook" | "delete_hook" => {
+                // Hooks are policy modules the model evolves (P-C). Like
+                // scripted tools, they reload from disk on every use, so
+                // an edit is live from the very next turn — no
+                // registration step, no restart.
+                let hooks_dir = self.hooks_dir.clone().ok_or_else(|| {
+                    anyhow::anyhow!("{action}: no hooks dir — start sigil with --hooks-dir <dir>")
+                })?;
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{action} requires a non-empty 'name' (e.g. on_tool_result.lua)"
+                        )
+                    })?;
+                // Constrain to a safe file name: hook files are loaded
+                // by exact name, so drop path separators and dots.
+                // Accept both "on_tool_result" and "on_tool_result.lua".
+                let stem = name.strip_suffix(".lua").unwrap_or(name);
+                let safe: String = stem
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if safe.is_empty() {
+                    anyhow::bail!("hook name must contain alphanumerics");
+                }
+                if action == "delete_hook" {
+                    let reason = gated_reason(args)?;
+                    let path = hooks_dir.join(format!("{safe}.lua"));
+                    if !path.exists() {
+                        anyhow::bail!("delete_hook: hook '{safe}' does not exist");
+                    }
+                    crate::harness::lock::with_dir_lock(&hooks_dir, || {
+                        let old = std::fs::read_to_string(&path)?;
+                        crate::harness::versions::backup_and_prune(
+                            &hooks_dir, "hooks", &safe, &old,
+                        );
+                        std::fs::remove_file(&path)?;
+                        record_refinement(
+                            &hooks_dir,
+                            &json!({
+                                "ts": crate::session::chrono_like_timestamp(),
+                                "id": refinement_id("delete_hook", &safe),
+                                "action": "delete_hook",
+                                "name": safe,
+                                "reason": reason,
+                                "result": "ok",
+                            }),
+                        );
+                        Ok(ToolOutput {
+                            text: format!(
+                                "hook '{safe}' deleted (previous version archived; roll back with skill_rollback kind=hooks)."
+                            ),
+                        })
+                    })
+                } else {
+                    let content = args
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .filter(|c| !c.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("edit_hook requires non-empty 'content'"))?;
+                    let reason = gated_reason(args)?;
+                    // Contract gate: a hook file must return a function.
+                    if !content.contains("return function") {
+                        anyhow::bail!(
+                            "edit_hook: content must contain 'return function(ctx) ... end' — a hook file exports one function"
+                        );
+                    }
+                    if content.chars().count() < 20 {
+                        anyhow::bail!(
+                            "edit_hook: content too short ({} chars, min 20)",
+                            content.chars().count()
+                        );
+                    }
+                    crate::harness::lock::with_dir_lock(&hooks_dir, || {
+                        std::fs::create_dir_all(&hooks_dir)?;
+                        let path = hooks_dir.join(format!("{safe}.lua"));
+                        if let Ok(old) = std::fs::read_to_string(&path)
+                            && old.trim() == content.trim()
+                        {
+                            anyhow::bail!(
+                                "edit_hook: '{safe}' already has identical content — no change"
+                            );
+                        }
+                        if let Ok(old) = std::fs::read_to_string(&path) {
+                            crate::harness::versions::backup_and_prune(
+                                &hooks_dir, "hooks", &safe, &old,
+                            );
+                        }
+                        std::fs::write(&path, content)?;
+                        record_refinement(
+                            &hooks_dir,
+                            &json!({
+                                "ts": crate::session::chrono_like_timestamp(),
+                                "id": refinement_id("edit_hook", &format!("{safe}\n{content}")),
+                                "action": "edit_hook",
+                                "name": safe,
+                                "reason": reason,
+                                "result": "ok",
+                            }),
+                        );
+                        Ok(ToolOutput {
+                            text: format!(
+                                "hook '{safe}' written to {}. Live from the very next turn (hooks reload on every use).",
+                                path.display()
+                            ),
+                        })
+                    })
+                }
             }
             other => anyhow::bail!("unknown action: {other}"),
         })

@@ -30,8 +30,9 @@ pub mod versions;
 mod scripted_tests;
 
 #[cfg(test)]
+mod evolve_hooks_tests;
+#[cfg(test)]
 mod evolve_tests;
-
 /// What a tool returns to the agent loop.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
@@ -116,7 +117,7 @@ impl ToolRegistry {
 
     #[allow(dead_code)]
     pub fn with_native_tools() -> Self {
-        Self::with_tools(None, None, None, None, None)
+        Self::with_tools(None, None, None, None, None, None)
     }
 
     /// Native tools plus any Lua scripted tools found on disk.
@@ -134,6 +135,7 @@ impl ToolRegistry {
         prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
         goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
         local_harness_dir: Option<&Path>,
+        hooks_dir: Option<&Path>,
     ) -> Self {
         let mut registry = Self::new();
         registry.register(Arc::new(bash::BashTool));
@@ -172,6 +174,7 @@ impl ToolRegistry {
             harness_dir: harness_dir.clone(),
             local_dir: local_harness_dir.map(Path::to_path_buf),
             prompt_state: prompt_state.clone(),
+            hooks_dir: hooks_dir.map(Path::to_path_buf),
         }));
         // Persistent goals: the model declares long-running objectives;
         // active goals are injected into the system context each turn.
@@ -186,10 +189,12 @@ impl ToolRegistry {
         registry.register(Arc::new(versions::SkillHistoryTool {
             harness_dir: harness_dir.clone(),
             tools_dir: tools_dir.clone(),
+            hooks_dir: hooks_dir.map(Path::to_path_buf),
         }));
         registry.register(Arc::new(versions::SkillRollbackTool {
             harness_dir: harness_dir.clone(),
             tools_dir: tools_dir.clone(),
+            hooks_dir: hooks_dir.map(Path::to_path_buf),
             register: Some(Box::new(move |name: &str, path: std::path::PathBuf| {
                 if let Ok(mut q) = hot_queue3.try_lock() {
                     q.push(HotOp::register(name, path));
@@ -200,6 +205,7 @@ impl ToolRegistry {
         registry.register(Arc::new(versions::VersionsGcTool {
             harness_dir,
             tools_dir: tools_dir.clone(),
+            hooks_dir: hooks_dir.map(Path::to_path_buf),
         }));
         // Cross-process ACP delegation: spawn an external ACP server.
         registry.register(Arc::new(acp::AcpCallTool {

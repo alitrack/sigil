@@ -109,15 +109,18 @@ async fn main() -> Result<()> {
     let hooks_lua = std::sync::Arc::new(std::sync::Mutex::new(
         lua::LuaRuntime::new().expect("lua runtime init"),
     ));
-    let hooks = std::sync::Arc::new(hooks::HookRunner::new(hooks_lua, hooks_dir));
 
+    // HookRunner borrows the dir first (with_tools needs it too), then
+    // takes ownership.
     let mut tools = ToolRegistry::with_tools(
         Some(tools_dir.as_path()),
         cli.harness_dir.as_deref().map(std::path::Path::new),
         Some(prompt_state.clone()),
         Some(goals.clone()),
         cli.local_harness_dir.as_deref().map(std::path::Path::new),
+        Some(hooks_dir.as_path()),
     );
+    let hooks = std::sync::Arc::new(hooks::HookRunner::new(hooks_lua, hooks_dir));
 
     // Memory tools (remember/recall) — default ~/.sigil/memory.md.
     let memory_path = cli

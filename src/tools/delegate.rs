@@ -1237,7 +1237,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -1575,7 +1575,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -1701,7 +1701,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -1821,7 +1821,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -1913,7 +1913,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -2371,7 +2371,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -2505,7 +2505,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None),
+            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
                 max_steps: 3,
@@ -2585,7 +2585,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                ToolRegistry::with_tools(None, None, None, None, None),
+                ToolRegistry::with_tools(None, None, None, None, None, None),
                 AgentConfig {
                     model: "test".into(),
                     max_steps: 3,
@@ -2621,7 +2621,7 @@ mod tests {
     #[test]
     fn apply_subagent_type_appends_prompt_and_filters_tools() {
         // A registry with many tools; the type allows only one.
-        let mut reg = ToolRegistry::with_tools(None, None, None, None, None);
+        let mut reg = ToolRegistry::with_tools(None, None, None, None, None, None);
         let before = reg.specs().len();
         assert!(before > 1, "expected several tools, got {before}");
         let def = subagent::AgentDefinition {

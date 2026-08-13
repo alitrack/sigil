@@ -50,6 +50,12 @@ impl HookRunner {
         Self { lua, hooks_dir }
     }
 
+    /// The directory hook files are loaded from.
+    #[allow(dead_code)] // public API surface (tests, tooling)
+    pub fn hooks_dir(&self) -> &PathBuf {
+        &self.hooks_dir
+    }
+
     /// Run `<name>.lua` from the hooks dir, if present.
     ///
     /// Returns `Ok(Some(text))` when the hook returned a string,
@@ -66,24 +72,47 @@ impl HookRunner {
         // (same pattern as scripted tools).
         let text = tokio::task::spawn_blocking(move || {
             let lua = lua.lock().expect("lua lock poisoned");
-            lua.run_file(path.to_str().unwrap_or(&name), &ctx.to_string())
+            run_hook_file(&lua, &path, &name, &ctx.to_string())
         })
         .await
         .context("lua hook thread")??;
-        // run_file JSON-serializes the result: `null` for nil, a quoted
-        // string for a string return. Anything else (table, number) is
-        // passed through verbatim — the string contract is documented
-        // but not enforced, so an early hook returning a table degrades
-        // to `Some(table-json)` rather than an error.
-        let trimmed = text.trim();
-        if trimmed == "null" {
+        Ok(hook_result(text))
+    }
+
+    /// Synchronous variant for millisecond-scale hot paths (prompt
+    /// assembly). Blocks the caller instead of hopping to a blocking
+    /// thread; do not use for slow hooks.
+    pub fn run_sync(&self, name: &str, ctx: Value) -> Result<Option<String>> {
+        let path = self.hooks_dir.join(format!("{name}.lua"));
+        if !path.exists() {
             return Ok(None);
         }
-        let text = serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_string());
-        Ok(Some(text))
+        let lua = self.lua.lock().expect("lua lock poisoned");
+        let text = run_hook_file(&lua, &path, name, &ctx.to_string())?;
+        Ok(hook_result(text))
     }
 }
 
+/// Load a hook file and call its exported function with the JSON ctx.
+fn run_hook_file(
+    lua: &LuaRuntime,
+    path: &std::path::Path,
+    name: &str,
+    ctx_json: &str,
+) -> Result<String> {
+    lua.run_file(path.to_str().unwrap_or(name), ctx_json)
+}
+
+/// Interpret the JSON-serialized Lua result: `null` → no-op, quoted
+/// string → replacement, anything else → passed through verbatim.
+fn hook_result(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed == "null" {
+        return None;
+    }
+    let text = serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_string());
+    Some(text)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +193,40 @@ mod tests {
         let runner = HookRunner::new(lua_runtime(), dir);
         let out = runner.run("on_tool_result", Value::Null).await.unwrap();
         assert_eq!(out.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn run_sync_matches_async_contract() {
+        let dir = tmp_hooks_dir("sync");
+        std::fs::write(
+            dir.join("on_prompt_build.lua"),
+            "return function(ctx) return 'PROMPT:' .. ctx.user_prompt end",
+        )
+        .unwrap();
+        let runner = HookRunner::new(lua_runtime(), dir);
+        let out = runner
+            .run_sync(
+                "on_prompt_build",
+                serde_json::json!({ "user_prompt": "hi" }),
+            )
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("PROMPT:hi"));
+    }
+
+    #[test]
+    fn run_sync_absent_and_nil_are_noop() {
+        let runner = HookRunner::new(lua_runtime(), tmp_hooks_dir("sync-absent"));
+        assert_eq!(
+            runner.run_sync("on_prompt_build", Value::Null).unwrap(),
+            None
+        );
+
+        let dir = tmp_hooks_dir("sync-nil");
+        std::fs::write(dir.join("on_prompt_build.lua"), "return function(ctx) end").unwrap();
+        let runner = HookRunner::new(lua_runtime(), dir);
+        assert_eq!(
+            runner.run_sync("on_prompt_build", Value::Null).unwrap(),
+            None
+        );
     }
 }

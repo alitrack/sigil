@@ -78,9 +78,15 @@ impl AgentConfig {
     /// compact index of every skill so the model knows what else is
     /// available and can load any body on demand. Reads the *live*
     /// state, so harness edits apply immediately.
+    ///
+    /// P-B (thin-core roadmap): an `on_prompt_build.lua` hook in the
+    /// hooks dir can override the final prompt — the returned string
+    /// replaces it entirely. Hook errors fall back to the base prompt
+    /// (prompt assembly must never break the agent; unlike the
+    /// on_turn_start / on_tool_result hooks, this one is lenient).
     pub fn system_prompt_for(&self, prompt: &str) -> String {
         let state = self.prompt_state.read().unwrap_or_else(|e| e.into_inner());
-        if state.skills.is_empty() || self.max_inline_skills == 0 {
+        let base = if state.skills.is_empty() || self.max_inline_skills == 0 {
             state.system_prompt.clone()
         } else {
             let mut p = state.system_prompt.clone();
@@ -93,7 +99,35 @@ impl AgentConfig {
                 self.max_inline_skills,
             ));
             p
+        };
+        if let Some(hooks) = &self.hooks {
+            let skills: Vec<serde_json::Value> = state
+                .skills
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "description": s.description,
+                        "body": s.body,
+                    })
+                })
+                .collect();
+            match hooks.run_sync(
+                "on_prompt_build",
+                serde_json::json!({
+                    "base": base.clone(),
+                    "system_prompt": state.system_prompt,
+                    "skills": skills,
+                    "user_prompt": prompt,
+                    "max_inline_skills": self.max_inline_skills,
+                }),
+            ) {
+                Ok(Some(text)) => return text,
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: on_prompt_build hook failed: {e:#}"),
+            }
         }
+        base
     }
 }
 
@@ -374,6 +408,24 @@ pub async fn run_messages(
     stream_cb: Option<&StreamCb>,
 ) -> Result<RunResult> {
     let mut messages = messages.to_vec();
+
+    // P-B (thin-core roadmap): ensure the harness system prompt is
+    // present. Callers that already build it (run_turn, daemon, ACP)
+    // are untouched; REPL and pipe mode previously ran with no system
+    // prompt at all, which also meant `on_prompt_build` hooks never
+    // fired there. This also covers resume paths whose transcript
+    // predates the system prompt.
+    if !messages
+        .iter()
+        .any(|m| matches!(m.role, crate::llm::provider::Role::System))
+    {
+        let first_user = messages.iter().find_map(|m| match m.role {
+            crate::llm::provider::Role::User => Some(m.content.clone()),
+            _ => None,
+        });
+        let system = config.system_prompt_for(first_user.as_deref().unwrap_or(""));
+        messages.insert(0, ChatMessage::system(system));
+    }
 
     let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;
@@ -1391,6 +1443,148 @@ mod parallel_tests {
         assert!(
             provider.saw_inject.load(Ordering::SeqCst),
             "on_turn_start hook text must appear in the first request"
+        );
+    }
+
+    #[test]
+    fn on_prompt_build_hook_overrides_system_prompt() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("prompt-build");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("on_prompt_build.lua"),
+            "return function(ctx) return 'CUSTOM:' .. ctx.user_prompt end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        assert_eq!(config.system_prompt_for("hello"), "CUSTOM:hello");
+        // The base prompt is still reachable through ctx.
+        let dir = config
+            .hooks
+            .as_ref()
+            .map(|h| h.hooks_dir().to_path_buf())
+            .unwrap();
+        std::fs::write(
+            dir.join("on_prompt_build.lua"),
+            "return function(ctx) return ctx.base .. '|APPENDED' end",
+        )
+        .unwrap();
+        assert_eq!(config.system_prompt_for("hi"), "base|APPENDED");
+    }
+
+    #[test]
+    fn on_prompt_build_hook_error_falls_back_to_base() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("prompt-build-error");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("on_prompt_build.lua"),
+            "return function(ctx) error('boom') end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        // Prompt assembly must never break: hook error → base prompt.
+        assert_eq!(config.system_prompt_for("hello"), "base");
+    }
+
+    #[tokio::test]
+    async fn run_messages_injects_system_prompt_when_missing() {
+        // REPL / pipe mode pass user-only message lists; the loop must
+        // inject the harness system prompt (and fire on_prompt_build).
+        #[derive(Debug)]
+        struct SysCheckProvider {
+            calls: AtomicUsize,
+            saw_system: AtomicBool,
+        }
+        #[async_trait]
+        impl LlmProvider for SysCheckProvider {
+            fn name(&self) -> &str {
+                "sys-check-test"
+            }
+            async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => {
+                        let sys = req
+                            .messages
+                            .iter()
+                            .find(|m| matches!(m.role, crate::llm::provider::Role::System));
+                        self.saw_system.store(
+                            sys.is_some_and(|m| m.content.contains("base")),
+                            Ordering::SeqCst,
+                        );
+                        Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                            crate::llm::provider::ChatChunk {
+                                delta: String::new(),
+                                thinking: false,
+                                done: true,
+                                tool_calls_requested: true,
+                                usage: None,
+                            },
+                        )])))
+                    }
+                    _ => Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                        crate::llm::provider::ChatChunk {
+                            delta: "SYS-OK".into(),
+                            thinking: false,
+                            done: true,
+                            tool_calls_requested: false,
+                            usage: None,
+                        },
+                    )]))),
+                }
+            }
+            async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+                Ok(ChatComplete {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "echo_tool".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: None,
+                })
+            }
+        }
+
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let provider = SysCheckProvider {
+            calls: AtomicUsize::new(0),
+            saw_system: AtomicBool::new(false),
+        };
+        let config = test_config();
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("hello")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "SYS-OK");
+        assert!(
+            provider.saw_system.load(Ordering::SeqCst),
+            "user-only message list must get the harness system prompt injected"
         );
     }
 

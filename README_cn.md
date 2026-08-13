@@ -23,6 +23,13 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
+> 状态：**薄化 P-C（v0.2.0）** — Lua 策略层已上线：agent loop 钩子
+> （`on_turn_start` / `on_tool_result` / `on_prompt_build`）在沙箱中运行
+> `~/.sigil/hooks/` 下的 Lua 文件，每次使用从磁盘重载；`improve_harness`
+> 新增 `edit_hook` / `delete_hook` / `list_hooks`（`return function` 契约门 +
+> 评审门 + kind=hooks 版本化回滚）——模型可在会话中途自写策略钩子，
+> 下一轮即生效，无需重启。另：MCP 客户端 Streamable HTTP 传输。
+>
 > 状态：**Phase 71** — cron 定时任务（prime-agent `cron-jobs.ts` 最小版）：
 > daemon 帧 `{"type":"cron","action":"add|list|pause|resume|remove",...}`
 > 管理持久化作业（`<sessions_dir>/cron.json`），`interval`（每 N 秒重触发）与

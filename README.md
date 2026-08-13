@@ -25,6 +25,15 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+> Status: **Thin-core P-C (v0.2.0)** — the Lua policy layer is live:
+> agent-loop hooks (`on_turn_start` / `on_tool_result` / `on_prompt_build`)
+> run sandboxed Lua from `~/.sigil/hooks/` and reload from disk on every
+> use; `improve_harness` gained `edit_hook` / `delete_hook` / `list_hooks`
+> with a `return function` contract gate, review-gated reasons, and
+> versioned rollback (kind=hooks) — the model authors its own policy
+> hooks mid-turn and they go live the next turn, no restart. Also:
+> streamable HTTP transport for MCP clients.
+>
 > Status: **Phase 71** — cron jobs (prime-agent `cron-jobs.ts`,
 > minimal): daemon frames `{"type":"cron","action":"add|list|pause|
 > resume|remove",...}` manage persisted jobs (`<sessions_dir>/

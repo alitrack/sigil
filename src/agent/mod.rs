@@ -655,7 +655,37 @@ pub async fn run_messages(
         // prefix cache. A steady hit-rate drop after a prompt-assembly
         // change means the prefix stopped being byte-stable. Goes to
         // stderr (stdout stays pure for pipe mode).
+        //
+        // Provider coverage: OpenAI returns cached_tokens in usage;
+        // vLLM 0.23 does NOT (prompt_tokens_details is null) — but its
+        // /metrics endpoint exposes prefix_cache_hits_total, verified
+        // end-to-end on 10.10.10.115:8011 at 95% hit for stable
+        // prefixes. Ollama also omits cached_tokens. When the provider
+        // reports none, the probe still gives prompt_tokens (useful for
+        // context-budget math) and the true hit figures must be read
+        // from the provider's own metrics endpoint.
         if std::env::var_os("SIGIL_DEBUG_CACHE").is_some() {
+            // vLLM / Ollama do NOT return usage on streamed responses;
+            // when the stream carried none, probe once non-streamed with
+            // the same prompt to learn the true cache-hit figures.
+            // (The probe re-sends the prompt, which is exactly what a
+            // cache-hit measurement needs — cached tokens only appear
+            // when the prefix matches a previously seen one.)
+            if tokens.is_none() {
+                match provider
+                    .chat_complete(ChatRequest {
+                        model: config.model.clone(),
+                        messages: messages.clone(),
+                        tools: tools.specs(),
+                        stream: false,
+                        temperature: None,
+                    })
+                    .await
+                {
+                    Ok(complete) => tokens = complete.usage,
+                    Err(e) => eprintln!("[cache] usage probe failed: {e:#}"),
+                }
+            }
             if let Some(u) = tokens {
                 let pct = if u.prompt_tokens > 0 {
                     (u.prompt_cache_hit_tokens as f64 / u.prompt_tokens as f64) * 100.0

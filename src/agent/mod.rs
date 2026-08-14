@@ -86,10 +86,15 @@ impl AgentConfig {
     /// state, so harness edits apply immediately.
     ///
     /// P-B (thin-core roadmap): an `on_prompt_build.lua` hook in the
-    /// hooks dir can override the final prompt — the returned string
-    /// replaces it entirely. Hook errors fall back to the base prompt
-    /// (prompt assembly must never break the agent; unlike the
-    /// on_turn_start / on_tool_result hooks, this one is lenient).
+    /// hooks dir can override the final prompt. Cache discipline
+    /// (Phase 65, DeepSeek Harness "don't break the prefix cache"):
+    /// the hook's returned text is **appended** to the base prompt
+    /// (prefix stays byte-stable across turns → provider prefix cache
+    /// keeps hitting). A hook that truly needs to replace everything
+    /// returns text starting with `__REPLACE_ALL__` (escape hatch).
+    /// Hook errors fall back to the base prompt (prompt assembly must
+    /// never break the agent; unlike the on_turn_start / on_tool_result
+    /// hooks, this one is lenient).
     pub fn system_prompt_for(&self, prompt: &str) -> String {
         let state = self.prompt_state.read().unwrap_or_else(|e| e.into_inner());
         let base = if state.skills.is_empty() || self.max_inline_skills == 0 {
@@ -128,7 +133,18 @@ impl AgentConfig {
                     "max_inline_skills": self.max_inline_skills,
                 }),
             ) {
-                Ok(Some(text)) => return text,
+                Ok(Some(text)) => {
+                    // Cache discipline: appended tail keeps the prefix
+                    // byte-stable. `__REPLACE_ALL__` is the escape
+                    // hatch for full overrides.
+                    if let Some(replaced) = text.strip_prefix("__REPLACE_ALL__") {
+                        return replaced.to_string();
+                    }
+                    let mut p = base;
+                    p.push_str("\n\n");
+                    p.push_str(&text);
+                    return p;
+                }
                 Ok(None) => {}
                 Err(e) => eprintln!("warning: on_prompt_build hook failed: {e:#}"),
             }
@@ -1599,7 +1615,7 @@ mod parallel_tests {
     }
 
     #[test]
-    fn on_prompt_build_hook_overrides_system_prompt() {
+    fn on_prompt_build_hook_appends_by_default() {
         let hooks_dir = std::env::temp_dir()
             .join("sigil-agent-hooks-tests")
             .join("prompt-build");
@@ -1617,7 +1633,10 @@ mod parallel_tests {
             lua, hooks_dir,
         )));
 
-        assert_eq!(config.system_prompt_for("hello"), "CUSTOM:hello");
+        // Cache discipline: hook text is appended, base prefix preserved.
+        let out = config.system_prompt_for("hello");
+        assert!(out.starts_with("base"), "prefix must stay byte-stable");
+        assert!(out.ends_with("CUSTOM:hello"), "hook text appended");
         // The base prompt is still reachable through ctx.
         let dir = config
             .hooks
@@ -1629,7 +1648,31 @@ mod parallel_tests {
             "return function(ctx) return ctx.base .. '|APPENDED' end",
         )
         .unwrap();
-        assert_eq!(config.system_prompt_for("hi"), "base|APPENDED");
+        let out2 = config.system_prompt_for("hi");
+        assert!(out2.starts_with("base"), "prefix still byte-stable");
+        assert!(out2.ends_with("base|APPENDED"));
+    }
+
+    #[test]
+    fn on_prompt_build_replace_all_escape_hatch() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("prompt-build-replace-all");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("on_prompt_build.lua"),
+            "return function(ctx) return '__REPLACE_ALL__FULL:' .. ctx.user_prompt end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        assert_eq!(config.system_prompt_for("hello"), "FULL:hello");
     }
 
     #[test]

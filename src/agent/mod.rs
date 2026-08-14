@@ -741,7 +741,7 @@ pub async fn run_messages(
                 // Audit event helper: record the approval decision for
                 // a gate-affected call (audit-only, never replayed into
                 // model context).
-                let mut emit_approval = |decision: &str, reason: Option<String>| {
+                let emit_approval = |decision: &str, reason: Option<String>| {
                     if let Some(sink) = &config.session_sink {
                         sink(crate::session::Event::Approval {
                             ts: None,

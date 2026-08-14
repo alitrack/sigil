@@ -241,9 +241,22 @@ pub fn parse_usage(v: &Value) -> Option<TokenUsage> {
     let usage = v.get("usage")?;
     let prompt_tokens = usage.get("prompt_tokens")?.as_u64()?;
     let completion_tokens = usage.get("completion_tokens")?.as_u64()?;
+    // Cache-hit tokens: vLLM exposes `prompt_cache_hit_tokens`;
+    // OpenAI exposes `prompt_tokens_details.cached_tokens`.
+    let prompt_cache_hit_tokens = usage
+        .get("prompt_cache_hit_tokens")
+        .and_then(|n| n.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|n| n.as_u64())
+        })
+        .unwrap_or(0);
     Some(TokenUsage {
         prompt_tokens,
         completion_tokens,
+        prompt_cache_hit_tokens,
     })
 }
 
@@ -439,6 +452,31 @@ mod tests {
         assert!(parse_usage(&serde_json::json!({})).is_none());
         assert!(parse_usage(&serde_json::json!({ "usage": {} })).is_none());
         assert!(parse_usage(&serde_json::json!({ "usage": { "prompt_tokens": 1 } })).is_none());
+    }
+
+    #[test]
+    fn usage_parses_cache_hit_tokens_both_formats() {
+        // vLLM: `prompt_cache_hit_tokens` at usage top level.
+        let vllm = serde_json::json!({
+            "usage": { "prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 80 }
+        });
+        let u = parse_usage(&vllm).unwrap();
+        assert_eq!(u.prompt_cache_hit_tokens, 80);
+
+        // OpenAI: `prompt_tokens_details.cached_tokens`.
+        let oai = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 60 }
+            }
+        });
+        let u2 = parse_usage(&oai).unwrap();
+        assert_eq!(u2.prompt_cache_hit_tokens, 60);
+
+        // Neither → 0, never None.
+        let none = serde_json::json!({ "usage": { "prompt_tokens": 1, "completion_tokens": 1 } });
+        assert_eq!(parse_usage(&none).unwrap().prompt_cache_hit_tokens, 0);
     }
 
     #[test]

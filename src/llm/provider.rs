@@ -123,6 +123,14 @@ pub struct ChatChunk {
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Prompt tokens served from the provider's prefix cache
+    /// (vLLM `prompt_cache_hit_tokens`; OpenAI-compatible providers
+    /// expose it as `prompt_tokens_details.cached_tokens`). `0` when
+    /// the provider did not report it. Cache-discipline diagnostics
+    /// (Phase 65): DEBUG logging prints hit/total so a change in
+    /// prompt assembly shows up as a measurable hit-rate drop.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: u64,
 }
 
 impl TokenUsage {
@@ -139,6 +147,8 @@ impl std::ops::Add for TokenUsage {
         TokenUsage {
             prompt_tokens: self.prompt_tokens + rhs.prompt_tokens,
             completion_tokens: self.completion_tokens + rhs.completion_tokens,
+            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens
+                + rhs.prompt_cache_hit_tokens,
         }
     }
 }

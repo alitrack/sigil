@@ -650,6 +650,26 @@ pub async fn run_messages(
                 break;
             }
         }
+        // Cache-discipline diagnostics (Phase 65): with SIGIL_DEBUG_CACHE
+        // set, log how much of the prompt was served from the provider's
+        // prefix cache. A steady hit-rate drop after a prompt-assembly
+        // change means the prefix stopped being byte-stable. Goes to
+        // stderr (stdout stays pure for pipe mode).
+        if std::env::var_os("SIGIL_DEBUG_CACHE").is_some() {
+            if let Some(u) = tokens {
+                let pct = if u.prompt_tokens > 0 {
+                    (u.prompt_cache_hit_tokens as f64 / u.prompt_tokens as f64) * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[cache] {}/{} prompt tokens cached ({:.0}%)",
+                    u.prompt_cache_hit_tokens,
+                    u.prompt_tokens,
+                    pct
+                );
+            }
+        }
 
         if tool_calls_requested {
             // Tell the UI the text stream is interrupted by tool calls.

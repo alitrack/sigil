@@ -81,6 +81,39 @@ pub enum Event {
         ok: bool,
         output: String,
     },
+    /// An approval decision for a gate-rejected tool call. Audit-only:
+    /// recorded in the log, but never projected back into model turns.
+    Approval {
+        #[serde(default)]
+        ts: Option<String>,
+        name: String,
+        args: String,
+        /// "approved" | "rejected" | "auto_approved" | "auto_rejected".
+        decision: String,
+        /// Optional human/auto approver note.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// A safety-gate classification hit. Audit-only.
+    Policy {
+        #[serde(default)]
+        ts: Option<String>,
+        name: String,
+        /// "read" | "write" | "dangerous" | "harness".
+        level: String,
+        /// "allowed" | "rejected" | "requires_approval".
+        verdict: String,
+    },
+    /// A Lua hook trigger record. Audit-only.
+    Hook {
+        #[serde(default)]
+        ts: Option<String>,
+        name: String,
+        /// "ran" | "error" | "skipped".
+        outcome: String,
+        #[serde(default)]
+        detail: Option<String>,
+    },
 }
 
 impl Event {
@@ -93,6 +126,9 @@ impl Event {
             Event::Assistant { .. } => "assistant",
             Event::ToolCall { .. } => "tool_call",
             Event::ToolResult { .. } => "tool_result",
+            Event::Approval { .. } => "approval",
+            Event::Policy { .. } => "policy",
+            Event::Hook { .. } => "hook",
         }
     }
 
@@ -103,7 +139,10 @@ impl Event {
             Event::User { ts, .. }
             | Event::Assistant { ts, .. }
             | Event::ToolCall { ts, .. }
-            | Event::ToolResult { ts, .. } => ts.as_deref(),
+            | Event::ToolResult { ts, .. }
+            | Event::Approval { ts, .. }
+            | Event::Policy { ts, .. }
+            | Event::Hook { ts, .. } => ts.as_deref(),
         }
     }
 
@@ -129,6 +168,15 @@ impl Event {
                     flat_preview(output, 40)
                 )
             }
+            Event::Approval {
+                name, decision, ..
+            } => format!("approval: {name} → {decision}"),
+            Event::Policy {
+                name, level, verdict, ..
+            } => format!("policy: {name} [{level}] → {verdict}"),
+            Event::Hook {
+                name, outcome, ..
+            } => format!("hook: {name} {outcome}"),
         }
     }
 }
@@ -218,6 +266,31 @@ fn stamp_event(ev: &Event) -> Event {
             name: name.clone(),
             ok: *ok,
             output: output.clone(),
+        },
+        Event::Approval {
+            name, args, decision, reason, ..
+        } => Event::Approval {
+            ts: Some(ts),
+            name: name.clone(),
+            args: args.clone(),
+            decision: decision.clone(),
+            reason: reason.clone(),
+        },
+        Event::Policy {
+            name, level, verdict, ..
+        } => Event::Policy {
+            ts: Some(ts),
+            name: name.clone(),
+            level: level.clone(),
+            verdict: verdict.clone(),
+        },
+        Event::Hook {
+            name, outcome, detail, ..
+        } => Event::Hook {
+            ts: Some(ts),
+            name: name.clone(),
+            outcome: outcome.clone(),
+            detail: detail.clone(),
         },
     }
 }
@@ -924,5 +997,132 @@ mod tests {
         assert!(summaries(&dir).unwrap().is_empty());
         assert!(latest(&dir).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn approval_event_roundtrip() {
+        // Audit events write and read back with all fields intact.
+        let dir = std::env::temp_dir().join(format!("sigil-approval-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::Approval {
+                ts: None,
+                name: "bash".into(),
+                args: "rm -rf /tmp/x".into(),
+                decision: "rejected".into(),
+                reason: Some("destructive".into()),
+            },
+        )
+        .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Approval {
+                name,
+                args,
+                decision,
+                reason,
+                ..
+            } => {
+                assert_eq!(name, "bash");
+                assert_eq!(args, "rm -rf /tmp/x");
+                assert_eq!(decision, "rejected");
+                assert_eq!(reason.as_deref(), Some("destructive"));
+                assert!(events[0].ts().is_some(), "ts auto-stamped");
+            }
+            other => panic!("expected Approval, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_events_not_in_turns() {
+        // Approval/Policy/Hook stay in the raw log but never project
+        // into the turn view (model context) — the dsh "audit-only"
+        // principle.
+        let dir = std::env::temp_dir().join(format!("sigil-audit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        for ev in [
+            Event::User {
+                ts: None,
+                text: "hi".into(),
+            },
+            Event::Approval {
+                ts: None,
+                name: "bash".into(),
+                args: "rm x".into(),
+                decision: "auto_rejected".into(),
+                reason: None,
+            },
+            Event::Policy {
+                ts: None,
+                name: "bash".into(),
+                level: "dangerous".into(),
+                verdict: "rejected".into(),
+            },
+            Event::Hook {
+                ts: None,
+                name: "on_tool_result".into(),
+                outcome: "ran".into(),
+                detail: None,
+            },
+            Event::Assistant {
+                ts: None,
+                text: "denied".into(),
+            },
+        ] {
+            append_event(&dir, &id, &ev).unwrap();
+        }
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 5, "all events preserved in raw log");
+
+        let turns = load(&dir, &id).unwrap();
+        assert_eq!(turns.len(), 2, "audit events filtered from turns");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[1].role, "assistant");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_summary_lines() {
+        // summary() renders audit events without leaking full args.
+        let a = Event::Approval {
+            ts: None,
+            name: "bash".into(),
+            args: "rm -rf /secret/path".into(),
+            decision: "approved".into(),
+            reason: None,
+        };
+        assert_eq!(a.summary(), "approval: bash → approved");
+        assert!(!a.summary().contains("secret"), "args not leaked to summary");
+
+        let p = Event::Policy {
+            ts: None,
+            name: "bash".into(),
+            level: "dangerous".into(),
+            verdict: "rejected".into(),
+        };
+        assert_eq!(p.summary(), "policy: bash [dangerous] → rejected");
+
+        let h = Event::Hook {
+            ts: None,
+            name: "on_tool_result".into(),
+            outcome: "error".into(),
+            detail: Some("bad lua".into()),
+        };
+        assert_eq!(h.summary(), "hook: on_tool_result error");
+        assert!(!h.summary().contains("bad lua"), "detail not leaked to summary");
     }
 }

@@ -702,14 +702,35 @@ pub async fn run_messages(
                 // interactive mode the human may override.
                 let gate = safety::check(&call.name, &call.arguments);
                 let mut allowed = matches!(gate, safety::GateDecision::Allow);
+                // Audit event helper: record the approval decision for
+                // a gate-affected call (audit-only, never replayed into
+                // model context).
+                let mut emit_approval = |decision: &str, reason: Option<String>| {
+                    if let Some(sink) = &config.session_sink {
+                        sink(crate::session::Event::Approval {
+                            ts: None,
+                            name: call.name.clone(),
+                            args: call.arguments.to_string(),
+                            decision: decision.into(),
+                            reason,
+                        });
+                    }
+                };
                 if !allowed
                     && let Some(approve) = approver
                     && approve(&call.name, &call.arguments)
                 {
                     allowed = true;
                     eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
+                    emit_approval("approved", None);
                 }
                 if !allowed {
+                    let decision = if approver.is_some() {
+                        "rejected"
+                    } else {
+                        "auto_rejected"
+                    };
+                    emit_approval(decision, None);
                     plans.push(Plan {
                         call: call.clone(),
                         blocked: Some(safety::reject_message(&call.name, &call.arguments)),

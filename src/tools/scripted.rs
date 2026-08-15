@@ -2,6 +2,9 @@
 //! become callable tools. Each file exports a function that receives the
 //! tool arguments (a Lua table) and returns a result (string or table).
 //!
+//! Phase B 边界说明：本模块的 std::fs 操作对象是 agent 自管理目录
+//! （~/.sigil/tools/）—— 非"执行世界"，不走 FsProvider 缝隙。
+//!
 //! This is the "evolve by scripting" layer: the model itself can write a
 //! Lua tool, drop it in the tools dir, and it becomes available next
 //! turn — no recompile. (Phase-3 self-evolution harness builds on this.)

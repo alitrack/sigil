@@ -142,9 +142,9 @@ impl ToolRegistry {
         registry.register(Arc::new(bash::BashTool::new()));
         registry.register(Arc::new(files::ReadFileTool::new()));
         registry.register(Arc::new(files::WriteFileTool::new()));
-        registry.register(Arc::new(git::GitStatusTool));
-        registry.register(Arc::new(git::GitDiffTool));
-        registry.register(Arc::new(git::GitLogTool));
+        registry.register(Arc::new(git::GitStatusTool::new()));
+        registry.register(Arc::new(git::GitDiffTool::new()));
+        registry.register(Arc::new(git::GitLogTool::new()));
         // Evolution tool: the model can write new Lua tools at runtime.
         let tools_dir = scripted_dir
             .map(Path::to_path_buf)

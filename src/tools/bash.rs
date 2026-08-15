@@ -17,6 +17,10 @@ pub const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// keeps running, and the caller gets `Ok(None)` — a *normal* tool
 /// output explaining the timeout, not a hard error, so the agent loop
 /// keeps going and the model can react.
+///
+/// Phase B：已被 `agent::provider::LocalShellProvider` 取代（执行走缝隙），
+/// 保留为兼容 API（测试与旧引用）。
+#[allow(dead_code)]
 pub async fn run_with_timeout(
     cmd: tokio::process::Command,
     budget: std::time::Duration,

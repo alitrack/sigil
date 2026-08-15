@@ -1,6 +1,10 @@
 //! Evolution tools: let the model extend its own toolset and improve
 //! its own harness.
 //!
+//! Phase B 边界说明：本模块的 std::fs 操作对象是 agent 自管理目录
+//! （tools_dir / refinements.jsonl / harness 文件）—— 非"执行世界"（用户
+//! 项目文件），不走 FsProvider 缝隙（对齐 dsh：seam 覆盖用户世界操作）。
+//!
 //! `create_lua_tool` — the model writes a Lua tool, sigil saves it to
 //! the tools dir and hot-registers it. Next turn (and every turn after)
 //! the new tool is available to every tool-calling model.

@@ -30,7 +30,29 @@ pub async fn run_with_timeout(
     }
 }
 
-pub struct BashTool;
+pub struct BashTool {
+    shell: crate::agent::provider::ArcShell,
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self {
+            shell: crate::agent::provider::default_shell(),
+        }
+    }
+
+    /// Phase B: 缝隙注入 —— 宿主可换沙箱/远程/审计 shell 实现。
+    #[allow(dead_code)]
+    pub fn with_shell(shell: crate::agent::provider::ArcShell) -> Self {
+        Self { shell }
+    }
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -60,7 +82,8 @@ impl Tool for BashTool {
 
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(command);
-        let output = match run_with_timeout(cmd, CMD_TIMEOUT).await? {
+        // Phase B: 执行走 ShellProvider 缝隙（默认 LocalShellProvider，行为与旧一致）。
+        let output = match self.shell.run(cmd, CMD_TIMEOUT).await? {
             Some(o) => o,
             None => {
                 return Ok(ToolOutput {
@@ -91,6 +114,25 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Phase B: 缝隙注入生效 —— BashTool 走 ShellProvider 而非直接 run_with_timeout。
+    #[tokio::test]
+    async fn bash_tool_with_injected_provider_routes_through_seam() {
+        use std::sync::atomic::Ordering;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let shell = crate::agent::provider::RecordingShell { calls: calls2 };
+
+        let tool = BashTool::with_shell(std::sync::Arc::new(shell));
+        let out = tool.run(&json!({ "command": "echo hi" })).await.unwrap();
+
+        assert_eq!(out.text, "hi");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "command must route through the injected provider"
+        );
+    }
 
     #[tokio::test]
     async fn run_with_timeout_returns_output_for_fast_command() {

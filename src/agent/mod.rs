@@ -11,6 +11,7 @@
 //!   4. Otherwise the streamed text is the final answer.
 
 pub mod invariant;
+pub mod provider;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;

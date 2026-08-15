@@ -5,11 +5,32 @@
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::fs;
 
 use super::{Tool, ToolOutput};
 
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    fs: crate::agent::provider::ArcFs,
+}
+
+impl ReadFileTool {
+    pub fn new() -> Self {
+        Self {
+            fs: crate::agent::provider::default_fs(),
+        }
+    }
+
+    /// Phase B: 缝隙注入 —— 宿主可换沙箱/远程/审计 fs 实现。
+    #[allow(dead_code)]
+    pub fn with_fs(fs: crate::agent::provider::ArcFs) -> Self {
+        Self { fs }
+    }
+}
+
+impl Default for ReadFileTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -49,7 +70,8 @@ impl Tool for ReadFileTool {
             .unwrap_or(500)
             .min(2000);
 
-        let content = match fs::read_to_string(path).await {
+        // Phase B: 文件 IO 走 FsProvider 缝隙（默认 LocalFsProvider）。
+        let content = match self.fs.read_to_string(std::path::Path::new(path)).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolOutput {
@@ -81,7 +103,29 @@ impl Tool for ReadFileTool {
     }
 }
 
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    fs: crate::agent::provider::ArcFs,
+}
+
+impl WriteFileTool {
+    pub fn new() -> Self {
+        Self {
+            fs: crate::agent::provider::default_fs(),
+        }
+    }
+
+    /// Phase B: 缝隙注入 —— 宿主可换沙箱/远程/审计 fs 实现。
+    #[allow(dead_code)]
+    pub fn with_fs(fs: crate::agent::provider::ArcFs) -> Self {
+        Self { fs }
+    }
+}
+
+impl Default for WriteFileTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for WriteFileTool {
@@ -115,9 +159,10 @@ impl Tool for WriteFileTool {
             .ok_or_else(|| anyhow::anyhow!("write_file: missing string 'content'"))?;
 
         if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = fs::create_dir_all(parent).await;
+            let _ = self.fs.create_dir_all(parent).await;
         }
-        match fs::write(path, content).await {
+        // Phase B: 文件 IO 走 FsProvider 缝隙（默认 LocalFsProvider）。
+        match self.fs.write(std::path::Path::new(path), content).await {
             Ok(()) => Ok(ToolOutput {
                 text: format!("wrote {} bytes to {path}", content.len()),
             }),

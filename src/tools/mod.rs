@@ -139,9 +139,9 @@ impl ToolRegistry {
         hooks_dir: Option<&Path>,
     ) -> Self {
         let mut registry = Self::new();
-        registry.register(Arc::new(bash::BashTool));
-        registry.register(Arc::new(files::ReadFileTool));
-        registry.register(Arc::new(files::WriteFileTool));
+        registry.register(Arc::new(bash::BashTool::new()));
+        registry.register(Arc::new(files::ReadFileTool::new()));
+        registry.register(Arc::new(files::WriteFileTool::new()));
         registry.register(Arc::new(git::GitStatusTool));
         registry.register(Arc::new(git::GitDiffTool));
         registry.register(Arc::new(git::GitLogTool));
@@ -305,9 +305,9 @@ mod registry_tests {
     #[test]
     fn re_register_same_name_does_not_duplicate_order() {
         let mut reg = ToolRegistry::new();
-        reg.register(std::sync::Arc::new(BashTool));
+        reg.register(std::sync::Arc::new(BashTool::new()));
         // Re-register (e.g. a scripted tool shadowing a native one).
-        reg.register(std::sync::Arc::new(BashTool));
+        reg.register(std::sync::Arc::new(BashTool::new()));
         let specs = reg.specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "bash");

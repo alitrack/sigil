@@ -80,7 +80,10 @@ pub async fn serve(
     let mut sessions = HashMap::new();
     let turns = crate::session::load(sessions_dir, &session_id)?;
     if !turns.is_empty() {
-        let msgs = crate::session::turns_to_messages(turns);
+        // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复。
+        let _ = crate::session::repair_unpaired_tool_calls(sessions_dir, &session_id)?;
+        let events = crate::session::load_events(sessions_dir, &session_id)?;
+        let msgs = crate::session::events_to_messages(&events);
         let st = SessionState {
             messages: tokio::sync::Mutex::new(msgs),
         };
@@ -260,8 +263,11 @@ async fn resolve_session(
             messages: tokio::sync::Mutex::new(Vec::new()),
         }
     } else {
+        // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复。
+        let _ = crate::session::repair_unpaired_tool_calls(sessions_dir, &id)?;
+        let events = crate::session::load_events(sessions_dir, &id)?;
         SessionState {
-            messages: tokio::sync::Mutex::new(crate::session::turns_to_messages(turns)),
+            messages: tokio::sync::Mutex::new(crate::session::events_to_messages(&events)),
         }
     };
     let st = Arc::new(st);

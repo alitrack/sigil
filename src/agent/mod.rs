@@ -10,6 +10,8 @@
 //!   3. Execute every call, append results as `tool` messages, loop.
 //!   4. Otherwise the streamed text is the final answer.
 
+pub mod invariant;
+
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 
@@ -479,6 +481,8 @@ pub async fn run_messages(
     // Real prompt-token usage of the most recent LLM call — feeds the
     // compaction trigger/calibration (see compact_messages_with_budget).
     let mut last_prompt_tokens: Option<usize> = None;
+    // Phase A2: turn 事件只写一次（run = 一个 turn，多 step）。
+    let mut turn_started = false;
 
     loop {
         // Cross-instance sync: if another sigil process edited the
@@ -581,6 +585,40 @@ pub async fn run_messages(
         {
             messages.push(ChatMessage::system(text));
         }
+
+        // ── Phase A2: 事件溯源 —— 注入即事件 + 请求前配对不变式 ──
+        // 本轮请求的上下文（step/header/注入）先入日志，再进请求；
+        // 配对校验拦截半完成 step（崩溃残留），fail-fast 而非发脏上下文。
+        if let Some(sink) = &config.session_sink {
+            if !turn_started {
+                sink(crate::session::Event::TurnStart { ts: None });
+                turn_started = true;
+            }
+            sink(crate::session::Event::StepStart { ts: None });
+            sink(crate::session::Event::RequestHeader {
+                ts: None,
+                model: config.model.clone(),
+                temperature: None,
+                max_tokens: None,
+                tools_fingerprint: Some(
+                    specs
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ),
+            });
+            if config.goals.is_some() {
+                // 注入上下文（持久目标）—— 注入即事件，审计可复现。
+                sink(crate::session::Event::RequestContext {
+                    ts: None,
+                    values: vec![("goals".into(), "active".into())],
+                });
+            }
+        }
+        crate::agent::invariant::check_tool_pairing(&messages).map_err(|v| {
+            anyhow::anyhow!("会话一致性校验失败（Model-visible means logged）：{v}")
+        })?;
 
         let req = ChatRequest {
             model: config.model.clone(),
@@ -720,11 +758,26 @@ pub async fn run_messages(
                 } else {
                     text
                 };
+                // Phase A2: 最终答案事件（模型可见输出入日志）。
+                if let Some(sink) = &config.session_sink {
+                    sink(crate::session::Event::Assistant {
+                        ts: None,
+                        text: answer.clone(),
+                    });
+                    sink(crate::session::Event::TurnEnd { ts: None });
+                }
                 return Ok(RunResult {
                     output: answer.trim().to_string(),
                     steps: step,
                     state: RunState::Success,
                     tokens,
+                });
+            }
+            // Phase A2: assistant 事件（文本 + 随后 ToolCall 事件配对成完整消息）。
+            if let Some(sink) = &config.session_sink {
+                sink(crate::session::Event::Assistant {
+                    ts: None,
+                    text: complete.text.clone(),
                 });
             }
             messages.push(ChatMessage::assistant_with_tools(
@@ -1406,20 +1459,32 @@ mod parallel_tests {
 
         {
             let evs = events.lock().unwrap();
-            // 2 ToolCall (slow_tool, fast_tool) + 2 ToolResult, in order:
-            // both calls emitted before any result (calls are emitted at
-            // plan time, results after execution).
-            assert_eq!(evs.len(), 4, "expected 2 calls + 2 results, got {evs:?}");
-            assert_eq!(evs[0].kind(), "tool_call");
-            assert_eq!(evs[1].kind(), "tool_call");
-            assert_eq!(evs[2].kind(), "tool_result");
-            assert_eq!(evs[3].kind(), "tool_result");
+            // Phase A2 补充了结构/元数据事件（TurnStart/StepStart/RequestHeader/Assistant），
+            // 此处验证核心契约：2 个 ToolCall + 2 个 ToolResult，且顺序为
+            // "全部调用先于任何结果"（calls 在 plan 时发出，results 在执行后）。
+            let calls: Vec<_> = evs.iter().filter(|e| e.kind() == "tool_call").collect();
+            let results: Vec<_> = evs.iter().filter(|e| e.kind() == "tool_result").collect();
+            assert_eq!(calls.len(), 2, "expected 2 tool_call events, got {evs:?}");
+            assert_eq!(
+                results.len(),
+                2,
+                "expected 2 tool_result events, got {evs:?}"
+            );
+            let first_result_idx = evs.iter().position(|e| e.kind() == "tool_result").unwrap();
+            let last_call_idx = evs.iter().rposition(|e| e.kind() == "tool_call").unwrap();
+            assert!(
+                last_call_idx < first_result_idx,
+                "all calls must precede any result, got {evs:?}"
+            );
+            // 结构化事件存在（Phase A2 注入即事件）。
+            assert!(evs.iter().any(|e| e.kind() == "turn_start"));
+            assert!(evs.iter().any(|e| e.kind() == "request_header"));
             // Names match the requested tools; both succeeded.
-            match &evs[0] {
+            match &calls[0] {
                 crate::session::Event::ToolCall { name, .. } => assert_eq!(name, "slow_tool"),
                 other => panic!("expected tool_call, got {other:?}"),
             }
-            match &evs[2] {
+            match &results[0] {
                 crate::session::Event::ToolResult { ok, output, .. } => {
                     assert!(*ok, "slow_tool should succeed");
                     assert!(!output.is_empty());

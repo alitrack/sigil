@@ -308,6 +308,44 @@ pub fn append(sessions_dir: &Path, id: &str, turn: &Turn) -> std::io::Result<()>
     append_event(sessions_dir, id, &ev)
 }
 
+/// 崩溃残留修复（Phase A2，对齐 cc M4）：扫描事件，对未配对的工具调用
+/// （ToolCall 无配对 ToolResult）追加合成结果事件 —— 会话不 brick，
+/// 修复本身是日志事件，可审计。返回修复的未配对调用数。
+pub fn repair_unpaired_tool_calls(sessions_dir: &Path, id: &str) -> std::io::Result<usize> {
+    let events = load_events(sessions_dir, id)?;
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ev in &events {
+        match ev {
+            Event::ToolCall { id: call_id, .. } => {
+                if !call_id.is_empty() {
+                    pending.insert(call_id.clone());
+                }
+            }
+            Event::ToolResult { id: call_id, .. } => {
+                pending.remove(call_id);
+            }
+            _ => {}
+        }
+    }
+
+    let mut repaired = 0;
+    for call_id in pending {
+        append_event(
+            sessions_dir,
+            id,
+            &Event::ToolResult {
+                ts: None,
+                id: call_id,
+                name: String::new(),
+                ok: false,
+                output: "[recovered: tool call interrupted before result]".into(),
+            },
+        )?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// Stamp a missing timestamp onto a clone of the event.
 fn stamp_event(ev: &Event) -> Event {
     let ts = ev
@@ -610,6 +648,10 @@ pub fn latest(sessions_dir: &Path) -> std::io::Result<Option<String>> {
 
 /// Turn a loaded session's turns into agent messages (resume paths:
 /// REPL, daemon, pipe mode).
+/// 文本级投影（Phase A1 前格式）：仅 user/assistant 文本，工具历史不进模型上下文。
+/// 已被 [`events_to_messages`] 取代（完整投影含工具调用/结果）；
+/// 保留作兼容 API（export/import 与旧工具）。
+#[allow(dead_code)]
 pub fn turns_to_messages(turns: Vec<Turn>) -> Vec<crate::llm::ChatMessage> {
     turns
         .into_iter()
@@ -965,6 +1007,53 @@ mod tests {
             }
             other => panic!("expected RequestContext, got {other:?}"),
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_unpaired_tool_calls_appends_synthetic_results() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-repair-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::User {
+                ts: None,
+                text: "hi".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::ToolCall {
+                ts: None,
+                id: "call_1".into(),
+                name: "read_file".into(),
+                args: "{}".into(),
+            },
+        )
+        .unwrap();
+
+        // 修复前：事件投影出的消息配对不完整（半完成 step）
+        let events = load_events(&dir, &id).unwrap();
+        assert!(
+            crate::agent::invariant::check_tool_pairing(&events_to_messages(&events)).is_err(),
+            "修复前应检测到未配对工具调用"
+        );
+
+        let repaired = repair_unpaired_tool_calls(&dir, &id).unwrap();
+        assert_eq!(repaired, 1);
+
+        let events = load_events(&dir, &id).unwrap();
+        assert!(
+            crate::agent::invariant::check_tool_pairing(&events_to_messages(&events)).is_ok(),
+            "修复后配对必须完整"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

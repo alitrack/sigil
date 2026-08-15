@@ -460,7 +460,14 @@ async fn main() -> Result<()> {
                     };
                     let turns = session::load(&sessions_dir, &id)?;
                     eprintln!("  (resumed session {id} — {} turns)", turns.len());
-                    let mut msgs = session::turns_to_messages(turns);
+                    // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复 ——
+                    // 模型 resume 后能看到之前的工具调用/结果，而不是文本摘要。
+                    let repaired = session::repair_unpaired_tool_calls(&sessions_dir, &id)?;
+                    if repaired > 0 {
+                        eprintln!("  (repaired {repaired} unpaired tool call(s))");
+                    }
+                    let events = session::load_events(&sessions_dir, &id)?;
+                    let mut msgs = session::events_to_messages(&events);
                     msgs.push(crate::llm::ChatMessage::user(prompt));
                     msgs
                 }

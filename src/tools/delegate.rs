@@ -388,6 +388,23 @@ pub struct DelegateTool {
     /// Nesting depth of this tool instance (0 = top-level agent; a
     /// depth-1 sub-agent's delegate tool is refused further nesting).
     depth: u32,
+    /// Optional progress reporter — the ACP host (brainflow) wires this
+    /// to stream sub-agent lifecycle events while a batch runs, so the
+    /// decision canvas can show branches as they start and finish.
+    progress: Option<Arc<dyn Fn(DelegateProgress) + Send + Sync>>,
+}
+
+/// One sub-agent lifecycle event for a live delegate batch. `step` is
+/// the 1-based ordinal of this sub-agent within the current batch and
+/// `total` the batch size (both 1 for a single `spawn`).
+#[derive(Debug, Clone)]
+pub struct DelegateProgress {
+    pub id: String,
+    pub name: String,
+    /// "running" | "completed" | "failed"
+    pub status: &'static str,
+    pub step: usize,
+    pub total: usize,
 }
 
 impl DelegateTool {
@@ -406,6 +423,7 @@ impl DelegateTool {
             agents: Arc::new(subagent::AgentRegistry::new(harness_dir.as_deref())),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         }
     }
 
@@ -423,6 +441,20 @@ impl DelegateTool {
             agents: self.agents.clone(),
             description: std::sync::OnceLock::new(),
             depth,
+            progress: self.progress.clone(),
+        }
+    }
+
+    /// A copy of this tool wired to a progress reporter — used by the
+    /// ACP server so a live delegate batch streams sub-agent lifecycle
+    /// events to the host (brainflow decision canvas).
+    pub fn with_progress(
+        self,
+        progress: Arc<dyn Fn(DelegateProgress) + Send + Sync>,
+    ) -> Self {
+        Self {
+            progress: Some(progress),
+            ..self
         }
     }
 
@@ -679,11 +711,37 @@ fn spawn_name(args: &serde_json::Value) -> anyhow::Result<Option<String>> {
 async fn wait_for_delegates(
     delegates: &DelegateRegistry,
     ids: &[String],
+    step_of: &[(String, usize, String)],
     timeout_secs: u64,
+    progress: Option<&(dyn Fn(DelegateProgress) + Send + Sync)>,
 ) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // Report a terminal state at most once per sub-agent.
+    let mut reported: std::collections::HashSet<&str> = std::collections::HashSet::new();
     loop {
         let states = delegates.snapshot().await;
+        // Progress bridge: each sub-agent that reached a terminal state
+        // (completed/failed) since the last poll gets a `completed` /
+        // `failed` event so the host canvas can update live.
+        for (id, step, name) in step_of {
+            if reported.contains(id.as_str()) {
+                continue;
+            }
+            if let (Some(st), Some(cb)) = (
+                states.iter().find(|s| &s.id == id),
+                progress,
+            ) && st.status != DelegateStatus::Running
+            {
+                cb(DelegateProgress {
+                    id: id.clone(),
+                    name: name.clone(),
+                    status: st.status.as_str(),
+                    step: *step,
+                    total: step_of.len(),
+                });
+                reported.insert(id.as_str());
+            }
+        }
         let all_done = ids.iter().all(|id| {
             states
                 .iter()
@@ -873,6 +931,7 @@ impl Tool for DelegateTool {
                     .and_then(Value::as_str)
                     .context("delegate spawn requires a 'task' string")?
                     .to_string();
+                let task_for_progress = task.clone();
                 let active = self
                     .delegates
                     .snapshot()
@@ -901,6 +960,16 @@ impl Tool for DelegateTool {
                             .map(|v| v as usize),
                     )
                     .await?;
+                if let Some(cb) = &self.progress {
+                    cb(DelegateProgress {
+                        id: id.clone(),
+                        name: spawn_name(args)?
+                            .unwrap_or_else(|| task_for_progress.clone()),
+                        status: "running",
+                        step: 1,
+                        total: 1,
+                    });
+                }
                 Ok(ToolOutput {
                     text: format!(
                         "delegate '{id}' spawned (status: running). Keep working; poll with action=status, collect with action=result."
@@ -945,6 +1014,8 @@ impl Tool for DelegateTool {
                 );
                 let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(600);
                 let mut ids = Vec::new();
+                let mut step_of: Vec<(String, usize, String)> = Vec::new();
+                let batch_total = tasks.len();
                 for t in tasks {
                     let task = t
                         .get("task")
@@ -957,6 +1028,16 @@ impl Tool for DelegateTool {
                         .map(|n| n.trim().to_string())
                         .filter(|n| !n.is_empty())
                         .filter(|n| n.chars().count() <= 64);
+                    let step = ids.len() + 1;
+                    if let Some(cb) = &self.progress {
+                        cb(DelegateProgress {
+                            id: format!("pending-{step}"),
+                            name: name.clone().unwrap_or_else(|| task.clone()),
+                            status: "running",
+                            step,
+                            total: batch_total,
+                        });
+                    }
                     let id = self
                         .spawn_subagent(
                             task,
@@ -973,9 +1054,10 @@ impl Tool for DelegateTool {
                                 .map(|v| v as usize),
                         )
                         .await?;
-                    ids.push(id);
+                    ids.push(id.clone());
+                    step_of.push((id, step, format!("pending-{step}")));
                 }
-                let text = wait_for_delegates(&self.delegates, &ids, timeout).await?;
+                let text = wait_for_delegates(&self.delegates, &ids, &step_of, timeout, self.progress.as_deref()).await?;
                 Ok(ToolOutput { text })
             }
             "resume" => {
@@ -1262,6 +1344,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
         assert_eq!(tool.name(), "delegate");
         let p = tool.parameters();
@@ -1387,7 +1470,9 @@ mod tests {
             .await;
             ids.push(id);
         }
-        let text = wait_for_delegates(&reg, &ids, 2).await.unwrap();
+        let step_of: Vec<(String, usize, String)> =
+            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
+        let text = wait_for_delegates(&reg, &ids, &step_of, 2, None).await.unwrap();
         assert!(text.contains("delegate batch (2 tasks)"), "got: {text}");
         assert!(
             text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
@@ -1397,6 +1482,52 @@ mod tests {
             text.contains("d00001 [completed] task-1 (1 steps) — answer-1"),
             "got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_delegates_reports_progress_events() {
+        let reg = DelegateRegistry::default();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = format!("d{i:05}");
+            reg.insert(DelegateState {
+                id: id.clone(),
+                name: format!("task-{i}"),
+                status: DelegateStatus::Completed,
+                started_ts: "t".into(),
+                finished_ts: Some("t1".into()),
+                result: Some(format!("answer-{i}")),
+                error: None,
+                task: format!("task-{i}"),
+                resume_from: None,
+                steps: Some(1),
+                model: None,
+                messages: Vec::new(),
+                inbox: Vec::new(),
+                tokens: None,
+            })
+            .await;
+            ids.push(id);
+        }
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let events2 = events.clone();
+        let cb = move |p: DelegateProgress| {
+            events2
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}:{}", p.id, p.status, p.step));
+        };
+        let step_of: Vec<(String, usize, String)> =
+            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
+        let text =
+            wait_for_delegates(&reg, &ids, &step_of, 2, Some(&cb)).await.unwrap();
+        assert!(text.contains("delegate batch (2 tasks)"), "got: {text}");
+        let got = events.lock().unwrap().clone();
+        // Both already terminal on the first poll → exactly one event each,
+        // with correct step ordinals and terminal statuses.
+        assert_eq!(got.len(), 2, "events: {got:?}");
+        assert!(got.iter().any(|e| e == "d00000:completed:1"), "events: {got:?}");
+        assert!(got.iter().any(|e| e == "d00001:completed:2"), "events: {got:?}");
     }
 
     #[tokio::test]
@@ -1433,9 +1564,11 @@ mod tests {
             .await;
             ids.push(id);
         }
+        let step_of: Vec<(String, usize, String)> =
+            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
         // 1s timeout: must return promptly with the partial aggregate,
         // not hang.
-        let text = wait_for_delegates(&reg, &ids, 1).await.unwrap();
+        let text = wait_for_delegates(&reg, &ids, &step_of, 1, None).await.unwrap();
         assert!(
             text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
             "got: {text}"
@@ -1601,6 +1734,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
 
         // Empty (after trim) and >64-char names are rejected — the
@@ -1729,6 +1863,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
         let out = tool.run(&json!({"action": "list"})).await.unwrap();
         assert!(
@@ -1852,6 +1987,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
         let out = tool.run(&json!({"action": "metrics"})).await.unwrap();
         assert!(
@@ -1945,6 +2081,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         }
     }
 
@@ -2177,6 +2314,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
         let out = tool
             .run(&json!({
@@ -2271,6 +2409,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
         let out = tool
             .run(&json!({"action": "send", "id": "d00001", "text": "watch out"}))
@@ -2406,6 +2545,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
 
         let out = tool
@@ -2541,6 +2681,7 @@ mod tests {
             agents: Arc::new(subagent::AgentRegistry::new(None)),
             description: std::sync::OnceLock::new(),
             depth: 0,
+            progress: None,
         };
 
         // Unknown id → clear error.

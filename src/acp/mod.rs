@@ -292,6 +292,8 @@ pub async fn serve(
     mut tools: ToolRegistry,
     agent_config: AgentConfig,
     provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>,
+    delegates_dir: Option<std::path::PathBuf>,
+    harness_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -350,6 +352,42 @@ pub async fn serve(
             })
         });
         tools.register(Arc::new(crate::tools::ask::AskTool { cb: ask_cb }));
+    }
+
+    // Live sub-agent progress → host canvas. A DelegateTool wired to a
+    // progress reporter shadows the default registration (the registry
+    // dedupes by name, last registration wins), so a delegate batch
+    // running inside a turn streams `agent_delegate_progress`
+    // notifications — the host can show branches starting/finishing.
+    {
+        let progress_tx = notif_tx.clone();
+        let provider2 = provider.clone();
+        let config2 = agent_config.clone();
+        let progress_cb: std::sync::Arc<
+            dyn Fn(crate::tools::delegate::DelegateProgress) + Send + Sync,
+        > = std::sync::Arc::new(move |p: crate::tools::delegate::DelegateProgress| {
+            let _ = progress_tx.send(Out::Notification {
+                session_id: String::new(), // the client matches by batch/turn
+                update: json!({
+                    "sessionUpdate": "agent_delegate_progress",
+                    "id": p.id,
+                    "name": p.name,
+                    "status": p.status,
+                    "step": p.step,
+                    "total": p.total,
+                }),
+            });
+        });
+        tools.register(std::sync::Arc::new(
+            crate::tools::delegate::DelegateTool::new(
+                provider2,
+                tools.clone_shallow(),
+                config2,
+                delegates_dir,
+                harness_dir,
+            )
+            .with_progress(progress_cb),
+        ));
     }
 
     // Real turn executor: full agent loop with this run's tools/config.

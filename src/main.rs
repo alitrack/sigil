@@ -277,7 +277,19 @@ async fn main() -> Result<()> {
         }
         Some(Command::Acp) => {
             eprintln!("sigil acp: serving Agent Client Protocol on stdio");
-            acp::serve(tools, agent_config, provider_arc).await
+            acp::serve(
+                tools,
+                agent_config,
+                provider_arc,
+                Some(
+                    cli.delegates_dir
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(tools::delegate::default_delegates_dir),
+                ),
+                cli.harness_dir.as_deref().map(std::path::PathBuf::from),
+            )
+            .await
         }
         Some(Command::Daemon { socket }) => {
             #[cfg(unix)]

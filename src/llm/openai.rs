@@ -71,7 +71,10 @@ impl OpenAiProvider {
 
     fn build_client() -> anyhow::Result<reqwest::Client> {
         Ok(reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            // 3600s: long-context review prompts can exceed 600s when the
+            // endpoint is busy (queued behind other requests) or the model
+            // streams a long answer. 600s was too tight for 48K-token prompts.
+            .timeout(std::time::Duration::from_secs(3600))
             // Never route requests through a proxy from the
             // environment: sigil's endpoints are local or direct, and
             // http_proxy would hijack loopback traffic (a proxy

@@ -66,20 +66,67 @@ pub enum Event {
         text: String,
     },
     /// A tool invocation requested by the model.
+    /// `id` = tool-call id (Phase A; legacy lines may omit it → empty).
     ToolCall {
         #[serde(default)]
         ts: Option<String>,
+        #[serde(default)]
+        id: String,
         name: String,
         args: String,
     },
     /// The outcome of a tool invocation.
+    /// `id` pairs with the originating ToolCall (Phase A; legacy → empty).
     ToolResult {
         #[serde(default)]
         ts: Option<String>,
+        #[serde(default)]
+        id: String,
         name: String,
         /// `true` = tool succeeded; `false` = error output.
         ok: bool,
         output: String,
+    },
+    /// One agent turn begins (structural event; not projected to messages).
+    TurnStart {
+        #[serde(default)]
+        ts: Option<String>,
+    },
+    /// One agent turn ends.
+    TurnEnd {
+        #[serde(default)]
+        ts: Option<String>,
+    },
+    /// One agent step begins (step = one model request + its tools).
+    StepStart {
+        #[serde(default)]
+        ts: Option<String>,
+    },
+    /// One agent step ends.
+    StepEnd {
+        #[serde(default)]
+        ts: Option<String>,
+    },
+    /// Request header snapshot: model / temperature / max_tokens / tools
+    /// fingerprint for the last model request. Metadata: not projected.
+    RequestHeader {
+        #[serde(default)]
+        ts: Option<String>,
+        model: String,
+        #[serde(default)]
+        temperature: Option<f32>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
+        #[serde(default)]
+        tools_fingerprint: Option<String>,
+    },
+    /// Injected request context (pinned workflow path, session binding,
+    /// goal, ...). Order-preserving key/value pairs. "注入即事件":
+    /// any session-external state entering a request is logged here.
+    RequestContext {
+        #[serde(default)]
+        ts: Option<String>,
+        values: Vec<(String, String)>,
     },
     /// An approval decision for a gate-rejected tool call. Audit-only:
     /// recorded in the log, but never projected back into model turns.
@@ -126,6 +173,12 @@ impl Event {
             Event::Assistant { .. } => "assistant",
             Event::ToolCall { .. } => "tool_call",
             Event::ToolResult { .. } => "tool_result",
+            Event::TurnStart { .. } => "turn_start",
+            Event::TurnEnd { .. } => "turn_end",
+            Event::StepStart { .. } => "step_start",
+            Event::StepEnd { .. } => "step_end",
+            Event::RequestHeader { .. } => "request_header",
+            Event::RequestContext { .. } => "request_context",
             Event::Approval { .. } => "approval",
             Event::Policy { .. } => "policy",
             Event::Hook { .. } => "hook",
@@ -140,6 +193,12 @@ impl Event {
             | Event::Assistant { ts, .. }
             | Event::ToolCall { ts, .. }
             | Event::ToolResult { ts, .. }
+            | Event::TurnStart { ts, .. }
+            | Event::TurnEnd { ts, .. }
+            | Event::StepStart { ts, .. }
+            | Event::StepEnd { ts, .. }
+            | Event::RequestHeader { ts, .. }
+            | Event::RequestContext { ts, .. }
             | Event::Approval { ts, .. }
             | Event::Policy { ts, .. }
             | Event::Hook { ts, .. } => ts.as_deref(),
@@ -168,15 +227,25 @@ impl Event {
                     flat_preview(output, 40)
                 )
             }
-            Event::Approval {
-                name, decision, ..
-            } => format!("approval: {name} → {decision}"),
+            Event::TurnStart { .. } => "turn_start".into(),
+            Event::TurnEnd { .. } => "turn_end".into(),
+            Event::StepStart { .. } => "step_start".into(),
+            Event::StepEnd { .. } => "step_end".into(),
+            Event::RequestHeader { model, .. } => {
+                format!("request_header: model={model}")
+            }
+            Event::RequestContext { values, .. } => {
+                let keys: Vec<&str> = values.iter().map(|(k, _)| k.as_str()).collect();
+                format!("request_context: {}", keys.join(","))
+            }
+            Event::Approval { name, decision, .. } => format!("approval: {name} → {decision}"),
             Event::Policy {
-                name, level, verdict, ..
+                name,
+                level,
+                verdict,
+                ..
             } => format!("policy: {name} [{level}] → {verdict}"),
-            Event::Hook {
-                name, outcome, ..
-            } => format!("hook: {name} {outcome}"),
+            Event::Hook { name, outcome, .. } => format!("hook: {name} {outcome}"),
         }
     }
 }
@@ -254,21 +323,52 @@ fn stamp_event(ev: &Event) -> Event {
             ts: Some(ts),
             text: text.clone(),
         },
-        Event::ToolCall { name, args, .. } => Event::ToolCall {
+        Event::ToolCall { id, name, args, .. } => Event::ToolCall {
             ts: Some(ts),
+            id: id.clone(),
             name: name.clone(),
             args: args.clone(),
         },
         Event::ToolResult {
-            name, ok, output, ..
+            id,
+            name,
+            ok,
+            output,
+            ..
         } => Event::ToolResult {
             ts: Some(ts),
+            id: id.clone(),
             name: name.clone(),
             ok: *ok,
             output: output.clone(),
         },
+        Event::TurnStart { .. } => Event::TurnStart { ts: Some(ts) },
+        Event::TurnEnd { .. } => Event::TurnEnd { ts: Some(ts) },
+        Event::StepStart { .. } => Event::StepStart { ts: Some(ts) },
+        Event::StepEnd { .. } => Event::StepEnd { ts: Some(ts) },
+        Event::RequestHeader {
+            model,
+            temperature,
+            max_tokens,
+            tools_fingerprint,
+            ..
+        } => Event::RequestHeader {
+            ts: Some(ts),
+            model: model.clone(),
+            temperature: *temperature,
+            max_tokens: *max_tokens,
+            tools_fingerprint: tools_fingerprint.clone(),
+        },
+        Event::RequestContext { values, .. } => Event::RequestContext {
+            ts: Some(ts),
+            values: values.clone(),
+        },
         Event::Approval {
-            name, args, decision, reason, ..
+            name,
+            args,
+            decision,
+            reason,
+            ..
         } => Event::Approval {
             ts: Some(ts),
             name: name.clone(),
@@ -277,7 +377,10 @@ fn stamp_event(ev: &Event) -> Event {
             reason: reason.clone(),
         },
         Event::Policy {
-            name, level, verdict, ..
+            name,
+            level,
+            verdict,
+            ..
         } => Event::Policy {
             ts: Some(ts),
             name: name.clone(),
@@ -285,7 +388,10 @@ fn stamp_event(ev: &Event) -> Event {
             verdict: verdict.clone(),
         },
         Event::Hook {
-            name, outcome, detail, ..
+            name,
+            outcome,
+            detail,
+            ..
         } => Event::Hook {
             ts: Some(ts),
             name: name.clone(),
@@ -360,6 +466,79 @@ pub fn events_to_turns(events: &[Event]) -> Vec<Turn> {
 /// Load a session's turns (empty if the session doesn't exist).
 pub fn load(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Turn>> {
     Ok(events_to_turns(&load_events(sessions_dir, id)?))
+}
+
+/// Full projection of a session's events into model-visible messages
+/// (Phase A: "Model-visible means logged").
+///
+/// - `User` → user message
+/// - `Assistant` → pending assistant text (flushed with its tool calls)
+/// - `ToolCall` → accumulated into the pending assistant message
+///   (consecutive calls merge into one `tool_calls` list)
+/// - `ToolResult` → flush the pending assistant message, then emit the
+///   tool message (paired by call id)
+/// - Structural (turn/step) and metadata (request/*) events are NOT
+///   projected — they exist for replay, audit, and invariant checks.
+///
+/// TODO(Phase A 接入): run_messages 请求构造切换到此视图后移除 allow(dead_code)。
+#[allow(dead_code)]
+pub fn events_to_messages(events: &[Event]) -> Vec<crate::llm::ChatMessage> {
+    use crate::llm::{ChatMessage, ToolCall};
+
+    let mut messages = Vec::new();
+    let mut pending_text: Option<String> = None;
+    let mut pending_calls: Vec<ToolCall> = Vec::new();
+
+    let flush =
+        |messages: &mut Vec<ChatMessage>, text: &mut Option<String>, calls: &mut Vec<ToolCall>| {
+            if text.is_none() && calls.is_empty() {
+                return;
+            }
+            let content = text.take().unwrap_or_default();
+            if calls.is_empty() {
+                messages.push(ChatMessage::assistant(content));
+            } else {
+                messages.push(ChatMessage::assistant_with_tools(
+                    content,
+                    std::mem::take(calls),
+                ));
+            }
+        };
+
+    for ev in events {
+        match ev {
+            Event::User { text, .. } => {
+                // A new user turn: flush any dangling assistant state first.
+                flush(&mut messages, &mut pending_text, &mut pending_calls);
+                messages.push(ChatMessage::user(text.clone()));
+            }
+            Event::Assistant { text, .. } => {
+                // Consecutive assistant texts merge; a new user message or
+                // tool result flushes the accumulated assistant message.
+                pending_text = Some(match pending_text.take() {
+                    Some(prev) => format!("{prev}\n{text}"),
+                    None => text.clone(),
+                });
+            }
+            Event::ToolCall { id, name, args, .. } => {
+                let arguments: serde_json::Value =
+                    serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+                pending_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments,
+                });
+            }
+            Event::ToolResult { id, output, .. } => {
+                flush(&mut messages, &mut pending_text, &mut pending_calls);
+                messages.push(ChatMessage::tool_result(output.clone(), id.clone()));
+            }
+            // Structural and metadata events never reach the model.
+            _ => {}
+        }
+    }
+    flush(&mut messages, &mut pending_text, &mut pending_calls);
+    messages
 }
 
 /// List session ids (newest first) for `--resume` discovery.
@@ -591,6 +770,206 @@ mod tests {
     }
 
     #[test]
+    fn event_tool_with_id_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-toolid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::ToolCall {
+                ts: None,
+                id: "call_1".into(),
+                name: "read_file".into(),
+                args: r#"{"path":"/tmp/a.txt"}"#.into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::ToolResult {
+                ts: None,
+                id: "call_1".into(),
+                name: "read_file".into(),
+                ok: true,
+                output: "content-a".into(),
+            },
+        )
+        .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Event::ToolCall { id, name, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &events[1] {
+            Event::ToolResult { id, ok, output, .. } => {
+                assert_eq!(id, "call_1");
+                assert!(*ok);
+                assert_eq!(output, "content-a");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_legacy_tool_line_without_id_parses() {
+        // Phase A 之前的旧 JSONL 行没有 `id` 字段 —— serde default 必须兼容。
+        let line =
+            r#"{"e":"tool_call","name":"read_file","args":"{}","ts":"2026-08-01T00:00:00Z"}"#;
+        let ev: Event = serde_json::from_str(line).unwrap();
+        match ev {
+            Event::ToolCall { id, name, .. } => {
+                assert_eq!(id, ""); // 旧行 → 空 id
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_to_messages_projects_full_tool_history() {
+        use crate::llm::Role;
+
+        let events = vec![
+            Event::User {
+                ts: None,
+                text: "读文件".into(),
+            },
+            Event::TurnStart { ts: None },
+            Event::Assistant {
+                ts: None,
+                text: "我来读".into(),
+            },
+            Event::ToolCall {
+                ts: None,
+                id: "call_1".into(),
+                name: "read_file".into(),
+                args: r#"{"path":"/tmp/a.txt"}"#.into(),
+            },
+            Event::ToolCall {
+                ts: None,
+                id: "call_2".into(),
+                name: "read_file".into(),
+                args: r#"{"path":"/tmp/b.txt"}"#.into(),
+            },
+            Event::ToolResult {
+                ts: None,
+                id: "call_1".into(),
+                name: "read_file".into(),
+                ok: true,
+                output: "content-a".into(),
+            },
+            Event::ToolResult {
+                ts: None,
+                id: "call_2".into(),
+                name: "read_file".into(),
+                ok: true,
+                output: "content-b".into(),
+            },
+            Event::TurnEnd { ts: None },
+        ];
+
+        let messages = events_to_messages(&events);
+
+        // user → assistant(文本 + 2 个 tool_calls 合并) → tool(call_1) → tool(call_2)
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].content, "读文件");
+
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "我来读");
+        let calls = messages[1].tool_calls.as_ref().expect("tool_calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[0].name, "read_file");
+
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[2].content, "content-a");
+
+        assert_eq!(messages[3].role, Role::Tool);
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(messages[3].content, "content-b");
+    }
+
+    #[test]
+    fn events_to_messages_ignores_structural_and_metadata() {
+        use crate::llm::Role;
+
+        let events = vec![
+            Event::TurnStart { ts: None },
+            Event::StepStart { ts: None },
+            Event::User {
+                ts: None,
+                text: "hi".into(),
+            },
+            Event::RequestHeader {
+                ts: None,
+                model: "deepseek-v4-flash".into(),
+                temperature: None,
+                max_tokens: None,
+                tools_fingerprint: None,
+            },
+            Event::RequestContext {
+                ts: None,
+                values: vec![("pinnedWorkflowPath".into(), "/wf/a.npp".into())],
+            },
+            Event::StepEnd { ts: None },
+            Event::TurnEnd { ts: None },
+        ];
+
+        let messages = events_to_messages(&events);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].content, "hi");
+    }
+
+    #[test]
+    fn request_context_events_preserve_order() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-ctx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::RequestContext {
+                ts: None,
+                values: vec![
+                    ("pinnedWorkflowPath".into(), "/wf/a.npp".into()),
+                    ("mode".into(), "workflow".into()),
+                ],
+            },
+        )
+        .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        match &events[0] {
+            Event::RequestContext { values, .. } => {
+                assert_eq!(values.len(), 2);
+                assert_eq!(values[0], ("pinnedWorkflowPath".into(), "/wf/a.npp".into()));
+                assert_eq!(values[1], ("mode".into(), "workflow".into()));
+            }
+            other => panic!("expected RequestContext, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn append_stamps_missing_timestamp() {
         let dir = std::env::temp_dir().join(format!("sigil-session-stamp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -661,6 +1040,7 @@ mod tests {
             &id,
             &Event::ToolCall {
                 ts: None,
+                id: "call_1".into(),
                 name: "bash".into(),
                 args: "ls -la".into(),
             },
@@ -671,6 +1051,7 @@ mod tests {
             &id,
             &Event::ToolResult {
                 ts: None,
+                id: "call_1".into(),
                 name: "bash".into(),
                 ok: true,
                 output: "total 8".into(),
@@ -751,6 +1132,7 @@ mod tests {
     fn event_summary_and_kind() {
         let ev = Event::ToolCall {
             ts: None,
+            id: "call_1".into(),
             name: "create_lua_tool".into(),
             args: "{\"name\":\"x\"}".into(),
         };
@@ -1106,7 +1488,10 @@ mod tests {
             reason: None,
         };
         assert_eq!(a.summary(), "approval: bash → approved");
-        assert!(!a.summary().contains("secret"), "args not leaked to summary");
+        assert!(
+            !a.summary().contains("secret"),
+            "args not leaked to summary"
+        );
 
         let p = Event::Policy {
             ts: None,
@@ -1123,6 +1508,9 @@ mod tests {
             detail: Some("bad lua".into()),
         };
         assert_eq!(h.summary(), "hook: on_tool_result error");
-        assert!(!h.summary().contains("bad lua"), "detail not leaked to summary");
+        assert!(
+            !h.summary().contains("bad lua"),
+            "detail not leaked to summary"
+        );
     }
 }

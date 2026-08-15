@@ -694,9 +694,7 @@ pub async fn run_messages(
                 };
                 eprintln!(
                     "[cache] {}/{} prompt tokens cached ({:.0}%)",
-                    u.prompt_cache_hit_tokens,
-                    u.prompt_tokens,
-                    pct
+                    u.prompt_cache_hit_tokens, u.prompt_tokens, pct
                 );
             }
         }
@@ -757,6 +755,7 @@ pub async fn run_messages(
                 for call in &complete.tool_calls {
                     sink(crate::session::Event::ToolCall {
                         ts: None,
+                        id: call.id.clone(),
                         name: call.name.clone(),
                         args: call.arguments.to_string(),
                     });
@@ -865,6 +864,7 @@ pub async fn run_messages(
                     let ok = blocked.is_none() && !msg.starts_with("error:");
                     sink(crate::session::Event::ToolResult {
                         ts: None,
+                        id: plan.call.id.clone(),
                         name: plan.call.name.clone(),
                         ok,
                         output: msg.clone(),

@@ -147,8 +147,7 @@ impl std::ops::Add for TokenUsage {
         TokenUsage {
             prompt_tokens: self.prompt_tokens + rhs.prompt_tokens,
             completion_tokens: self.completion_tokens + rhs.completion_tokens,
-            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens
-                + rhs.prompt_cache_hit_tokens,
+            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens + rhs.prompt_cache_hit_tokens,
         }
     }
 }

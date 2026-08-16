@@ -200,20 +200,58 @@ pub fn estimate_message_tokens(m: &ChatMessage) -> usize {
 /// compaction summary can tell the model which files it touched — the
 /// one thing a naive excerpt fold loses (prime-agent tracks the same
 /// via `CompactionEntry.details`).
+///
+/// Cross-compaction accumulation: system messages that are themselves
+/// previous compaction summaries (they carry the
+/// `[earlier conversation compressed]` header and `Files read:` /
+/// `Files modified:` lines) are also parsed, so a second compaction
+/// merges the file history preserved by the first instead of dropping
+/// it (Pi's `compaction.details` accumulate the same way).
 fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
     let mut read: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
+    let mut push_read = |p: String| {
+        if !read.contains(&p) {
+            read.push(p);
+        }
+    };
+    let mut push_modified = |p: String| {
+        if !modified.contains(&p) {
+            modified.push(p);
+        }
+    };
     for m in messages {
-        let Some(calls) = &m.tool_calls else { continue };
-        for c in calls {
-            let Some(path) = c.arguments.get("path").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let path = path.to_string();
-            match c.name.as_str() {
-                "read_file" if !read.contains(&path) => read.push(path),
-                "write_file" if !modified.contains(&path) => modified.push(path),
-                _ => {}
+        // 1) Tool calls carry the authoritative paths.
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                let Some(path) = c.arguments.get("path").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let path = path.to_string();
+                match c.name.as_str() {
+                    "read_file" => push_read(path),
+                    "write_file" => push_modified(path),
+                    _ => {}
+                }
+            }
+        }
+        // 2) Previous compaction summaries already list files — parse
+        //    those lines so the history survives repeated compactions.
+        if m.role == Role::System && m.content.starts_with("[earlier conversation compressed]") {
+            for line in m.content.lines() {
+                if let Some(rest) = line.strip_prefix("Files read: ") {
+                    for p in rest.split(',').map(str::trim) {
+                        if !p.is_empty() {
+                            push_read(p.to_string());
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("Files modified: ") {
+                    for p in rest.split(',').map(str::trim) {
+                        if !p.is_empty() {
+                            push_modified(p.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -2260,6 +2298,72 @@ mod compact_tests {
             summary.content.contains("Files modified: src/config.rs"),
             "missing modified file in summary: {}",
             summary.content
+        );
+    }
+
+    #[test]
+    fn compact_file_history_survives_second_compaction() {
+        // First compaction folds turns with read_file/write_file calls.
+        let m1 = vec![
+            ChatMessage::system("SYS"),
+            ChatMessage::user("task"),
+            ChatMessage::assistant_with_tools(
+                "read then write",
+                vec![
+                    crate::llm::provider::ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "src/main.rs"}),
+                    },
+                    crate::llm::provider::ToolCall {
+                        id: "c2".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({"path": "src/config.rs"}),
+                    },
+                ],
+            ),
+            ChatMessage::tool_result("ok", "c1"),
+            ChatMessage::tool_result("ok", "c2"),
+            ChatMessage::user("newest-request"),
+        ];
+        let c1 = compact_messages_with_budget(&m1, 0, 5, None);
+        let summary1 = c1
+            .iter()
+            .find(|m| m.role == Role::System && m.content.contains("compressed"))
+            .expect("first summary present");
+        assert!(summary1.content.contains("Files read: src/main.rs"));
+
+        // Second compaction: the first summary is now a system message in
+        // the transcript, plus a new turn touching a NEW file. The new
+        // summary must accumulate BOTH histories — the old files and the
+        // new one (Pi compaction.details accumulates the same way).
+        let mut m2 = c1;
+        m2.push(ChatMessage::user("new task"));
+        m2.push(ChatMessage::assistant_with_tools(
+            "wrote another",
+            vec![crate::llm::provider::ToolCall {
+                id: "c3".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+        ));
+        m2.push(ChatMessage::tool_result("ok", "c3"));
+        m2.push(ChatMessage::user("second-newest"));
+
+        let c2 = compact_messages_with_budget(&m2, 0, 5, None);
+        let summary2 = c2
+            .iter()
+            .find(|m| m.role == Role::System && m.content.contains("compressed"))
+            .expect("second summary present");
+        assert!(
+            summary2.content.contains("Files read: src/main.rs"),
+            "first-compaction read file lost: {}",
+            summary2.content
+        );
+        assert!(
+            summary2.content.contains("src/config.rs") && summary2.content.contains("src/lib.rs"),
+            "modified files not accumulated: {}",
+            summary2.content
         );
     }
 

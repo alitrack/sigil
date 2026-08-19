@@ -86,7 +86,7 @@ Key contracts:
 - `AcpClient` holds the spawned child for the session lifetime —
   `kill_on_drop` + early drop kills the child mid-protocol (BrokenPipe).
 
-## State Locations on this machine (probed on disk, 2026-08)
+## State Locations on this machine (probed on disk; re-probed 2026-08-26)
 
 sigil on this box is the **Windows** build (repo `D:\wsl2\sigil`,
 `target/x86_64-pc-windows-msvc`, `build-win.ps1` / `test-win.ps1`).
@@ -104,11 +104,19 @@ sessions/hooks/agents follow `dirs::home_dir()`):
 
 On Linux the same code resolves harness/tools/memory/config to
 `~/.config/sigil/` (NOT `~/.sigil/harness`). WSL is installed on this
-box (WSL 2.7.11) but no distro is currently accessible from this
-account (LxssManager stopped, no LRM store) — the WSL side is not the
-active sigil state location. A pinned copy of this fact also exists as
-the global skill `harness-locations` (drop-in file kept in this repo at
-`harness-skill/harness-locations.md`) for sigil's own sessions.
+box (WSL 2.7.11) but no distro is accessible from this account
+(`wsl -l -v` → E_ACCESSDENIED) — the WSL side is not the active sigil
+state location. This fact is pinned for sigil's own sessions as the
+global skill `harness-locations`: source of truth is
+`harness-skill/harness-locations.md` in this repo; the live installed
+copy sigil loads is
+`%APPDATA%\sigil\harness\skills\harness-locations.md`. The 2026-08-26
+re-probe found that installed copy **still missing** (global `skills/`
+empty; the installed `system_prompt.md` is the 380 B built-in default,
+i.e. not customized). Agent sandboxes cannot write outside the
+workspace (escalation fails closed without an approval channel), so
+(re)install from a full-access shell:
+`Copy-Item harness-skill\harness-locations.md %APPDATA%\sigil\harness\skills\`
 
 ## Key Patterns
 

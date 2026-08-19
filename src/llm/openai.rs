@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use futures_util::Stream;
 use serde_json::{Value, json};
+use std::pin::Pin;
 
 use super::provider::{
     ChatChunk, ChatComplete, ChatMessage, ChatRequest, ChatStream, LlmProvider, TokenUsage,
@@ -39,12 +40,10 @@ impl std::fmt::Display for PostError {
 pub struct OpenAiProvider {
     /// Endpoint chain: index 0 is primary, the rest are fallbacks tried
     /// in order on transient failures (network error / 5xx / 429).
-    endpoints: Vec<Endpoint>,
-}
-
-#[derive(Debug, Clone)]
-struct Endpoint {
-    config: OpenAiConfig,
+    endpoints: Vec<OpenAiConfig>,
+    /// One shared client for the whole chain: connection pools are
+    /// reused across hosts, and N per-endpoint clients would double
+    /// connection pools and fds.
     client: reqwest::Client,
 }
 
@@ -56,17 +55,16 @@ impl OpenAiProvider {
         config: OpenAiConfig,
         fallbacks: Vec<OpenAiConfig>,
     ) -> anyhow::Result<Self> {
-        let mut endpoints = vec![Endpoint {
-            config: config.clone(),
-            client: Self::build_client()?,
-        }];
-        for fb in fallbacks {
-            endpoints.push(Endpoint {
-                config: fb,
-                client: Self::build_client()?,
-            });
+        validate_base_url(&config.base_url)?;
+        for fb in &fallbacks {
+            validate_base_url(&fb.base_url)?;
         }
-        Ok(Self { endpoints })
+        let mut endpoints = vec![config];
+        endpoints.extend(fallbacks);
+        Ok(Self {
+            endpoints,
+            client: Self::build_client()?,
+        })
     }
 
     fn build_client() -> anyhow::Result<reqwest::Client> {
@@ -75,6 +73,9 @@ impl OpenAiProvider {
             // endpoint is busy (queued behind other requests) or the model
             // streams a long answer. 600s was too tight for 48K-token prompts.
             .timeout(std::time::Duration::from_secs(3600))
+            // A stuck endpoint must fail fast on connect, not hang for the
+            // full 3600s total timeout.
+            .connect_timeout(std::time::Duration::from_secs(10))
             // Never route requests through a proxy from the
             // environment: sigil's endpoints are local or direct, and
             // http_proxy would hijack loopback traffic (a proxy
@@ -85,23 +86,28 @@ impl OpenAiProvider {
     }
 
     /// Try the endpoint chain: primary, then each fallback on transient
-    /// failure with backoff. Fatal (4xx) errors abort immediately.
+    /// failure with exponential backoff. Fatal (4xx, except 429) errors
+    /// abort immediately.
     async fn post_with_fallback(&self, req: &ChatRequest) -> anyhow::Result<reqwest::Response> {
         let mut last: Option<String> = None;
-        for (i, ep) in self.endpoints.iter().enumerate() {
+        for (i, config) in self.endpoints.iter().enumerate() {
             if i > 0 {
-                // Small backoff before a fallback attempt.
-                tokio::time::sleep(std::time::Duration::from_millis(300 * i as u64)).await;
+                // Exponential backoff with deterministic jitter before a
+                // fallback attempt: 200/400/800/1600/3200ms + jitter. The
+                // fixed 300ms*i scheme re-stormed busy endpoints.
+                let exp = 200u64.saturating_mul(1u64 << (i - 1).min(4));
+                let jitter = (i as u64 * 37) % 150;
+                tokio::time::sleep(std::time::Duration::from_millis(exp + jitter)).await;
                 eprintln!(
                     "[sigil] primary endpoint failed — trying fallback {}",
-                    ep.config.base_url
+                    config.base_url
                 );
             }
-            match ep.post(req).await {
+            match self.post(config, req).await {
                 Ok(resp) => return Ok(resp),
                 Err(PostError::Fatal(e)) => return Err(anyhow::anyhow!(e)),
                 Err(PostError::Transient(e)) => {
-                    eprintln!("[sigil] endpoint {} failed: {e}", ep.config.base_url);
+                    eprintln!("[sigil] endpoint {} failed: {e}", config.base_url);
                     last = Some(e);
                 }
             }
@@ -112,19 +118,18 @@ impl OpenAiProvider {
             last.unwrap_or_default()
         ))
     }
-}
 
-impl Endpoint {
-    async fn post(&self, req: &ChatRequest) -> Result<reqwest::Response, PostError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+    async fn post(
+        &self,
+        config: &OpenAiConfig,
+        req: &ChatRequest,
+    ) -> Result<reqwest::Response, PostError> {
+        let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = build_body(req);
         let resp = match self
             .client
             .post(&url)
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(&config.api_key)
             .json(&body)
             .send()
             .await
@@ -135,19 +140,57 @@ impl Endpoint {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            // Bound the error body: some gateways echo the entire request
+            // (tens of KB) back on 4xx/5xx, buffered per failed attempt ×
+            // per fallback.
+            let text = bounded_error_text(resp).await;
+            if status.as_u16() == 429 {
+                // Rate limit: the endpoint is overloaded, not the request
+                // malformed — safe to try a fallback.
+                return Err(PostError::Transient(format!(
+                    "provider error {status}: {text}"
+                )));
+            }
             if status.is_client_error() {
                 // 4xx: the request is malformed (bad schema, auth,
                 // unknown model) — retrying another endpoint won't help.
                 return Err(PostError::Fatal(format!("provider error {status}: {text}")));
             }
-            // 5xx / 429: server-side trouble — safe to try a fallback.
+            // 5xx: server-side trouble — safe to try a fallback.
             return Err(PostError::Transient(format!(
                 "provider error {status}: {text}"
             )));
         }
         Ok(resp)
     }
+}
+
+/// Read a response body up to 16 KiB — enough for a diagnostic message,
+/// not enough to buffer a full request echo.
+async fn bounded_error_text(resp: reqwest::Response) -> String {
+    const CAP: usize = 16 * 1024;
+    match resp.bytes().await {
+        Ok(bytes) => {
+            let head = &bytes[..bytes.len().min(CAP)];
+            String::from_utf8_lossy(head).to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Reject malformed base URLs at construction time so a typo fails fast
+/// instead of walking the whole fallback chain and reporting a confusing
+/// "all endpoints failed" error.
+fn validate_base_url(u: &str) -> anyhow::Result<()> {
+    let parsed =
+        reqwest::Url::parse(u).map_err(|e| anyhow::anyhow!("invalid base_url {u:?}: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        anyhow::bail!("base_url must be http(s), got {:?}: {u:?}", parsed.scheme());
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("base_url must include a host: {u:?}");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -158,8 +201,15 @@ impl LlmProvider for OpenAiProvider {
 
     async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
         let resp = self.post_with_fallback(&req).await?;
-        let bytes = resp.bytes().await?.to_vec();
-        Ok(Box::new(parse_stream(bytes)))
+        // Incremental body streaming: `resp.bytes()` buffered the whole
+        // response before emitting anything — first-token latency equaled
+        // the full generation time, and a mid-stream disconnect discarded
+        // every token generated so far.
+        let body = resp.bytes_stream();
+        // Per-chunk idle timeout: a stalled endpoint must not pin the
+        // caller for the whole 3600s total timeout after emitting one byte.
+        let idle = std::time::Duration::from_secs(120);
+        Ok(Box::new(sse_line_stream(with_idle_timeout(body, idle))))
     }
 
     async fn chat_complete(&self, req: ChatRequest) -> anyhow::Result<ChatComplete> {
@@ -168,8 +218,21 @@ impl LlmProvider for OpenAiProvider {
         let resp = self.post_with_fallback(&req).await?;
         let v: Value = resp.json().await?;
 
-        let text = v["choices"][0]["message"]["content"]
-            .as_str()
+        // A 200 with no choices/message is a provider malfunction, not an
+        // empty answer — surface it instead of silently returning "".
+        let msg = v["choices"][0]["message"].as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider returned 200 without choices[0].message: {}",
+                serde_json::to_string(&v)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            )
+        })?;
+        let text = msg
+            .get("content")
+            .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
         let tool_calls = parse_tool_calls(&v);
@@ -183,9 +246,36 @@ impl LlmProvider for OpenAiProvider {
 
 /// Build the OpenAI chat-completions request body.
 fn build_body(req: &ChatRequest) -> Value {
+    // Normalize the message list into JSON values up front.
+    let mut msgs: Vec<Value> = req.messages.iter().map(message_to_json).collect();
+
+    // Some OpenAI-compatible backends (SGLang, NInfer, vLLM with strict
+    // chat templates) reject a request that contains NO user message
+    // ("No user query found in messages"). That shape is reachable after
+    // history compression trims the original user prompt, leaving
+    // [system, system(summary), assistant(tool_calls), tool, ...]. Both
+    // local gateways 400 on it, so normalize here instead of per-backend:
+    // synthesize a continuation user turn right after the leading
+    // system messages. It is invisible to the model's task state (the
+    // real prompt is in the compressed summary) and keeps every
+    // backend happy.
+    let has_user = msgs
+        .iter()
+        .any(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+    if !has_user {
+        let pos = msgs
+            .iter()
+            .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+            .count();
+        msgs.insert(
+            pos,
+            json!({ "role": "user", "content": "(continuing — proceed with the current task)" }),
+        );
+    }
+
     let mut body = json!({
         "model": req.model,
-        "messages": req.messages.iter().map(message_to_json).collect::<Vec<_>>(),
+        "messages": msgs,
         "stream": req.stream,
     });
     if !req.tools.is_empty() {
@@ -263,8 +353,11 @@ pub fn parse_usage(v: &Value) -> Option<TokenUsage> {
     })
 }
 
-/// Chunk stream parser. Handles both plain SSE lines and wrapped
-/// `data: {...}` frames. Robust to trailing whitespace and `[DONE]`.
+/// Chunk stream parser (whole-buffer variant, used by tests). Handles
+/// both plain SSE lines and wrapped `data: {...}` frames. Robust to
+/// trailing whitespace and `[DONE]`. The live path uses
+/// `sse_line_stream` over the incremental body stream instead.
+#[cfg(test)]
 pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<ChatChunk>> {
     let text = String::from_utf8_lossy(&bytes).to_string();
     // Own the text inside the closure; iterate in place.
@@ -273,54 +366,202 @@ pub(crate) fn parse_stream(bytes: Vec<u8>) -> impl Stream<Item = anyhow::Result<
             .map(str::to_string)
             .collect::<Vec<String>>()
             .into_iter()
-            .filter_map(move |line| {
-                let line = line.trim();
-                if line.is_empty() {
-                    return None;
-                }
-                let payload = line.strip_prefix("data:").unwrap_or(line).trim();
-                if payload == "[DONE]" {
-                    return Some(Ok(ChatChunk {
-                        delta: String::new(),
-                        thinking: false,
-                        done: true,
-                        tool_calls_requested: false,
-                        usage: None,
-                    }));
-                }
-                let parsed: Result<Value, _> = serde_json::from_str(payload);
-                match parsed {
-                    Ok(v) => {
-                        // Some providers (incl. the sigil local test
-                        // endpoint) attach `usage` to the final chunk.
-                        let usage = parse_usage(&v);
-                        let delta = v["choices"][0]["delta"]["content"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        let reasoning = v["choices"][0]["delta"]["reasoning_content"]
-                            .as_str()
-                            .or_else(|| v["choices"][0]["delta"]["reasoning"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let finish = v["choices"][0]["finish_reason"].as_str();
-                        let tool_calls_requested = finish == Some("tool_calls");
-                        Some(Ok(ChatChunk {
-                            delta,
-                            thinking: !reasoning.is_empty(),
-                            done: finish == Some("stop") || tool_calls_requested,
-                            tool_calls_requested,
-                            usage,
-                        }))
-                    }
-                    Err(e) => Some(Err(anyhow::anyhow!("bad chunk: {e}"))),
-                }
-            }),
+            .filter_map(move |line| parse_sse_line(&line)),
     )
 }
 
+/// Wrap a byte stream so each item must arrive within `idle`; a stall
+/// ends the stream with an error instead of hanging the caller.
+///
+/// Hand-rolled `poll_next`: `stream::unfold` needs its closure future to
+/// be `Unpin`, which async blocks are not (futures-util 0.3.33).
+struct IdleTimeout<S> {
+    inner: S,
+    idle: std::time::Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+fn with_idle_timeout<S, T, E>(
+    stream: S,
+    idle: std::time::Duration,
+) -> impl Stream<Item = anyhow::Result<T>>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    IdleTimeout {
+        inner: stream,
+        idle,
+        sleep: None,
+    }
+}
+
+impl<S, T, E> Stream for IdleTimeout<S>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Item = anyhow::Result<T>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        // Inner data takes priority: poll it first, and only consult
+        // the idle timer when the inner stream is silent. Polling the
+        // timer first would swallow a ready item behind a not-yet-fired
+        // sleep and stall the stream until the timer expires.
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                this.sleep = None;
+                Poll::Ready(Some(Ok(item)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.sleep = None;
+                Poll::Ready(Some(Err(anyhow::anyhow!("{e}"))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if this.sleep.is_none() {
+                    this.sleep = Some(Box::pin(tokio::time::sleep(this.idle)));
+                }
+                match this.sleep.as_mut().expect("armed").as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.sleep = None;
+                        Poll::Ready(Some(Err(anyhow::anyhow!(
+                            "stream idle timeout after {:?}",
+                            this.idle
+                        ))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// Incremental SSE parser: accumulates bytes into lines, feeds complete
+/// lines to `parse_sse_line`, and drops a trailing partial line at EOF
+/// (a torn frame left behind by a mid-stream disconnect).
+struct SseLines<S> {
+    inner: S,
+    pending: String,
+    queued: std::collections::VecDeque<anyhow::Result<ChatChunk>>,
+}
+
+fn sse_line_stream<S, T>(stream: S) -> impl Stream<Item = anyhow::Result<ChatChunk>>
+where
+    S: Stream<Item = anyhow::Result<T>> + Unpin,
+    T: AsRef<[u8]>,
+{
+    SseLines {
+        inner: stream,
+        pending: String::new(),
+        queued: std::collections::VecDeque::new(),
+    }
+}
+
+impl<S, T> Stream for SseLines<S>
+where
+    S: Stream<Item = anyhow::Result<T>> + Unpin,
+    T: AsRef<[u8]>,
+{
+    type Item = anyhow::Result<ChatChunk>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if let Some(item) = this.queued.pop_front() {
+            return Poll::Ready(Some(item));
+        }
+        loop {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.pending
+                        .push_str(&String::from_utf8_lossy(chunk.as_ref()));
+                    let mut lines: Vec<String> =
+                        this.pending.split('\n').map(str::to_string).collect();
+                    // The last element is the unfinished line — keep it
+                    // pending for the next chunk.
+                    this.pending = lines.pop().unwrap_or_default();
+                    this.queued
+                        .extend(lines.into_iter().filter_map(|l| parse_sse_line(&l)));
+                    if let Some(item) = this.queued.pop_front() {
+                        return Poll::Ready(Some(item));
+                    }
+                    // Chunk contained no complete line yet — keep polling.
+                    continue;
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Parse one SSE line into an optional chunk. Non-`data:` lines
+/// (keep-alive comments like `: ping`, `event:`/`id:` fields, blank
+/// lines) are skipped; a `data:` line whose JSON fails to parse is
+/// skipped too — a single malformed frame must not kill the stream.
+///
+/// NOTE: `delta.tool_calls` is intentionally NOT accumulated here.
+/// sigil's tool-call flow detects `finish_reason == "tool_calls"` on the
+/// stream and replays the request non-streaming (`chat_complete`) to get
+/// the complete call — streaming deltas are unreliable for that, and the
+/// replay is what produces the real `ToolCall`s.
+fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let payload = line.strip_prefix("data:")?.trim();
+    if payload == "[DONE]" {
+        return Some(Ok(ChatChunk {
+            delta: String::new(),
+            thinking: false,
+            done: true,
+            tool_calls_requested: false,
+            usage: None,
+        }));
+    }
+    let parsed: Result<Value, _> = serde_json::from_str(payload);
+    match parsed {
+        Ok(v) => {
+            // Some providers (incl. the sigil local test
+            // endpoint) attach `usage` to the final chunk.
+            let usage = parse_usage(&v);
+            let delta = v["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let reasoning = v["choices"][0]["delta"]["reasoning_content"]
+                .as_str()
+                .or_else(|| v["choices"][0]["delta"]["reasoning"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let finish = v["choices"][0]["finish_reason"].as_str();
+            let tool_calls_requested = finish == Some("tool_calls");
+            Some(Ok(ChatChunk {
+                delta,
+                thinking: !reasoning.is_empty(),
+                done: finish == Some("stop") || tool_calls_requested,
+                tool_calls_requested,
+                usage,
+            }))
+        }
+        // Malformed frame: skip it rather than killing the whole stream.
+        // A torn final frame after a disconnect is common and harmless.
+        Err(_) => None,
+    }
+}
+
 /// Parse an OpenAI function-calling response into tool calls.
-#[allow(dead_code)]
 pub fn parse_tool_calls(v: &Value) -> Vec<ToolCall> {
     let mut out = Vec::new();
     if let Some(calls) = v["choices"][0]["message"]["tool_calls"].as_array() {
@@ -357,9 +598,36 @@ mod tests {
                     Ok(x) => x,
                     Err(_) => break,
                 };
-                // Drain the request headers, then reply.
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
+                // Drain the full request (headers + Content-Length body)
+                // before replying. Reading only one 4 KiB chunk would
+                // drop the tail of large request bodies and could cause a
+                // spurious reset on the client side.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    match sock.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(he) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers =
+                                    String::from_utf8_lossy(&buf[..he]).to_ascii_lowercase();
+                                let cl: usize = headers
+                                    .lines()
+                                    .find_map(|l| {
+                                        l.trim()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse().ok())
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= he + 4 + cl {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let resp = format!(
                     "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{}",
                     body.len(),
@@ -505,5 +773,168 @@ mod tests {
         let u = with_usage.usage.expect("final chunk carries usage");
         assert_eq!(u.prompt_tokens, 7);
         assert_eq!(u.completion_tokens, 3);
+    }
+
+    #[test]
+    fn build_body_synthesizes_user_turn_when_history_has_none() {
+        // Regression: strict OpenAI-compatible backends (SGLang, NInfer)
+        // 400 with "No user query found in messages" when history
+        // compression trims the original user prompt, leaving
+        // [system, system(summary), assistant(tool_calls), tool, ...].
+        let req = ChatRequest {
+            model: "test".into(),
+            messages: vec![
+                ChatMessage::system("sys"),
+                ChatMessage::system("[earlier conversation compressed]"),
+                ChatMessage::assistant_with_tools("", vec![]),
+                ChatMessage::tool_result("res", "c1"),
+            ],
+            tools: vec![],
+            stream: false,
+            temperature: None,
+        };
+        let body = build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert!(
+            roles.contains(&"user"),
+            "no-user history must be normalized to carry a user turn, got {roles:?}"
+        );
+        // The synthesized turn goes in after the leading system block,
+        // before the assistant tool-call turn.
+        let first_user = roles.iter().position(|r| *r == "user").unwrap();
+        let first_assistant = roles.iter().position(|r| *r == "assistant").unwrap();
+        assert!(first_user < first_assistant);
+    }
+
+    #[test]
+    fn build_body_leaves_user_messages_untouched() {
+        let req = ChatRequest {
+            model: "test".into(),
+            messages: vec![ChatMessage::system("sys"), ChatMessage::user("do it")],
+            tools: vec![],
+            stream: false,
+            temperature: None,
+        };
+        let body = build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "normal history must not be modified");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "do it");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_does_not_swallow_ready_items() {
+        // Regression: the idle timer was polled BEFORE the inner stream,
+        // so a ready item sitting behind a not-yet-fired sleep was never
+        // delivered — the stream stalled until the timer fired (120s).
+        // Inner data must always win over the timer.
+        use std::task::Poll;
+        let mut state = 0u8;
+        let slow = futures_util::stream::poll_fn(move |cx| match state {
+            0 => {
+                state = 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            1 => {
+                state = 2;
+                Poll::Ready(Some(Ok::<Vec<u8>, String>(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec(),
+                )))
+            }
+            _ => Poll::Ready(None),
+        });
+        let stream = sse_line_stream(with_idle_timeout(slow, std::time::Duration::from_secs(5)));
+        let chunks: Vec<anyhow::Result<ChatChunk>> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(
+            chunks.len(),
+            1,
+            "pending-then-ready must not stall on the idle timer"
+        );
+        assert_eq!(chunks[0].as_ref().unwrap().delta, "hi");
+    }
+
+    #[tokio::test]
+    async fn falls_back_on_rate_limit_429() {
+        // 429 is transient (the endpoint is overloaded, not the request
+        // malformed): the fallback chain must be tried. Regression: 429
+        // was classified as Fatal via is_client_error(), killing the
+        // whole chain.
+        let p429 = fake_endpoint(429, "rate limited");
+        let ok_body = r#"{"choices":[{"message":{"content":"recovered-from-429"}}]}"#;
+        let ok_port = fake_endpoint(200, ok_body);
+        let provider = OpenAiProvider::with_fallbacks(cfg(p429), vec![cfg(ok_port)]).unwrap();
+        let complete = provider.chat_complete(chat_request()).await.unwrap();
+        assert_eq!(complete.text, "recovered-from-429");
+    }
+
+    #[test]
+    fn sse_tolerates_keepalive_comments_and_bad_frames() {
+        // Real providers emit `: ping` keep-alive comments and, on a
+        // disconnect, torn frames. None of them may kill the stream.
+        let sse = concat!(
+            ": ping\n",
+            "event: message\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "\n",
+            "data: {not valid json\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"torn\"}}\n" // torn final frame
+        );
+        let chunks: Vec<ChatChunk> = futures_util::StreamExt::collect::<
+            Vec<anyhow::Result<ChatChunk>>,
+        >(parse_stream(sse.as_bytes().to_vec()))
+        .now_or_never()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.expect("no chunk may be an error"))
+        .collect();
+        assert_eq!(
+            chunks.len(),
+            3,
+            "content + stop + [DONE], comments/bad frames skipped"
+        );
+        assert_eq!(chunks[0].delta, "hi");
+        assert!(chunks[1].done);
+        assert!(chunks[2].done);
+    }
+
+    #[test]
+    fn with_fallbacks_rejects_malformed_base_url() {
+        // A typo'd base_url must fail at construction, not walk the whole
+        // fallback chain and report a confusing "all endpoints failed".
+        assert!(
+            OpenAiProvider::with_fallbacks(
+                OpenAiConfig {
+                    base_url: "not-a-url".into(),
+                    api_key: "x".into(),
+                },
+                vec![],
+            )
+            .is_err()
+        );
+        assert!(
+            OpenAiProvider::with_fallbacks(
+                OpenAiConfig {
+                    base_url: "ftp://example.com/v1".into(),
+                    api_key: "x".into(),
+                },
+                vec![],
+            )
+            .is_err()
+        );
+        assert!(
+            OpenAiProvider::with_fallbacks(
+                OpenAiConfig {
+                    base_url: "http://127.0.0.1:8000/v1".into(),
+                    api_key: "x".into(),
+                },
+                vec![],
+            )
+            .is_ok()
+        );
     }
 }

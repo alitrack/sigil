@@ -84,12 +84,14 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn bad_chunk_returns_error_not_panic() {
+    async fn bad_chunk_skipped_without_killing_stream() {
+        // A malformed data frame must be skipped, not surface as an
+        // error — a single bad frame (keep-alive comment, torn frame
+        // after a disconnect) must not kill the whole stream.
         let sse = "data: not-json\n\n";
         let mut stream = parse_stream(sse.as_bytes().to_vec());
         let first = stream.next().await;
-        assert!(first.is_some());
-        assert!(first.unwrap().is_err());
+        assert!(first.is_none(), "malformed frame must be skipped");
     }
 
     #[test]

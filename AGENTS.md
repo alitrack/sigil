@@ -40,7 +40,7 @@ src/
 ├── repl.rs          # interactive REPL: rustyline editing, sessions, approval, streaming
 ├── session.rs       # JSONL session store (~/.sigil/sessions/), --resume
 ├── safety/mod.rs    # approval gate: destructive-command detection; CircuitBreaker
-├── harness/mod.rs   # bundle: system_prompt.md + skills/ from ~/.sigil/harness/
+├── harness/mod.rs   # bundle: system_prompt.md + skills/ from %APPDATA%\sigil\harness (Win) / ~/.config/sigil/harness (Linux)
 │   └── harness_tests.rs  # skill inlining (small inline / large index-only)
 ├── llm/
 │   ├── mod.rs       # re-exports the provider surface
@@ -60,7 +60,7 @@ src/
     ├── bash.rs      # bash tool
     ├── files.rs     # read_file / write_file
     ├── git.rs       # git_status / git_diff / git_log (read-only)
-    ├── scripted.rs  # Lua scripted tools from ~/.sigil/tools/ (*.lua + manifest)
+    ├── scripted.rs  # Lua scripted tools from %APPDATA%\sigil\tools (Win) / ~/.config/sigil/tools (Linux)
     ├── evolve.rs    # create_lua_tool + improve_harness (AHE: tools + instruction layer)
     ├── memory.rs    # remember / recall tools
     ├── mcp.rs       # MCP-backed tools (mcp_<server>_<tool>)
@@ -85,6 +85,30 @@ Key contracts:
   zero tool calls; larger skills stay index-only (read_file on demand).
 - `AcpClient` holds the spawned child for the session lifetime —
   `kill_on_drop` + early drop kills the child mid-protocol (BrokenPipe).
+
+## State Locations on this machine (probed on disk, 2026-08)
+
+sigil on this box is the **Windows** build (repo `D:\wsl2\sigil`,
+`target/x86_64-pc-windows-msvc`, `build-win.ps1` / `test-win.ps1`).
+Global state is split between two roots — do NOT assume `~/.sigil`
+for everything (harness/tools/memory/config follow `dirs::config_dir()`,
+sessions/hooks/agents follow `dirs::home_dir()`):
+
+| What | Location on this machine | Code default |
+|---|---|---|
+| **Global harness** (`system_prompt.md`, `skills/`) | `C:\Users\DecisionLinnc\AppData\Roaming\sigil\harness` | `default_harness_dir() = dirs::config_dir()/sigil/harness` |
+| Scripted Lua tools | `C:\Users\DecisionLinnc\AppData\Roaming\sigil\tools` | `config_dir()/sigil/tools` |
+| Memory file (`remember`/`recall`) | `C:\Users\DecisionLinnc\AppData\Roaming\sigil\memory.md` | `config_dir()/sigil/memory.md` |
+| Config file (absent on this box = built-in defaults) | `C:\Users\DecisionLinnc\AppData\Roaming\sigil\config.toml` | `config_dir()/sigil/config.toml` |
+| Sessions (`--resume`), hooks, agents, delegates | `C:\Users\DecisionLinnc\.sigil\` | `dirs::home_dir()/.sigil/...` |
+
+On Linux the same code resolves harness/tools/memory/config to
+`~/.config/sigil/` (NOT `~/.sigil/harness`). WSL is installed on this
+box (WSL 2.7.11) but no distro is currently accessible from this
+account (LxssManager stopped, no LRM store) — the WSL side is not the
+active sigil state location. A pinned copy of this fact also exists as
+the global skill `harness-locations` (drop-in file kept in this repo at
+`harness-skill/harness-locations.md`) for sigil's own sessions.
 
 ## Key Patterns
 

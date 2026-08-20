@@ -14,6 +14,7 @@ import os, sys, subprocess, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 PY = sys.executable
+BENCH = os.path.join(os.path.expanduser("~"), "sigil_bench2")
 
 SIGIL_EPOCHS = int(os.environ.get("NIGHT_SIGIL_EPOCHS", "8"))
 DSH_EPOCHS   = int(os.environ.get("NIGHT_DSH_EPOCHS", "8"))
@@ -32,20 +33,24 @@ def run(cmd, logfile):
     return r.returncode
 
 def main():
-    # 1) sigil experimental group
+    # 1) sigil experimental group (seed 'evolve' persists tools across epochs)
     c1 = run([PY, "benchmark/run_bench.py",
+              "--seed", "evolve",
               "--epochs", str(SIGIL_EPOCHS), "--tasks", TASKS,
               "--model", MODEL, "--base-url", BASE,
-              "--timeout", TIMEOUT, "--max-steps", MAXSTEPS],
-             os.path.expanduser("~/sigil_bench/sigil_night.log"))
+              "--timeout", TIMEOUT, "--max-steps", MAXSTEPS,
+              "--out", os.path.join(BENCH, "runs")],
+             os.path.join(BENCH, "sigil_night.log"))
     # 2) dsh control group (own data sandbox via SIGIL_BENCH_WORKDIR override)
     c2 = run([PY, "benchmark/run_dsh.py",
+              "--seed", "evolve",
               "--epochs", str(DSH_EPOCHS), "--tasks", TASKS,
-              "--provider", "local-qwen-sglang", "--timeout", TIMEOUT],
-             os.path.expanduser("~/sigil_bench/dsh_night.log"))
+              "--provider", "local-qwen-sglang", "--timeout", TIMEOUT,
+              "--out", os.path.join(BENCH, "dsh_runs")],
+             os.path.join(BENCH, "dsh_night.log"))
     # 3) consolidated report
     run([PY, "benchmark/make_report.py"],
-        os.path.expanduser("~/sigil_bench/report.log"))
+        os.path.join(BENCH, "report.log"))
     print("NIGHT_RUN_DONE", flush=True)
     sys.exit(0 if (c1 == 0 and c2 == 0) else 1)
 

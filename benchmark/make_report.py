@@ -12,8 +12,9 @@ Output: ~/sigil_bench/REPORT.md (and stdout).
 import os, json, glob
 
 HOME = os.path.expanduser("~")
-SIGIL_RUNS = os.path.join(HOME, "sigil_bench/runs")
-DSH_RUNS   = os.path.join(HOME, "sigil_bench/dsh_runs")
+BENCH = os.path.join(HOME, "sigil_bench2")
+SIGIL_RUNS = os.path.join(BENCH, "runs")
+DSH_RUNS   = os.path.join(BENCH, "dsh_runs")
 
 def latest(path_glob):
     hits = glob.glob(path_glob)
@@ -110,8 +111,8 @@ def main():
         lines.append("")
 
     out = "\n".join(lines)
-    os.makedirs(os.path.join(HOME, "sigil_bench"), exist_ok=True)
-    open(os.path.join(HOME, "sigil_bench/REPORT.md"), "w", encoding="utf-8").write(out)
+    os.makedirs(BENCH, exist_ok=True)
+    open(os.path.join(BENCH, "REPORT.md"), "w", encoding="utf-8").write(out)
     print(out)
 
 if __name__ == "__main__":

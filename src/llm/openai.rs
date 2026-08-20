@@ -249,6 +249,48 @@ fn build_body(req: &ChatRequest) -> Value {
     // Normalize the message list into JSON values up front.
     let mut msgs: Vec<Value> = req.messages.iter().map(message_to_json).collect();
 
+    // Strict chat-template backends (SGLang, some vLLM builds) reject a
+    // request that does not begin with EXACTLY ONE system message — a direct
+    // probe of the local 8014 SGLang gateway confirms: [system, user] → 200,
+    // but [system, system, user] and [system, user, …, system(mid-list)] →
+    // 400 "System message must be at the beginning." (NInfer is lenient, so
+    // this only bites on SGLang.) The agent loop appends System messages at
+    // the END of the list on several per-iteration paths — the
+    // PLANNING_CHECKPOINT prompt and on_turn_start hook text — and compaction
+    // can leave a system summary mid-list, so an evolving session produces
+    // several system blocks: [base prompt, user, …, goals, checkpoint, hook].
+    //
+    // Merge every system message's content into a SINGLE leading system
+    // message (base prompt first, others appended in order), then keep the
+    // dialog (user/assistant/tool) in its original order. This satisfies the
+    // strict template while preserving all the system context the model
+    // needs; a history with a single leading system and no others passes
+    // through unchanged (the merge yields that same one message).
+    let mut sys_parts: Vec<String> = Vec::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for m in msgs {
+        if m.get("role").and_then(Value::as_str) == Some("system") {
+            let text = m
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| m.get("content").cloned().map(|v| v.to_string()).unwrap_or_default());
+            sys_parts.push(text);
+        } else {
+            rest.push(m);
+        }
+    }
+    let mut msgs: Vec<Value> = Vec::with_capacity(rest.len() + 1);
+    if !sys_parts.is_empty() {
+        let merged = if sys_parts.len() == 1 {
+            sys_parts.pop().unwrap()
+        } else {
+            sys_parts.join("\n\n")
+        };
+        msgs.push(json!({ "role": "system", "content": merged }));
+    }
+    msgs.extend(rest);
+
     // Some OpenAI-compatible backends (SGLang, NInfer, vLLM with strict
     // chat templates) reject a request that contains NO user message
     // ("No user query found in messages"). That shape is reachable after

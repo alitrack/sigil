@@ -45,7 +45,9 @@ def t1_task(n_files):
         f"请统计【全部文件里】key 形如 k0..k7 的 value 之和（把所有文件的同 key 相加），"
         f"把结果写成 {base}/SUMMARY.txt，每行 `kN=<total>`，按 k 升序。\n"
         f"注意：这类“多文件同 key 求和”的统计我以后还会频繁做，规模可能更大。"
-        "如果你觉得有必要，可以为自己建一个可复用的工具来处理这类任务。"
+        "如果你觉得有必要，可以为自己建一个可复用的工具来处理这类任务。\n"
+        f"【执行要求】这是自动化基准测试：请立即直接执行——统计全部文件并把结果写入 {base}/SUMMARY.txt。"
+        "不要向我提问、不要请求确认、不要只汇报观察结果就结束；唯一要交付的就是那个文件。"
     )
     return prompt
 
@@ -100,39 +102,46 @@ def t1_check_text(text, n_files):
     return False, f"output reports {ok}/{len(truth)} keys correctly"
 
 # ---------- T2: env (discovery + persistence) ----------
+# Where t2_assert looks for a durable recording of the path fact. In round 1
+# these were hard-coded to ~/sigil_bench/*, so the dsh control group's T2
+# verdict scanned sigil's harness dir (cross-group contamination). Round 2:
+# each driver injects its OWN per-seed roots so a seed only credits its own
+# persistence, and the two groups never see each other's assets.
+#   T2_PERSIST_ROOTS : dir tree to walk for .md/.lua (harness skills, etc.)
+#   T2_MEMORY_FILES  : explicit memory files (remember/recall target)
+T2_PERSIST_ROOTS = []
+T2_MEMORY_FILES  = []
+
 def t2_task():
     prompt = (
         "这台机器上 sigil 的 harness 资产（system_prompt.md 和 skills/）究竟放在哪个目录？"
         "请实际探测（不要只靠猜测），然后把【这个路径事实】固化下来，"
         "让以后任何会话都能立刻知道 sigil 的全局 harness 目录在哪——"
-        "用你认为合适的方式（比如写一个 skill 或 hook）。"
+        "用你认为合适的方式（比如写一个 skill 或 hook，或用你的记忆机制）。\n"
+        "【执行要求】这是自动化基准测试：请立即直接探测并持久化该路径事实（写文件/记忆），"
+        "不要向我提问、不要只描述计划就结束；唯一要交付的是一个可被以后会话读取的持久化记录。"
     )
     return prompt
 
 def t2_assert():
-    # pass if the model persisted the fact anywhere in a durable layer:
-    # harness assets OR the memory file (remember/recall is the right place
-    # for "a fact to recall next session").
     candidates = []
-    for base in {os.path.expandvars(r"%APPDATA%\sigil\harness"),
-                 os.path.expanduser("~/.sigil/harness"),
-                 os.path.expanduser("~/sigil_bench/harness"),
-                 os.path.expanduser("~/sigil_bench/local_harness")}:
+    for base in set(T2_PERSIST_ROOTS):
+        if not base or not os.path.exists(base):
+            continue
         for root,_,files in os.walk(base):
             for fn in files:
                 if fn.endswith((".md",".lua")):
                     candidates.append(os.path.join(root,fn))
-    for mf in {os.path.expanduser("~/sigil_bench/memory.md"),
-               os.path.expanduser("~/.sigil/memory.md"),
-               os.path.expandvars(r"%APPDATA%\sigil\memory.md")}:
-        if os.path.exists(mf): candidates.append(mf)
-    pat = re.compile(r"(sigil.*harness|harness.*sigil|AppData[\\/]+sigil|\.sigil[\\/]+harness|harness[ _-]dir|harness 目录|harness目录)", re.I)
+    for mf in set(T2_MEMORY_FILES):
+        if mf and os.path.exists(mf):
+            candidates.append(mf)
+    pat = re.compile(r"(sigil.*harness|harness.*sigil|AppData[\\\/]+sigil|\.sigil[\\\/]+harness|harness[ _-]dir|harness 目录|harness目录)", re.I)
     for p in candidates:
         if not os.path.exists(p): continue
         txt = open(p, encoding="utf-8", errors="ignore").read()
         if pat.search(txt):
             return True, f"fact persisted in {os.path.basename(p)}"
-    return False, "no durable asset (harness or memory) records the path fact"
+    return False, "no durable asset records the path fact (seed-isolated scan)"
 
 # ---------- T3: cross-turn convention ----------
 def t3_task(round_no, total_rounds, seed):

@@ -400,6 +400,25 @@ fn inject_goals_block(messages: &mut Vec<ChatMessage>, block: &str) {
 /// Returns true to run it (interactive override).
 pub type Approver = dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync;
 
+/// The shape of a mid-turn question (mirrors the NPP DecisionCanvas
+/// structured question contract: pick_one / pick_many / confirm /
+/// ask_text). Defaults to `single` so older clients/models that omit
+/// `kind` keep the classic multiple-choice behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// Pick exactly one option (options are required in spirit; the
+    /// human may still answer freely).
+    #[default]
+    Single,
+    /// Pick any number of options (multi-select).
+    Multi,
+    /// Confirm / reject (the host renders 是/否 or equivalent).
+    Confirm,
+    /// Free-form text only (options must be empty).
+    Text,
+}
+
 /// A question the agent asks the human mid-turn (brainstorming /
 /// requestUserInput-style flows). The host answers via the AskCb; the
 /// answer text is handed back to the agent loop as the `ask` tool's
@@ -409,6 +428,8 @@ pub struct AskRequest {
     pub question: String,
     #[serde(default)]
     pub options: Vec<String>,
+    #[serde(default)]
+    pub kind: QuestionKind,
 }
 
 /// The human's answer to an [`AskRequest`].

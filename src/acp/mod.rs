@@ -336,6 +336,7 @@ pub async fn serve(
                             "requestId": request_id,
                             "question": req.question,
                             "options": req.options,
+                            "kind": req.kind,
                         }),
                     })
                     .map_err(|_| anyhow::anyhow!("host disconnected while asking"))?;

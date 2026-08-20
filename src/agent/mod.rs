@@ -450,20 +450,41 @@ pub type AskCb = dyn Fn(AskRequest) -> futures_util::future::BoxFuture<'static, 
 /// interrupts the text stream (so the UI can flush).
 pub type StreamCb = dyn Fn(Option<&str>) + Send + Sync;
 
-/// One turn of the agent loop. Returns the assistant's final text.
-pub async fn run_turn(
+/// One turn of the agent loop over a PRIOR transcript (multi-turn
+/// sessions: the caller keeps the transcript returned in
+/// [`RunResult::messages`] and feeds it back next turn).
+///
+/// `history` is the previous transcript (system prompt included when
+/// present — the loop will not re-insert one). When it is empty the
+/// system prompt is built from the new prompt via
+/// [`AgentConfig::system_prompt_for`], so a fresh session behaves
+/// exactly like a one-shot prompt. The new user prompt is appended to
+/// the history. Returns the full [`RunResult`] including the updated
+/// transcript (post-compaction) so the caller can store it.
+///
+/// This is the ACP-session workhorse: each `agent/session.prompt` runs
+/// one turn, and the per-session transcript is what makes a session
+/// remember its earlier turns (and lets `agent/session/fork` clone a
+/// branch's context).
+pub async fn run_session_turn(
     provider: &dyn LlmProvider,
     tools: &mut ToolRegistry,
     config: &AgentConfig,
+    history: &[ChatMessage],
     user_prompt: &str,
-) -> Result<String> {
-    let messages = vec![
-        ChatMessage::system(config.system_prompt_for(user_prompt)),
-        ChatMessage::user(user_prompt),
-    ];
-    Ok(run_messages(provider, tools, config, &messages, None, None)
-        .await?
-        .output)
+) -> Result<RunResult> {
+    let mut messages: Vec<ChatMessage> = history.to_vec();
+    if !messages
+        .iter()
+        .any(|m| matches!(m.role, Role::System))
+    {
+        messages.insert(
+            0,
+            ChatMessage::system(config.system_prompt_for(user_prompt)),
+        );
+    }
+    messages.push(ChatMessage::user(user_prompt));
+    run_messages(provider, tools, config, &messages, None, None).await
 }
 
 /// Outcome state of an agent loop run.
@@ -482,6 +503,10 @@ pub enum RunState {
 /// to guess whether a run ended by answering or by exhausting its
 /// step budget: the state is explicit, and a budget-exhausted run is
 /// *not* an error (the model still produced a summary answer).
+///
+/// `messages` is the final transcript (system prompt included) after
+/// any in-run compaction. Session-scoped callers (ACP sessions) keep
+/// it to build the next turn's context; one-shot callers ignore it.
 #[derive(Debug, Clone)]
 pub struct RunResult {
     /// Final answer text (or the wrap-up summary on step-limit).
@@ -492,6 +517,8 @@ pub struct RunResult {
     /// Cumulative token usage across the run's completions, when the
     /// provider reported usage (streamed + tool-call replays).
     pub tokens: Option<TokenUsage>,
+    /// Final transcript (system + history) — see struct docs.
+    pub messages: Vec<ChatMessage>,
 }
 
 /// Fold one completion's usage into the running total (None-safe).
@@ -518,7 +545,7 @@ pub async fn run_messages(
     let mut messages = messages.to_vec();
 
     // P-B (thin-core roadmap): ensure the harness system prompt is
-    // present. Callers that already build it (run_turn, daemon, ACP)
+    // present. Callers that already build it (ACP, daemon, REPL)
     // are untouched; REPL and pipe mode previously ran with no system
     // prompt at all, which also meant `on_prompt_build` hooks never
     // fired there. This also covers resume paths whose transcript
@@ -629,6 +656,7 @@ pub async fn run_messages(
                 steps: step,
                 state: RunState::StepLimitReached,
                 tokens,
+                messages,
             });
         }
         step += 1;
@@ -831,6 +859,7 @@ pub async fn run_messages(
                     steps: step,
                     state: RunState::Success,
                     tokens,
+                    messages,
                 });
             }
             // Phase A2: assistant 事件（文本 + 随后 ToolCall 事件配对成完整消息）。
@@ -1013,6 +1042,7 @@ pub async fn run_messages(
             steps: step,
             state: RunState::Success,
             tokens,
+            messages,
         });
     }
 }

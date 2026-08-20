@@ -5,15 +5,62 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::acp::{AcpState, Out, handle_message};
+use crate::acp::{AcpState, Out, TranscriptStore, TurnFn, handle_message};
+
+/// Echo turn that mimics the real serve() executor: (session_id,
+/// prompt, history) → (answer, updated transcript), and it writes the
+/// updated transcript back to the shared store — exactly what the real
+/// turn executor does in `serve` (the store is the source of truth the
+/// prompt handler reads on the next turn / fork clones from).
+fn make_fake_turn(store: TranscriptStore) -> Arc<TurnFn> {
+    Arc::new(
+        move |session_id: String, prompt: String, history: Vec<crate::llm::provider::ChatMessage>| {
+            let store2 = store.clone();
+            let prompt2 = prompt.clone();
+            let sid2 = session_id.clone();
+            let fut = async move {
+                let mut updated = history;
+                updated.push(crate::llm::provider::ChatMessage::user(&prompt2));
+                store2.lock().unwrap().insert(sid2, updated.clone());
+                Ok::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>((
+                    format!("fake-echo[{session_id}]: {prompt2}"),
+                    updated,
+                ))
+            };
+            Box::pin(fut)
+        },
+    )
+}
 
 fn fake_state() -> AcpState {
     let mut s = AcpState::new();
-    s.turn = Some(Arc::new(|prompt: String| {
-        let fut = async move { Ok::<String, anyhow::Error>(format!("fake-echo: {prompt}")) };
-        Box::pin(fut)
-    }));
+    s.turn = Some(make_fake_turn(s.transcripts()));
     s
+}
+
+/// Extract the (id, session_id, done) triple from a Deferred out.
+fn deferred(out: Out) -> (serde_json::Value, String, tokio::sync::oneshot::Receiver<
+    anyhow::Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+>) {
+    match out {
+        Out::Deferred {
+            id,
+            session_id,
+            done,
+        } => (id, session_id, done),
+        _ => panic!("expected deferred prompt"),
+    }
+}
+
+/// Pull `result.sessionId` out of a Response (session/new, fork).
+fn session_id_of(out: &Out) -> String {
+    match out {
+        Out::Response { result: Some(r), .. } => r["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        _ => panic!("expected sessionId response"),
+    }
 }
 
 #[cfg(test)]
@@ -80,18 +127,11 @@ mod acp_tests {
         .await
         .unwrap();
         assert_eq!(outs.len(), 1);
-        let (deferred_id, deferred_sid, done) = match outs.into_iter().next().unwrap() {
-            Out::Deferred {
-                id,
-                session_id,
-                done,
-            } => (id, session_id, done),
-            _ => panic!("expected deferred prompt"),
-        };
+        let (deferred_id, deferred_sid, done) = deferred(outs.into_iter().next().unwrap());
         assert_eq!(deferred_id, json!(3));
         assert_eq!(deferred_sid, session_id);
-        let text = done.await.unwrap().unwrap();
-        assert_eq!(text, "fake-echo: hi");
+        let (text, _transcript) = done.await.unwrap().unwrap();
+        assert_eq!(text, format!("fake-echo[{session_id}]: hi"));
 
         // close
         let outs = handle_message(
@@ -133,10 +173,13 @@ mod acp_tests {
     #[tokio::test]
     async fn turn_error_becomes_jsonrpc_error() {
         let mut s = AcpState::new();
-        s.turn = Some(Arc::new(|_p: String| {
-            let fut = async move { Err::<String, anyhow::Error>(anyhow::anyhow!("boom")) };
-            Box::pin(fut)
-        }));
+        s.turn = Some(Arc::new(
+            |_sid: String, _p: String, _h: Vec<crate::llm::provider::ChatMessage>| {
+                let fut =
+                    async move { Err::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>(anyhow::anyhow!("boom")) };
+                Box::pin(fut)
+            },
+        ));
         let outs = handle_message(
             &mut s,
             &json!({
@@ -248,7 +291,7 @@ mod acp_tests {
         let rx = s.register_input("req-2".to_string());
         let rx_slot: Arc<std::sync::Mutex<Option<_>>> = Arc::new(std::sync::Mutex::new(Some(rx)));
         let rx_slot2 = rx_slot.clone();
-        s.turn = Some(Arc::new(move |prompt: String| {
+        s.turn = Some(Arc::new(move |_sid: String, prompt: String, _h: Vec<crate::llm::provider::ChatMessage>| {
             let rx_slot2 = rx_slot2.clone();
             Box::pin(async move {
                 let rx = rx_slot2
@@ -258,7 +301,10 @@ mod acp_tests {
                     .ok_or_else(|| anyhow::anyhow!("input already taken"))?;
                 let answer = rx.await.map_err(|_| anyhow::anyhow!("input dropped"))?;
                 let choice = answer["answers"][0].as_str().unwrap_or("?");
-                Ok::<String, anyhow::Error>(format!("{prompt} → chose {choice}"))
+                Ok::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>((
+                    format!("{prompt} → chose {choice}"),
+                    Vec::new(),
+                ))
             })
         }));
 
@@ -297,7 +343,185 @@ mod acp_tests {
         ));
 
         // The deferred turn finished with the answer in its output.
-        let text = done.await.unwrap().unwrap();
+        let (text, _transcript) = done.await.unwrap().unwrap();
         assert!(text.contains("chose 方案B"), "text was: {text}");
+    }
+
+    // ---- session context: multi-turn transcripts + fork (NPP parity) ----
+
+    #[tokio::test]
+    async fn multi_turn_session_accumulates_transcript() {
+        // Two prompts on the same session: the second turn's executor
+        // sees the first turn's transcript (fed from the shared store).
+        let mut s = fake_state();
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "agent/session/new",
+                "params": { "cwd": "/tmp", "mcpServers": [] }
+            }),
+        )
+        .await
+        .unwrap();
+        let sid = session_id_of(&outs[0]);
+
+        let (_id, _sid, done1) = deferred(
+            handle_message(
+                &mut s,
+                &json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "agent/session.prompt",
+                    "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "first" }] }
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap(),
+        );
+        let (text1, _t1) = done1.await.unwrap().unwrap();
+        assert_eq!(text1, format!("fake-echo[{sid}]: first"));
+
+        // The transcript store now holds turn 1's user message.
+        let stored = s.transcripts.lock().unwrap().get(&sid).cloned().unwrap();
+        assert_eq!(stored.len(), 1);
+
+        let (_id, _sid, done2) = deferred(
+            handle_message(
+                &mut s,
+                &json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "agent/session.prompt",
+                    "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "second" }] }
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap(),
+        );
+        // The fake turn appends to the RECEIVED history — so the
+        // returned transcript proves turn 2 saw turn 1's context.
+        let (_text2, transcript2) = done2.await.unwrap().unwrap();
+        assert_eq!(transcript2.len(), 2);
+        assert!(transcript2
+            .iter()
+            .any(|m| m.content.contains("first")));
+        assert!(transcript2
+            .iter()
+            .any(|m| m.content.contains("second")));
+    }
+
+    #[tokio::test]
+    async fn session_fork_inherits_parent_transcript() {
+        let mut s = fake_state();
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "agent/session/new",
+                "params": { "cwd": "/work", "mcpServers": [] }
+            }),
+        )
+        .await
+        .unwrap();
+        let parent = session_id_of(&outs[0]);
+        let (_id, _sid, done) = deferred(
+            handle_message(
+                &mut s,
+                &json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "agent/session.prompt",
+                    "params": { "sessionId": parent, "prompt": [{ "type": "text", "text": "parent turn" }] }
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap(),
+        );
+        done.await.unwrap().unwrap();
+
+        // Fork: the branch clones the parent's transcript + cwd.
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "agent/session/fork",
+                "params": { "fromSessionId": parent }
+            }),
+        )
+        .await
+        .unwrap();
+        let branch = session_id_of(&outs[0]);
+        assert_ne!(branch, parent);
+        assert!(branch.starts_with("sigil-fork-"));
+
+        let branch_transcript = s
+            .transcripts
+            .lock()
+            .unwrap()
+            .get(&branch)
+            .cloned()
+            .unwrap();
+        assert!(branch_transcript
+            .iter()
+            .any(|m| m.content.contains("parent turn")),
+            "branch must inherit the parent's context");
+
+        // Prompting the branch sees the inherited context.
+        let (_id, _sid, done2) = deferred(
+            handle_message(
+                &mut s,
+                &json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "agent/session.prompt",
+                    "params": { "sessionId": branch, "prompt": [{ "type": "text", "text": "branch turn" }] }
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap(),
+        );
+        let (text, transcript) = done2.await.unwrap().unwrap();
+        assert_eq!(text, format!("fake-echo[{branch}]: branch turn"));
+        assert!(transcript
+            .iter()
+            .any(|m| m.content.contains("parent turn")));
+
+        // Closing the branch removes only the branch's state.
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "agent/session.close",
+                "params": { "sessionId": branch }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &outs[0],
+            Out::Response { error: None, .. }
+        ));
+        let store = s.transcripts.lock().unwrap();
+        assert!(!store.contains_key(&branch));
+        assert!(store.contains_key(&parent), "parent must survive");
+    }
+
+    #[tokio::test]
+    async fn fork_unknown_session_errors() {
+        let mut s = fake_state();
+        let outs = handle_message(
+            &mut s,
+            &json!({
+                "jsonrpc": "2.0", "id": 9, "method": "agent/session/fork",
+                "params": { "fromSessionId": "nope" }
+            }),
+        )
+        .await
+        .unwrap();
+        match &outs[0] {
+            Out::Response { error: Some(e), .. } => assert_eq!(e["code"], -32602),
+            _ => panic!("expected error response"),
+        }
     }
 }

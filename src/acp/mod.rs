@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::agent::{AgentConfig, run_turn};
+use crate::agent::{AgentConfig, run_session_turn};
 use crate::tools::ToolRegistry;
 
 #[cfg(test)]
@@ -55,18 +55,64 @@ pub enum Out {
     Deferred {
         id: Value,
         session_id: String,
-        done: tokio::sync::oneshot::Receiver<Result<String>>,
+        done: tokio::sync::oneshot::Receiver<
+            Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+        >,
     },
 }
 
-/// How one agent turn runs: prompt → future of the final answer.
+/// How one agent turn runs: (session id, prompt, prior transcript) →
+/// future of (final answer, updated transcript). The transcript is
+/// what makes a session multi-turn: each `agent/session.prompt` feeds
+/// the stored transcript back in, and `agent/session/fork` clones it
+/// (NPP: each answer branch is a forked Codex thread with its own
+/// context).
 pub type TurnFn =
-    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<String>> + Send + Sync;
+    dyn Fn(
+        String,
+        String,
+        Vec<crate::llm::provider::ChatMessage>,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+    > + Send + Sync;
+
+/// Shared transcript store: session id → accumulated transcript.
+///
+/// Separate from `AcpState.sessions` (which `handle_message` mutates
+/// exclusively) because the BACKGROUND turn executor runs outside
+/// `handle_message` and must write the transcript back when a turn
+/// finishes — same Arc<Mutex> pattern as `pending_inputs`. This store
+/// is authoritative for transcripts; `AcpState.sessions` keeps the
+/// per-session cwd. `agent/session/fork` clones from it.
+pub type TranscriptStore = Arc<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<crate::llm::provider::ChatMessage>>>,
+>;
+
+/// Per-session runtime state: the working directory (from
+/// `agent/session/new`). The transcript lives in the shared
+/// [`TranscriptStore`] (background turns write it back). Forged by
+/// `agent/session/new` and cloned (with a fresh id) by
+/// `agent/session/fork` — the branch keeps the parent's full context,
+/// exactly like NPP's `ForkThreadAsync`.
+#[derive(Default, Clone)]
+struct SessionState {
+    cwd: String,
+}
 
 /// Session state shared across messages.
 #[derive(Default)]
 pub struct AcpState {
-    sessions: std::collections::HashMap<String, mpsc::UnboundedSender<Value>>,
+    sessions: std::collections::HashMap<String, SessionState>,
+    /// The session most recently created, forked, or prompted. In the
+    /// serial client protocol (one in-flight prompt per client) this
+    /// is the session a mid-turn `ask` notification should be
+    /// attributed to — the background turn executor reads it.
+    /// Shared (Arc<Mutex>) like `pending_inputs`: the background
+    /// executor and callbacks run outside `handle_message`.
+    current_session: Arc<std::sync::Mutex<String>>,
+    /// session id → accumulated transcript (see [`TranscriptStore`]).
+    transcripts: TranscriptStore,
     /// Mid-turn human-input requests: requestId → responder. The
     /// server-side AskCb registers a oneshot here before emitting an
     /// `agent_request_input` notification; the client answers with
@@ -88,7 +134,16 @@ pub struct AcpState {
 
 impl AcpState {
     pub fn new() -> Self {
-        Self::default()
+        let mut s = Self::default();
+        s.transcripts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        s.current_session = Arc::new(std::sync::Mutex::new(String::new()));
+        s
+    }
+
+    /// The shared transcript store (background turns write transcripts
+    /// back into it after completion).
+    pub fn transcripts(&self) -> TranscriptStore {
+        self.transcripts.clone()
     }
 
     /// Register a mid-turn input request and return the receiver the
@@ -148,28 +203,83 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             );
-            let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-            state.sessions.insert(session_id.clone(), tx);
-            // Notifier task: forward queued updates as notifications.
-            tokio::spawn(async move {
-                while let Some(update) = rx.recv().await {
-                    let notif = json!({
-                        "jsonrpc": "2.0",
-                        "method": "client/session.update",
-                        "params": { "sessionId": "__sid__", "update": update }
-                    });
-                    // The session id is spliced below by handle_message;
-                    // this task only forwards via the channel — the
-                    // actual write happens in serve(). For pure tests we
-                    // never reach this path (fake turn returns instantly).
-                    let _ = notif;
-                }
-            });
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            state
+                .sessions
+                .insert(session_id.clone(), SessionState { cwd });
+            state
+                .transcripts
+                .lock()
+                .unwrap()
+                .insert(session_id.clone(), Vec::new());
+            *state.current_session.lock().unwrap() = session_id.clone();
             outs.push(Out::Response {
                 id: id.unwrap_or(Value::Null),
                 result: Some(json!({ "sessionId": session_id })),
                 error: None,
             });
+        }
+        // sigil extension (NPP parity): fork a session's context into a
+        // new branch session. The branch starts with the parent's full
+        // transcript, so its agent remembers everything the parent
+        // figured out (NPP: `ForkThreadAsync` — each answer branch is a
+        // forked Codex thread). `agent/session/new` = NPP's
+        // `CreateThreadAsync` (empty context).
+        "agent/session/fork" => {
+            let from = params
+                .get("fromSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match state.sessions.get(&from).cloned() {
+                Some(parent) => {
+                    let session_id = format!(
+                        "sigil-fork-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    );
+                    state.sessions.insert(
+                        session_id.clone(),
+                        SessionState {
+                            cwd: parent.cwd.clone(),
+                        },
+                    );
+                    // Clone the parent's accumulated transcript: the
+                    // branch's agent starts where the parent left off.
+                    let parent_transcript = state
+                        .transcripts
+                        .lock()
+                        .unwrap()
+                        .get(&from)
+                        .cloned()
+                        .unwrap_or_default();
+                    state
+                        .transcripts
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone(), parent_transcript);
+                    *state.current_session.lock().unwrap() = session_id.clone();
+                    outs.push(Out::Response {
+                        id: id.unwrap_or(Value::Null),
+                        result: Some(json!({ "sessionId": session_id })),
+                        error: None,
+                    });
+                }
+                None => outs.push(Out::Response {
+                    id: id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(json!({
+                        "code": -32602,
+                        "message": format!("cannot fork unknown session {from}")
+                    })),
+                }),
+            }
         }
         "agent/session.prompt" => {
             let session_id = params
@@ -196,10 +306,19 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .unwrap_or_default();
 
             let turn = state.turn.clone();
+            let transcript = state
+                .transcripts
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            *state.current_session.lock().unwrap() = session_id.clone();
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let session_id_for_turn = session_id.clone();
             tokio::spawn(async move {
                 let result = match &turn {
-                    Some(t) => (t)(prompt_text).await,
+                    Some(t) => (t)(session_id_for_turn, prompt_text, transcript).await,
                     None => Err(anyhow::anyhow!("no turn executor installed")),
                 };
                 let _ = done_tx.send(result);
@@ -217,6 +336,7 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .unwrap_or("")
                 .to_string();
             state.sessions.remove(&sid);
+            state.transcripts.lock().unwrap().remove(&sid);
             outs.push(Out::Response {
                 id: id.unwrap_or(Value::Null),
                 result: Some(Value::Null),
@@ -302,19 +422,24 @@ pub async fn serve(
     let mut stdout = tokio::io::stdout();
 
     let mut state = AcpState::new();
+    let current_session = state.current_session.clone();
 
     // Mid-turn question notifications flow from the background turn
     // executor (AskCb) to the stdio loop over this channel.
     let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<Out>();
 
     // The AskCb: surface `agent_request_input` to the host and wait
-    // for its `agent/request.input` answer.
+    // for its `agent/request.input` answer. The notification is
+    // attributed to the session the prompt handler marked current
+    // (serial client protocol: one in-flight prompt).
     {
         let pending_inputs = state.pending_inputs();
         let notif_tx_for_ask = notif_tx.clone();
+        let current_for_ask = current_session.clone();
         let ask_cb: Arc<crate::agent::AskCb> = Arc::new(move |req: crate::agent::AskRequest| {
             let pending_inputs = pending_inputs.clone();
             let notif_tx = notif_tx_for_ask.clone();
+            let current = current_for_ask.clone();
             Box::pin(async move {
                 let request_id = format!(
                     "in-{}",
@@ -328,9 +453,10 @@ pub async fn serve(
                     .lock()
                     .unwrap()
                     .insert(request_id.clone(), tx);
+                let session_id = current.lock().unwrap().clone();
                 notif_tx
                     .send(Out::Notification {
-                        session_id: String::new(), // the client matches by requestId
+                        session_id,
                         update: json!({
                             "sessionUpdate": "agent_request_input",
                             "requestId": request_id,
@@ -362,13 +488,15 @@ pub async fn serve(
     // notifications — the host can show branches starting/finishing.
     {
         let progress_tx = notif_tx.clone();
+        let current_for_delegate = current_session.clone();
         let provider2 = provider.clone();
         let config2 = agent_config.clone();
         let progress_cb: std::sync::Arc<
             dyn Fn(crate::tools::delegate::DelegateProgress) + Send + Sync,
         > = std::sync::Arc::new(move |p: crate::tools::delegate::DelegateProgress| {
+            let session_id = current_for_delegate.lock().unwrap().clone();
             let _ = progress_tx.send(Out::Notification {
-                session_id: String::new(), // the client matches by batch/turn
+                session_id,
                 update: json!({
                     "sessionUpdate": "agent_delegate_progress",
                     "id": p.id,
@@ -391,19 +519,52 @@ pub async fn serve(
         ));
     }
 
-    // Real turn executor: full agent loop with this run's tools/config.
+    // Real turn executor: one session-scoped agent turn. The prior
+    // transcript (fed by the prompt handler) makes each session
+    // multi-turn; the result's updated transcript is written back to
+    // the shared store so the NEXT turn sees this one. A failed turn
+    // keeps the prior transcript (no partial corruption).
+    let transcripts_shared = state.transcripts();
     let turn = Arc::new(
-        move |prompt: String| -> futures_util::future::BoxFuture<'static, Result<String>> {
+        move |session_id: String,
+              prompt: String,
+              history: Vec<crate::llm::provider::ChatMessage>|
+              -> futures_util::future::BoxFuture<
+                'static,
+                Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+              > {
             let mut tools = tools.clone_shallow();
             let config = agent_config.clone();
             let provider = provider.clone();
-            async move { run_turn(provider.as_ref(), &mut tools, &config, &prompt).await }.boxed()
+            let transcripts = transcripts_shared.clone();
+            async move {
+                let res =
+                    run_session_turn(provider.as_ref(), &mut tools, &config, &history, &prompt)
+                        .await;
+                match res {
+                    Ok(r) => {
+                        transcripts
+                            .lock()
+                            .unwrap()
+                            .insert(session_id.clone(), r.messages.clone());
+                        Ok((r.output, r.messages))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            .boxed()
         },
     );
     state.turn = Some(turn);
 
-    // Background turns awaiting completion: (request id, session id, outcome).
-    type PendingTurn = (Value, String, Result<String>);
+    // Background turns awaiting completion: (request id, session id,
+    // (answer, updated transcript) — the transcript was already written
+    // back by the turn executor; this copy only feeds the wire).
+    type PendingTurn = (
+        Value,
+        String,
+        Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+    );
     let mut pending: FuturesUnordered<
         std::pin::Pin<Box<dyn futures_util::Future<Output = PendingTurn>>>,
     > = FuturesUnordered::new();
@@ -497,10 +658,10 @@ async fn write_turn_outcome(
     stdout: &mut tokio::io::Stdout,
     id: Value,
     session_id: String,
-    result: Result<String>,
+    result: Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
 ) -> Result<()> {
     match result {
-        Ok(text) => {
+        Ok((text, _transcript)) => {
             write_out(
                 stdout,
                 Out::Notification {

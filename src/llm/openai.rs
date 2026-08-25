@@ -45,6 +45,16 @@ pub struct OpenAiProvider {
     /// reused across hosts, and N per-endpoint clients would double
     /// connection pools and fds.
     client: reqwest::Client,
+    /// Bound on waiting for the response HEADERS (status line + headers),
+    /// i.e. the `send().await` phase before any body bytes arrive. This is
+    /// the phase that hangs indefinitely when a load-balanced endpoint
+    /// (SGLang/vLLM with a request queue) drops a queued request without
+    /// closing the socket: the TCP connection stays ESTAB/half-open, no
+    /// status line is ever sent, and — without this bound — the caller
+    /// waits for the full client `.timeout()` (3600s), which reads as an
+    /// infinite hang. A head-timeout error is `Transient`, so it flows into
+    /// the normal fallback/backoff chain instead of pinning the agent.
+    head_timeout: std::time::Duration,
 }
 
 impl OpenAiProvider {
@@ -64,7 +74,25 @@ impl OpenAiProvider {
         Ok(Self {
             endpoints,
             client: Self::build_client()?,
+            head_timeout: Self::default_head_timeout(),
         })
+    }
+
+    /// Default bound on waiting for response headers: 300s. A local
+    /// endpoint under queue pressure should answer or drop well inside
+    /// that; a healthy streaming completion can wait arbitrarily long for
+    /// BODY bytes (that phase is covered by the per-chunk idle timeout),
+    /// so this only caps the pre-body wait.
+    pub fn default_head_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(300)
+    }
+
+    /// Override the head-wait bound (tests use short values so a
+    /// "server accepts the connection but never answers" scenario fails
+    /// in milliseconds instead of 300s).
+    pub fn with_head_timeout(mut self, d: std::time::Duration) -> Self {
+        self.head_timeout = d;
+        self
     }
 
     fn build_client() -> anyhow::Result<reqwest::Client> {
@@ -126,16 +154,29 @@ impl OpenAiProvider {
     ) -> Result<reqwest::Response, PostError> {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = build_body(req);
-        let resp = match self
+        // Bound the wait for response HEADERS. `send()` returns when the
+        // status line + headers arrive; for a load-balanced local endpoint
+        // whose queue drops the request without closing the socket, that
+        // can be arbitrarily long — and the client-level `.timeout(3600s)`
+        // only makes it *worse* (a 1-hour hang). Time it out at
+        // `head_timeout` and report Transient so the fallback chain kicks
+        // in. The body phase is NOT bounded here: streaming completions
+        // legitimately take minutes, and per-chunk idle timeout covers stalls.
+        let send_fut = self
             .client
             .post(&url)
             .bearer_auth(&config.api_key)
             .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(PostError::Transient(format!("{e}"))),
+            .send();
+        let resp = match tokio::time::timeout(self.head_timeout, send_fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(PostError::Transient(format!("{e}"))),
+            Err(_) => {
+                return Err(PostError::Transient(format!(
+                    "timed out after {:?} waiting for response headers from {} (endpoint may have dropped the request without closing the connection)",
+                    self.head_timeout, config.base_url
+                )))
+            }
         };
 
         let status = resp.status();
@@ -491,6 +532,19 @@ struct SseLines<S> {
     inner: S,
     pending: String,
     queued: std::collections::VecDeque<anyhow::Result<ChatChunk>>,
+    /// Saw a terminal chunk (`[DONE]` or `finish_reason`)? When the body
+    /// stream reaches EOF WITHOUT one, the provider dropped the connection
+    /// mid-completion — a truncated (often empty) answer. Reporting that
+    /// as a clean `None` let the agent treat the partial output as the
+    /// final answer ("silent empty output"); surface it as an error
+    /// instead.
+    saw_terminal: bool,
+    /// Inner stream reached EOF. Once set, every subsequent poll returns
+    /// `None` — including after we've already emitted the truncation
+    /// error. Without this, a `StreamExt::collect()` loop (which keeps
+    /// polling past an Err item, since our Item IS `Result<_,_>`) would
+    /// re-observe the EOF and re-emit the same error forever → hang.
+    finished: bool,
 }
 
 fn sse_line_stream<S, T>(stream: S) -> impl Stream<Item = anyhow::Result<ChatChunk>>
@@ -502,6 +556,8 @@ where
         inner: stream,
         pending: String::new(),
         queued: std::collections::VecDeque::new(),
+        saw_terminal: false,
+        finished: false,
     }
 }
 
@@ -518,7 +574,18 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
         let this = self.get_mut();
+        // EOF already reached: terminate. We must return `None` here rather
+        // than re-enter the inner stream, otherwise a `collect()` consumer
+        // that keeps polling past our truncation error would loop forever
+        // re-emitting the same error (our Item is `Result`, so an Err is a
+        // value, not a stream terminator).
+        if this.finished {
+            return Poll::Ready(None);
+        }
         if let Some(item) = this.queued.pop_front() {
+            if item.as_ref().ok().map(|c| c.done).unwrap_or(false) {
+                this.saw_terminal = true;
+            }
             return Poll::Ready(Some(item));
         }
         loop {
@@ -534,13 +601,38 @@ where
                     this.queued
                         .extend(lines.into_iter().filter_map(|l| parse_sse_line(&l)));
                     if let Some(item) = this.queued.pop_front() {
+                        if item.as_ref().ok().map(|c| c.done).unwrap_or(false) {
+                            this.saw_terminal = true;
+                        }
                         return Poll::Ready(Some(item));
                     }
                     // Chunk contained no complete line yet — keep polling.
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    // Body stream ended. Mark finished so subsequent polls
+                    // return None (see the guard at the top of poll_next).
+                    this.finished = true;
+                    // A well-formed SSE completion terminates with [DONE]
+                    // (or a finish_reason chunk); EOF without either means
+                    // the connection was dropped mid-stream and anything
+                    // already delivered is partial.
+                    if !this.saw_terminal && !this.pending.is_empty() {
+                        // Pending bytes that never became a full line —
+                        // a torn final frame.
+                        return Poll::Ready(Some(Err(anyhow::anyhow!(
+                            "provider closed the stream mid-completion (torn final frame: {:?})",
+                            &this.pending
+                        ))));
+                    }
+                    if !this.saw_terminal {
+                        return Poll::Ready(Some(Err(anyhow::anyhow!(
+                            "provider closed the stream before sending a terminal chunk (no [DONE]/finish_reason) — response truncated or dropped"
+                        ))));
+                    }
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -752,6 +844,107 @@ mod tests {
         );
     }
 
+    /// Regression: the CLOSE-WAIT hang. A server that accepts the TCP
+    /// connection (or a pool-stale socket reused under a load-balanced
+    /// gateway that dropped the queued request) and then sends NOTHING —
+    /// no status line, no RST — used to pin the caller for the full
+    /// client timeout (3600s), reading as an infinite hang. With the
+    /// head-wait bound, the call must fail fast with a Transient error.
+    #[tokio::test]
+    async fn head_wait_bounded_when_server_accepts_but_never_answers() {
+        // Accept the connection, read the request, then hold it open
+        // without ever sending a status line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                // Drain the request, then just hold the socket open.
+                let mut buf = [0u8; 4096];
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                // Hold for ~3s (longer than the 300ms head timeout, shorter
+                // than the test can wait) and then close without a reply.
+                std::thread::sleep(std::time::Duration::from_millis(3000));
+                drop(sock);
+            }
+        });
+
+        let provider = OpenAiProvider::with_fallbacks(cfg(port), vec![])
+            .unwrap()
+            .with_head_timeout(std::time::Duration::from_millis(300));
+
+        let t0 = std::time::Instant::now();
+        let err = provider.chat_complete(chat_request()).await.unwrap_err();
+        let elapsed = t0.elapsed();
+        let msg = format!("{err}");
+        // Must be a timeout, not a hang, and must NOT take the full 3600s.
+        assert!(
+            msg.contains("timed out"),
+            "expected head-wait timeout error, got: {msg}"
+        );
+        assert!(
+            elapsed.as_secs() < 30,
+            "head wait must fail fast, but took {elapsed:?}"
+        );
+    }
+
+    /// A body stream that ends WITHOUT a terminal chunk ([DONE]/
+    /// finish_reason) — i.e. the provider dropped the connection mid-
+    /// completion — must surface an error rather than a clean EOF, so the
+    /// agent does not mistake a truncated (often empty) answer for the
+    /// final result.
+    #[tokio::test]
+    async fn mid_stream_eof_without_terminal_is_an_error() {
+        use futures_util::StreamExt;
+        // One partial data frame, then EOF — no finish_reason, no [DONE].
+        let frames: Vec<Vec<u8>> = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_vec(),
+        ];
+        let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
+        let parsed: Vec<anyhow::Result<ChatChunk>> =
+            sse_line_stream(stream).collect().await;
+        // The partial delta arrives, then an EOF-without-terminal error.
+        assert_eq!(parsed.len(), 2, "expected a delta + a terminal error: {parsed:?}");
+        assert_eq!(parsed[0].as_ref().unwrap().delta, "partial");
+        let err = parsed[1].as_ref().unwrap_err().to_string();
+        assert!(
+            err.contains("no [DONE]/finish_reason"),
+            "expected truncation error, got: {err}"
+        );
+    }
+
+    /// A well-formed stream that ends with [DONE] must still close
+    /// cleanly (no spurious truncation error) — guards against the
+    /// EOF-detection false-positiving on the happy path.
+    #[tokio::test]
+    async fn wellformed_stream_with_done_closes_cleanly() {
+        use futures_util::StreamExt;
+        let frames: Vec<Vec<u8>> = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
+        let parsed: Vec<anyhow::Result<ChatChunk>> =
+            sse_line_stream(stream).collect().await;
+        // The finish_reason chunk (done=true) AND the [DONE] chunk both
+        // surface; no truncation error item. Both are terminal markers.
+        assert_eq!(parsed.len(), 2, "expected finish chunk + [DONE] chunk: {parsed:?}");
+        for c in parsed.iter().map(|r| r.as_ref().unwrap()) {
+            assert!(c.done, "both terminal chunks must be done: {c:?}");
+        }
+        assert_eq!(parsed[0].as_ref().unwrap().delta, "hi");
+    }
+
     #[test]
     fn usage_parsed_from_response_block() {
         let v = serde_json::json!({
@@ -872,10 +1065,15 @@ mod tests {
         // so a ready item sitting behind a not-yet-fired sleep was never
         // delivered — the stream stalled until the timer fired (120s).
         // Inner data must always win over the timer.
+        //
+        // The stream ends with [DONE] (as every real SSE completion does),
+        // so the new mid-stream-EOF truncation check does not fire here.
         use std::task::Poll;
         let mut state = 0u8;
         let slow = futures_util::stream::poll_fn(move |cx| match state {
             0 => {
+                // Pending on first poll, then wake — this is the stall the
+                // regression guards against.
                 state = 1;
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -886,16 +1084,28 @@ mod tests {
                     b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec(),
                 )))
             }
+            2 => {
+                state = 3;
+                // Terminal [DONE] frame so the stream is well-formed.
+                Poll::Ready(Some(Ok::<Vec<u8>, String>(b"data: [DONE]\n".to_vec())))
+            }
             _ => Poll::Ready(None),
         });
         let stream = sse_line_stream(with_idle_timeout(slow, std::time::Duration::from_secs(5)));
         let chunks: Vec<anyhow::Result<ChatChunk>> = futures_util::StreamExt::collect(stream).await;
-        assert_eq!(
-            chunks.len(),
-            1,
+        // The delta chunk and the [DONE] chunk both surface; no stall, no
+        // truncation error. Both are terminal.
+        assert!(
+            chunks.len() >= 1,
             "pending-then-ready must not stall on the idle timer"
         );
-        assert_eq!(chunks[0].as_ref().unwrap().delta, "hi");
+        let first = chunks[0].as_ref().expect("first chunk is Ok");
+        assert_eq!(first.delta, "hi");
+        // No truncation error anywhere in the collected stream.
+        assert!(
+            chunks.iter().all(|c| c.is_ok()),
+            "well-formed stream must not report a truncation error: {chunks:?}"
+        );
     }
 
     #[tokio::test]

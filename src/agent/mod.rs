@@ -944,6 +944,43 @@ pub async fn run_messages(
                     });
                     continue;
                 }
+                // P0 hook (serial decision): an `on_pre_tool` listener can
+                // veto the call before it runs. The first non-null verdict
+                // wins; a truthy verdict (boolean true, or a non-empty
+                // string used as a human-readable reason) blocks the call.
+                // A nil / null verdict is a no-op and the chain continues.
+                if let Some(hooks) = &config.hooks
+                    && let crate::hooks::DispatchOutput::First(Some(v)) = hooks
+                        .dispatch(
+                            "on_pre_tool",
+                            crate::hooks::HookMode::Serial,
+                            serde_json::json!({
+                                "name": call.name,
+                                "args": call.arguments,
+                            }),
+                        )
+                        .await?
+                {
+                    // A verdict blocks the call when it is boolean `true`
+                    // or a non-empty string (the string is surfaced as the
+                    // reason). Anything else — `false`, null, an empty
+                    // string — is a pass and the chain continues.
+                    let veto_reason = match &v {
+                        serde_json::Value::Bool(true) => {
+                            Some("vetoed by on_pre_tool hook".to_string())
+                        }
+                        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                        _ => None,
+                    };
+                    if let Some(reason) = veto_reason {
+                        emit_approval("hook_vetoed", Some(reason.clone()));
+                        plans.push(Plan {
+                            call: call.clone(),
+                            blocked: Some(format!("blocked by on_pre_tool hook: {reason}")),
+                        });
+                        continue;
+                    }
+                }
                 // Circuit breaker: skip tripped tools entirely.
                 if breaker.is_tripped(&call.name) {
                     plans.push(Plan {
@@ -1037,6 +1074,25 @@ pub async fn run_messages(
         }
 
         // No tool call — this is the final answer.
+        // P0 hook (emit observation): an `on_done` listener may react to
+        // the finished turn (log, metrics, notify). Purely observational —
+        // a hook error is logged, never fatal, since the answer is already
+        // produced (same leniency as on_prompt_build).
+        if let Some(hooks) = &config.hooks
+            && let Err(e) = hooks
+                .dispatch(
+                    "on_done",
+                    crate::hooks::HookMode::Emit,
+                    serde_json::json!({
+                        "output": text.trim(),
+                        "steps": step,
+                        "model": config.model,
+                    }),
+                )
+                .await
+        {
+            eprintln!("warning: on_done hook failed: {e:#}");
+        }
         return Ok(RunResult {
             output: text.trim().to_string(),
             steps: step,
@@ -1816,6 +1872,188 @@ mod parallel_tests {
         assert!(
             provider.saw_inject.load(Ordering::SeqCst),
             "on_turn_start hook text must appear in the first request"
+        );
+    }
+
+    /// P0 (serial decision): an `on_pre_tool` listener that returns `true`
+    /// for a tool must block the call before it runs — the tool never
+    /// executes and the model sees the veto reason as the tool result.
+    #[derive(Debug)]
+    struct PreToolVetoProvider {
+        calls: AtomicUsize,
+        saw_veto: AtomicBool,
+    }
+    #[async_trait]
+    impl LlmProvider for PreToolVetoProvider {
+        fn name(&self) -> &str {
+            "pre-tool-veto-test"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: true,
+                        usage: None,
+                    },
+                )])))
+            } else {
+                let vetoed = req
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m.role, crate::llm::provider::Role::Tool))
+                    .any(|m| m.content.contains("blocked by on_pre_tool hook"));
+                self.saw_veto.store(vetoed, Ordering::SeqCst);
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "VETO-DONE".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                        usage: None,
+                    },
+                )])))
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            Ok(ChatComplete {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn on_pre_tool_hook_vetoes_tool_call() {
+        let hooks_dir = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("pre-tool-veto");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let slot = hooks_dir.join("on_pre_tool.d");
+        std::fs::create_dir_all(&slot).unwrap();
+        // A serial veto: the first non-null verdict wins. This listener
+        // vetoes echo_tool specifically; returning `true` blocks the call.
+        std::fs::write(
+            slot.join("01_safety.lua"),
+            "return function(ctx) return ctx.name == 'echo_tool' end",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, hooks_dir,
+        )));
+
+        let mut tools = crate::tools::ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let provider = PreToolVetoProvider {
+            calls: AtomicUsize::new(0),
+            saw_veto: AtomicBool::new(false),
+        };
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("run echo")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "VETO-DONE");
+        assert!(
+            provider.saw_veto.load(Ordering::SeqCst),
+            "the vetoes echo_tool call must reach the model as a blocked result"
+        );
+    }
+
+    /// P0 (emit observation): when the turn ends with a final answer, an
+    /// `on_done` listener must observe it. The hook is observational, so it
+    /// signals by writing a marker file through a host helper.
+    #[derive(Debug)]
+    struct DoneAnswerProvider;
+    #[async_trait]
+    impl LlmProvider for DoneAnswerProvider {
+        fn name(&self) -> &str {
+            "done-answer-test"
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> anyhow::Result<ChatStream> {
+            Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                crate::llm::provider::ChatChunk {
+                    delta: "DONE-ANSWER".into(),
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: false,
+                    usage: None,
+                },
+            )])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            unreachable!("no tool calls in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn on_done_hook_observes_final_answer() {
+        let base = std::env::temp_dir()
+            .join("sigil-agent-hooks-tests")
+            .join("done");
+        std::fs::create_dir_all(&base).unwrap();
+        let slot = base.join("on_done.d");
+        std::fs::create_dir_all(&slot).unwrap();
+        let marker = base.join("on_done_marker.txt");
+        let _ = std::fs::remove_file(&marker);
+        // The path is embedded inside a Lua string literal; backslashes are
+        // Lua escape characters, so normalize to forward slashes (Windows
+        // file APIs accept `/`). This is a test-only concern — production
+        // hook files are user-authored with valid paths.
+        let marker_s = marker.to_string_lossy().replace('\\', "/");
+        // The emit listener writes a marker carrying the observed output —
+        // proving on_done fired and received the final answer.
+        std::fs::write(
+            slot.join("01.log.lua"),
+            &format!(
+                "return function(ctx) host.write_file('{marker_s}', 'on_done:' .. ctx.output); return nil end"
+            ),
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().unwrap(),
+        ));
+        let mut config = test_config();
+        config.hooks = Some(std::sync::Arc::new(crate::hooks::HookRunner::new(
+            lua, base,
+        )));
+
+        let mut tools = crate::tools::ToolRegistry::new();
+        let provider = DoneAnswerProvider;
+
+        let answer = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("answer")],
+            None,
+            None,
+        )
+        .await
+        .expect("turn succeeds");
+        assert_eq!(answer.output, "DONE-ANSWER");
+        let written = std::fs::read_to_string(&marker).expect("on_done marker written");
+        assert_eq!(
+            written, "on_done:DONE-ANSWER",
+            "on_done hook must observe the final answer"
         );
     }
 

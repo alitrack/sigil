@@ -230,6 +230,39 @@ impl LuaRuntime {
         let json = lua.to_value(&result).map_err(lua_err)?;
         Ok(serde_json::to_string(&json)?)
     }
+
+    /// Like `run_file` but returns the hook's return value as a typed
+    /// `serde_json::Value` instead of a string. Needed by the agent-loop
+    /// hook dispatch modes that consume non-string results: `parallel`
+    /// (a table of per-monitor outputs) and `serial` (a boolean veto).
+    ///
+    /// A Lua `nil` return serializes to `Value::Null` — call sites that
+    /// distinguish "absent" from "present but null" should check their
+    /// own discovery logic first (see `hooks::HookRunner::resolve_slot`).
+    pub fn run_file_value(&self, path: &str, args_json: &str) -> Result<serde_json::Value> {
+        let lua = self
+            .lua
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lua lock poisoned"))?;
+        let source = std::fs::read_to_string(path)?;
+        let exported: Value = lua.load(&source).set_name(path).eval().map_err(lua_err)?;
+        let func: mlua::Function = exported
+            .as_function()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("scripted tool {path} must return a function"))?;
+        let args: serde_json::Value =
+            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+        let result: Value = func
+            .call(lua.to_value(&args).map_err(lua_err)?)
+            .map_err(lua_err)?;
+        // Serialize the Lua value to a JSON string, then parse it into a
+        // typed serde value. (Reuses the same serde round-trip the string
+        // variant of run_file relies on, so tables/bools/nil all land as
+        // the corresponding JSON object/bool/null.)
+        let json = lua.to_value(&result).map_err(lua_err)?;
+        let s = serde_json::to_string(&json)?;
+        Ok(serde_json::from_str(&s)?)
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +274,41 @@ mod tests {
         let rt = LuaRuntime::new().unwrap();
         let out = rt.run("return 1 + 2").unwrap();
         assert_eq!(out, "3");
+    }
+
+    #[test]
+    fn run_file_value_typed_returns() {
+        // Non-string returns (bool veto, table of outputs) are the whole
+        // point of run_file_value; a bare `return nil` must surface as
+        // Value::Null so dispatch modes can treat it as "no opinion".
+        let dir = std::env::temp_dir().join("sigil-lua-value-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = LuaRuntime::new().unwrap();
+
+        let p = dir.join("veto.lua");
+        std::fs::write(&p, "return function(ctx) return ctx.block == true end").unwrap();
+        assert_eq!(
+            rt.run_file_value(p.to_str().unwrap(), r#"{"block":true}"#).unwrap(),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            rt.run_file_value(p.to_str().unwrap(), r#"{"block":false}"#).unwrap(),
+            serde_json::Value::Bool(false)
+        );
+
+        let p = dir.join("tbl.lua");
+        std::fs::write(&p, "return function(ctx) return {ok=true, n=3} end").unwrap();
+        assert_eq!(
+            rt.run_file_value(p.to_str().unwrap(), "{}").unwrap(),
+            serde_json::json!({"ok": true, "n": 3})
+        );
+
+        let p = dir.join("nil.lua");
+        std::fs::write(&p, "return function() return nil end").unwrap();
+        assert!(rt
+            .run_file_value(p.to_str().unwrap(), "{}")
+            .unwrap()
+            .is_null());
     }
 
     #[test]

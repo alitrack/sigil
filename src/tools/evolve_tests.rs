@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use crate::tools::Tool;
-use crate::tools::evolve::{CreateLuaToolTool, ImproveHarnessTool};
+use crate::tools::evolve::{CreateLuaToolTool, ImproveHarnessTool, RevertEffectsTool};
 
 /// Unique temp dir per test (parallel-test safety).
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -190,6 +190,7 @@ async fn improve_harness_edits_prompt() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     let out = tool
         .run(&json!({
@@ -218,6 +219,7 @@ async fn improve_harness_adds_and_lists_skills() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
 
     // Add a skill.
@@ -280,6 +282,7 @@ async fn improve_harness_rejects_unknown_action() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     let err = tool
         .run(&json!({ "action": "nuke_everything" }))
@@ -307,6 +310,7 @@ async fn edit_prompt_updates_live_prompt_state() {
         local_dir: None,
         prompt_state: Some(state.clone()),
         hooks_dir: None,
+        effects: None,
     };
     let out = tool
         .run(&json!({
@@ -341,6 +345,7 @@ async fn refinement_gate_rejects_missing_reason() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     // No reason → rejected before any write.
     let err = tool
@@ -373,6 +378,7 @@ async fn refinement_gate_rejects_noop_rewrites() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     // Identical content (just whitespace difference) → rejected.
     let err = tool
@@ -415,6 +421,7 @@ async fn refinement_gate_rejects_noise_and_bad_shape() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     // Too short to be a full prompt replacement.
     let err = tool
@@ -457,6 +464,7 @@ async fn accepted_edits_are_audited_in_refinements_jsonl() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     tool.run(&json!({
         "action": "edit_prompt",
@@ -499,6 +507,7 @@ async fn scope_local_writes_to_local_dir_when_configured() {
         local_dir: Some(local.clone()),
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
 
     // scope=local edit_prompt → lands in the local dir, not the global one.
@@ -534,6 +543,7 @@ async fn scope_local_without_local_dir_is_rejected() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     let err = tool
         .run(&json!({
@@ -564,6 +574,7 @@ async fn default_scope_is_local_when_local_layer_exists() {
         local_dir: Some(local.clone()),
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
 
     // No scope arg → lands in the local layer (prime-agent semantics).
@@ -599,6 +610,7 @@ async fn explicit_global_scope_writes_global_even_with_local_layer() {
         local_dir: Some(local.clone()),
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
 
     // Explicit scope=global bypasses the local default.
@@ -646,6 +658,7 @@ async fn scope_local_add_skill_and_refresh_state_merge() {
         local_dir: Some(local.clone()),
         prompt_state: Some(state.clone()),
         hooks_dir: None,
+        effects: None,
     };
 
     // Local add_skill shadows the global same-named skill.
@@ -670,4 +683,192 @@ async fn scope_local_add_skill_and_refresh_state_merge() {
     assert!(s.skills.iter().any(|sk| sk.name == "dup"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cordis P1: a revertible effect round-trips `edit_prompt`. Forward write
+/// lands, the tracker records an inverse; `revert_effects` restores the
+/// previous prompt exactly.
+#[tokio::test]
+async fn revertible_edit_prompt_roundtrip() {
+    let dir = fresh_dir("revert-prompt");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    let original = "original prompt v1";
+    std::fs::write(harness.join("system_prompt.md"), original).unwrap();
+
+    let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: None,
+        prompt_state: None,
+        hooks_dir: None,
+        effects: Some(tracker.clone()),
+    };
+    let out = tool
+        .run(&json!({
+            "action": "edit_prompt",
+            "content": "revised prompt v2\n\nThis is a substantially longer full-prompt replacement that clears the one-hundred-character quality gate comfortably, so the write is accepted.",
+            "reason": "improve clarity"
+        }))
+        .await
+        .unwrap();
+    assert!(out.text.contains("updated"));
+    assert_eq!(tracker.pending(), 1, "one effect recorded per write");
+    let changed = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
+    assert!(changed.contains("revised prompt v2"));
+
+    // Runtime rollback restores the original.
+    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let r = revert.run(&json!({ "action": "all" })).await.unwrap();
+    assert!(r.text.contains("reverted 1 effect"), "got: {}", r.text);
+    let restored = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
+    assert_eq!(restored, original, "revert must restore the exact previous prompt");
+    assert_eq!(tracker.pending(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cordis P1: a revertible effect round-trips `add_skill` — a brand-new
+/// skill is reverted by deleting the file again.
+#[tokio::test]
+async fn revertible_add_skill_roundtrip() {
+    let dir = fresh_dir("revert-skill");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(harness.join("skills")).unwrap();
+
+    let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: None,
+        prompt_state: None,
+        hooks_dir: None,
+        effects: Some(tracker.clone()),
+    };
+    let skill_path = harness.join("skills").join("my-skill.md");
+    tool.run(&json!({
+        "action": "add_skill",
+        "name": "my-skill",
+        "content": "> A reusable procedure\n\n1. step one\n2. step two\n3. this body is padded out beyond the minimum length comfortably",
+        "reason": "the workflow repeats across sessions"
+    }))
+    .await
+    .unwrap();
+    assert!(skill_path.exists());
+    assert_eq!(tracker.pending(), 1);
+
+    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let r = revert.run(&json!({ "action": "last" })).await.unwrap();
+    assert!(r.text.contains("add_skill"), "got: {}", r.text);
+    assert!(!skill_path.exists(), "revert of a new skill deletes it");
+    assert_eq!(tracker.pending(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cordis P1: a revertible effect round-trips `edit_hook` — overwriting an
+/// existing hook restores its previous content on rollback.
+#[tokio::test]
+async fn revertible_edit_hook_roundtrip() {
+    let dir = fresh_dir("revert-hook");
+    let hooks = dir.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_path = hooks.join("on_tool_result.lua");
+    let before = "return function(ctx) return ctx.result end";
+    std::fs::write(&hook_path, before).unwrap();
+
+    let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+    let tool = ImproveHarnessTool {
+        harness_dir: dir.join("harness"),
+        local_dir: None,
+        prompt_state: None,
+        hooks_dir: Some(hooks.clone()),
+        effects: Some(tracker.clone()),
+    };
+    let after = "return function(ctx) return ctx.result .. ' [annotated]' end";
+    tool.run(&json!({
+        "action": "edit_hook",
+        "name": "on_tool_result.lua",
+        "content": after,
+        "reason": "annotate tool results"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), after);
+    assert_eq!(tracker.pending(), 1);
+
+    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    revert.run(&json!({ "action": "last" })).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&hook_path).unwrap(),
+        before,
+        "revert must restore the previous hook content"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cordis P1: LIFO composition across multiple writes. Three edits to the
+/// same prompt; `revert_effects action=last` undoes only the newest, and a
+/// subsequent `action=all` undoes the rest — restoring the pre-run state.
+#[tokio::test]
+async fn revertible_lifo_multi_write() {
+    let dir = fresh_dir("revert-lifo");
+    let harness = dir.join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    let original = "prompt v0";
+    std::fs::write(harness.join("system_prompt.md"), original).unwrap();
+
+    let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+    let tool = ImproveHarnessTool {
+        harness_dir: harness.clone(),
+        local_dir: None,
+        prompt_state: None,
+        hooks_dir: None,
+        effects: Some(tracker.clone()),
+    };
+    let pad = "padding padding padding padding padding padding padding padding padding padding padding padding padding padding";
+    let write = |v: &str| {
+        json!({
+            "action": "edit_prompt",
+            "content": format!("{v}\n\n{pad}"),
+            "reason": "step"
+        })
+    };
+    tool.run(&write("prompt v1")).await.unwrap();
+    tool.run(&write("prompt v2")).await.unwrap();
+    tool.run(&write("prompt v3")).await.unwrap();
+    assert_eq!(tracker.pending(), 3);
+    assert!(std::fs::read_to_string(harness.join("system_prompt.md"))
+        .unwrap()
+        .starts_with("prompt v3"));
+
+    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    // Undo the single newest (v3 -> v2).
+    revert.run(&json!({ "action": "last" })).await.unwrap();
+    assert!(std::fs::read_to_string(harness.join("system_prompt.md"))
+        .unwrap()
+        .starts_with("prompt v2"), "LIFO: only the newest is undone");
+    assert_eq!(tracker.pending(), 2);
+    // Undo the remaining two (v2 -> v1 -> v0).
+    revert.run(&json!({ "action": "all" })).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(harness.join("system_prompt.md")).unwrap(),
+        original,
+        "full LIFO rollback restores the pre-run prompt"
+    );
+    assert_eq!(tracker.pending(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cordis P1: `revert_effects` on an empty tracker reports nothing to do
+/// (and does not error).
+#[tokio::test]
+async fn revert_effects_empty_is_noop() {
+    let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+    let revert = RevertEffectsTool { tracker };
+    for action in ["last", "all"] {
+        let r = revert.run(&json!({ "action": action })).await.unwrap();
+        assert!(r.text.contains("nothing to revert"), "got: {}", r.text);
+    }
 }

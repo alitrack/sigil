@@ -171,11 +171,22 @@ impl ToolRegistry {
         let harness_dir = harness_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(harness::default_harness_dir);
+        // Cordis P1: runtime revertible-effect tracker, shared between the
+        // write side (improve_harness registers an inverse per write) and
+        // the revert side (revert_effects rolls them back LIFO at runtime).
+        let effects = std::sync::Arc::new(crate::revertible::EffectTracker::new());
         registry.register(Arc::new(evolve::ImproveHarnessTool {
             harness_dir: harness_dir.clone(),
             local_dir: local_harness_dir.map(Path::to_path_buf),
             prompt_state: prompt_state.clone(),
             hooks_dir: hooks_dir.map(Path::to_path_buf),
+            effects: Some(effects.clone()),
+        }));
+        // Runtime rollback of the above: undo the most recent improve_harness
+        // write(s) in-process, LIFO. The model gets a one-call "undo my last
+        // harness edit" without reaching for git or the on-disk archive.
+        registry.register(Arc::new(evolve::RevertEffectsTool {
+            tracker: effects,
         }));
         // Persistent goals: the model declares long-running objectives;
         // active goals are injected into the system context each turn.

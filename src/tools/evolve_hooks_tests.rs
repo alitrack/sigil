@@ -29,6 +29,7 @@ fn improve_tool(hooks: std::path::PathBuf, harness: std::path::PathBuf) -> Impro
         local_dir: None,
         prompt_state: None,
         hooks_dir: Some(hooks),
+        effects: None,
     }
 }
 
@@ -97,6 +98,7 @@ async fn edit_hook_creates_updates_and_rejects_bad_code() {
         local_dir: None,
         prompt_state: None,
         hooks_dir: None,
+        effects: None,
     };
     let err = bare
         .run(&json!({ "action": "list_hooks" }))
@@ -223,6 +225,7 @@ async fn self_evolution_loop_hook_goes_live_same_session() {
         local_dir: None,
         prompt_state: Some(prompt_state.clone()),
         hooks_dir: Some(hooks.clone()),
+        effects: None,
     }));
 
     let lua = std::sync::Arc::new(std::sync::Mutex::new(

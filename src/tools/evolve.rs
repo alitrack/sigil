@@ -192,6 +192,37 @@ pub struct ImproveHarnessTool {
     /// modules). `None` = hooks actions rejected with a hint (start
     /// sigil with --hooks-dir to enable).
     pub hooks_dir: Option<std::path::PathBuf>,
+    /// Cordis P1: runtime revertible-effect tracker. When set, every write
+    /// (edit_prompt / add_skill / edit_hook / delete_hook) registers an
+    /// explicit inverse so the change can be rolled back *at runtime* via
+    /// the `revert_effects` tool — LIFO, in-process. `None` = no runtime
+    /// revert tracking (writes still work and remain covered by the durable
+    /// on-disk `skill_rollback` archive).
+    pub effects: Option<std::sync::Arc<crate::revertible::EffectTracker>>,
+}
+
+/// Re-run the live-prompt refresh from owned/clone-able handles. Identical
+/// to the inline `refresh_state` closure in `run`, but taking `&`/owned
+/// params so the revertible-effect inverse closures (which must be `'static`)
+/// can call it. No-op when `prompt_state` is `None` (isolated/tests) or the
+/// lock is poisoned.
+fn refresh_prompt_state(
+    prompt_state: &Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
+    harness_dir: &std::path::Path,
+    local_dir: Option<&std::path::Path>,
+) {
+    let Some(state) = prompt_state else {
+        return;
+    };
+    let Ok(mut s) = state.write() else {
+        return;
+    };
+    if let Ok(merged) =
+        crate::harness::Harness::load_with_local(Some(harness_dir), local_dir)
+    {
+        s.system_prompt = merged.system_prompt;
+        s.skills = merged.skills;
+    }
 }
 
 /// Require an evidence-backed `reason` for a harness write (the
@@ -452,6 +483,31 @@ impl Tool for ImproveHarnessTool {
                 }
                 std::fs::write(&path, content)?;
                 refresh_state();
+                // Cordis P1: register the inverse so this prompt replacement
+                // is revertible at runtime (restore the previous content, or
+                // delete the file if there was none).
+                if let Some(effects) = &self.effects {
+                    let p = path.clone();
+                    let prev = if old.is_empty() {
+                        None
+                    } else {
+                        Some(old.clone())
+                    };
+                    let ps = self.prompt_state.clone();
+                    let hd = self.harness_dir.clone();
+                    let ld = self.local_dir.clone();
+                    effects.record(crate::revertible::EvolveEffect::new(
+                        format!("edit_prompt ({scope}): system_prompt.md"),
+                        Box::new(move || {
+                            match prev.as_deref() {
+                                Some(c) => std::fs::write(&p, c)?,
+                                None => std::fs::remove_file(&p)?,
+                            }
+                            refresh_prompt_state(&ps, &hd, ld.as_deref());
+                            Ok(())
+                        }),
+                    ));
+                }
                 record_refinement(
                     &target_dir,
                     &json!({
@@ -516,12 +572,36 @@ impl Tool for ImproveHarnessTool {
                         "add_skill: skill '{safe}' already exists with identical content — no change"
                     );
                 }
+                // Capture the previous skill content (if any) BEFORE the
+                // write, so the revertible-effect inverse can restore it.
+                let prev_skill = std::fs::read_to_string(&path).ok();
                 // Snapshot the previous version if this skill exists.
-                if let Ok(old) = std::fs::read_to_string(&path) {
-                    crate::harness::versions::backup_and_prune(&target_dir, "skills", &safe, &old);
+                if let Some(old) = prev_skill.as_deref() {
+                    crate::harness::versions::backup_and_prune(&target_dir, "skills", &safe, old);
                 }
                 std::fs::write(&path, content)?;
                 refresh_state();
+                // Cordis P1: register the inverse so this skill write is
+                // revertible at runtime (restore the previous skill, or
+                // delete the file if it was newly created).
+                if let Some(effects) = &self.effects {
+                    let p = path.clone();
+                    let prev = prev_skill.clone();
+                    let ps = self.prompt_state.clone();
+                    let hd = self.harness_dir.clone();
+                    let ld = self.local_dir.clone();
+                    effects.record(crate::revertible::EvolveEffect::new(
+                        format!("add_skill ({scope}): {safe}.md"),
+                        Box::new(move || {
+                            match prev.as_deref() {
+                                Some(c) => std::fs::write(&p, c)?,
+                                None => std::fs::remove_file(&p)?,
+                            }
+                            refresh_prompt_state(&ps, &hd, ld.as_deref());
+                            Ok(())
+                        }),
+                    ));
+                }
                 // Detect dependency cycles across all skills and warn
                 // (the write succeeds — a cycle is a quality problem,
                 // not a reason to reject the skill).
@@ -644,6 +724,22 @@ impl Tool for ImproveHarnessTool {
                             &hooks_dir, "hooks", &safe, &old,
                         );
                         std::fs::remove_file(&path)?;
+                        // Cordis P1: register the inverse so this deletion is
+                        // revertible at runtime (re-create the hook file).
+                        if let Some(effects) = &self.effects {
+                            let p = path.clone();
+                            let ps = self.prompt_state.clone();
+                            let hd = self.harness_dir.clone();
+                            let ld = self.local_dir.clone();
+                            effects.record(crate::revertible::EvolveEffect::new(
+                                format!("delete_hook: {safe}.lua"),
+                                Box::new(move || {
+                                    std::fs::write(&p, &old)?;
+                                    refresh_prompt_state(&ps, &hd, ld.as_deref());
+                                    Ok(())
+                                }),
+                            ));
+                        }
                         record_refinement(
                             &hooks_dir,
                             &json!({
@@ -695,7 +791,32 @@ impl Tool for ImproveHarnessTool {
                                 &hooks_dir, "hooks", &safe, &old,
                             );
                         }
+                        // Capture the previous hook content (if any) BEFORE
+                        // the write, so the revertible-effect inverse can
+                        // restore it.
+                        let prev_hook = std::fs::read_to_string(&path).ok();
                         std::fs::write(&path, content)?;
+                        // Cordis P1: register the inverse so this hook write
+                        // is revertible at runtime (restore the previous
+                        // hook, or delete the file if it was newly created).
+                        if let Some(effects) = &self.effects {
+                            let p = path.clone();
+                            let prev = prev_hook;
+                            let ps = self.prompt_state.clone();
+                            let hd = self.harness_dir.clone();
+                            let ld = self.local_dir.clone();
+                            effects.record(crate::revertible::EvolveEffect::new(
+                                format!("edit_hook: {safe}.lua"),
+                                Box::new(move || {
+                                    match prev.as_deref() {
+                                        Some(c) => std::fs::write(&p, c)?,
+                                        None => std::fs::remove_file(&p)?,
+                                    }
+                                    refresh_prompt_state(&ps, &hd, ld.as_deref());
+                                    Ok(())
+                                }),
+                            ));
+                        }
                         record_refinement(
                             &hooks_dir,
                             &json!({
@@ -718,6 +839,87 @@ impl Tool for ImproveHarnessTool {
             }
             other => anyhow::bail!("unknown action: {other}"),
         })
+    }
+}
+
+/// Cordis P1: runtime rollback of self-evolution writes. The model (or a
+/// human via the REPL) calls this to undo the most recent `improve_harness`
+/// changes *at runtime* — LIFO, in-process — instead of reaching for
+/// `git revert`. Shares the same [`crate::revertible::EffectTracker`] that
+/// `improve_harness` writes to, so every write is immediately revertible.
+///
+/// This is the runtime complement to the durable on-disk
+/// `skill_rollback` / `versions` archive: that one survives restarts and
+/// keeps a version history across sessions; this one gives the live agent a
+/// one-call undo of "the last thing I did to the harness".
+pub struct RevertEffectsTool {
+    pub tracker: std::sync::Arc<crate::revertible::EffectTracker>,
+}
+
+#[async_trait]
+impl Tool for RevertEffectsTool {
+    fn name(&self) -> &str {
+        "revert_effects"
+    }
+
+    fn description(&self) -> &str {
+        "Undo recent improve_harness changes at runtime (Cordis P1: \
+         revertible effects). Rollback is LIFO — the most recent writes are \
+         reverted first. Use action='last' to undo the single most recent \
+         write, or action='all' to undo every pending write back to the \
+         harness state before this run started. Returns what was reverted. \
+         (Complements the durable on-disk skill_rollback, which keeps a \
+         version history across sessions.)"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["last", "all"],
+                    "description": "'last' reverts the single most recent write; 'all' reverts every pending write."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match action {
+            "last" => {
+                match self.tracker.rollback_one()? {
+                    Some(label) => Ok(ToolOutput {
+                        text: format!("reverted: {label}"),
+                    }),
+                    None => Ok(ToolOutput {
+                        text: "nothing to revert — no pending improve_harness writes".into(),
+                    }),
+                }
+            }
+            "all" => {
+                let before = self.tracker.pending();
+                if before == 0 {
+                    return Ok(ToolOutput {
+                        text: "nothing to revert — no pending improve_harness writes".into(),
+                    });
+                }
+                let reverted = self.tracker.rollback(0)?;
+                let labels = reverted.join("; ");
+                Ok(ToolOutput {
+                    text: format!(
+                        "reverted {n} effect(s) back to the pre-run harness state: {labels}",
+                        n = reverted.len()
+                    ),
+                })
+            }
+            other => anyhow::bail!("revert_effects: unknown action '{other}' (expected 'last' or 'all')"),
+        }
     }
 }
 

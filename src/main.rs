@@ -14,6 +14,7 @@ mod lua;
 mod mcp;
 mod memory;
 mod repl;
+mod revertible;
 mod safety;
 mod session;
 mod tools;

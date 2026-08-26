@@ -895,11 +895,15 @@ pub async fn run_messages(
             // approval later blocks it.
             if let Some(sink) = &config.session_sink {
                 for call in &complete.tool_calls {
+                    // Cordis P3: fingerprint the call so a log replay can
+                    // find the matching inverse (per-frame rollback).
+                    let key = crate::session::revert_key(&call.name, &call.arguments);
                     sink(crate::session::Event::ToolCall {
                         ts: None,
                         id: call.id.clone(),
                         name: call.name.clone(),
                         args: call.arguments.to_string(),
+                        revert_key: key,
                     });
                 }
             }
@@ -1041,12 +1045,20 @@ pub async fn run_messages(
                 // blocked/rejected calls emit ok=false).
                 if let Some(sink) = &config.session_sink {
                     let ok = blocked.is_none() && !msg.starts_with("error:");
+                    // Cordis P3: annotate whether this call registered a
+                    // runtime-revertible effect (P1) so the session can be
+                    // rolled back frame-by-frame. Grounded in the actual
+                    // wiring: only a tool that opted into the P1
+                    // EffectTracker reports Some(true); everything else is
+                    // None (not assessed).
+                    let revertible = registry.revertible_of(&plan.call.name);
                     sink(crate::session::Event::ToolResult {
                         ts: None,
                         id: plan.call.id.clone(),
                         name: plan.call.name.clone(),
                         ok,
                         output: msg.clone(),
+                        revertible,
                     });
                 }
                 // P-A hook: on_tool_result can rewrite what the model

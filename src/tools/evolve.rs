@@ -392,6 +392,13 @@ impl Tool for ImproveHarnessTool {
         })
     }
 
+    /// Cordis P3: this tool's writes are runtime-revertible (P1) when it is
+    /// wired with a live `EffectTracker`. Without one (`effects: None`,
+    /// e.g. a bare test construction) it does not participate → `None`.
+    fn revertible(&self) -> Option<bool> {
+        Some(self.effects.is_some())
+    }
+
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
         let action = args
             .get("action")

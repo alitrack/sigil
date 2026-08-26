@@ -61,6 +61,17 @@ pub trait Tool: Send + Sync {
     fn dependencies(&self) -> Vec<String> {
         vec![]
     }
+    /// Cordis P3: is this tool's effect runtime-revertible (P1)?
+    ///
+    /// `Some(true)` = a call to this tool registers a runtime-revertible
+    /// effect (P1) that the session log can roll back frame-by-frame.
+    /// `None` = the tool does not participate in the P1 revertible-effect
+    /// system (the default for every pre-existing tool) — not assessed,
+    /// not a claim of irreversibility. Only `improve_harness` (when wired
+    /// with a live `EffectTracker`) overrides this to `Some(true)`.
+    fn revertible(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Unified registry, keyed by advertised name.
@@ -298,6 +309,13 @@ impl ToolRegistry {
     /// `tool_dependencies` introspection tool).
     pub fn dependency_state(&self) -> Arc<RwLock<DependencyState>> {
         self.deps.clone()
+    }
+
+    /// Cordis P3: whether the tool registered under `name` is
+    /// runtime-revertible (P1). `None` if the tool isn't registered or
+    /// doesn't participate in the revertible-effect system.
+    pub fn revertible_of(&self, name: &str) -> Option<bool> {
+        self.tools.get(name).and_then(|t| t.revertible())
     }
 
     /// Test helper: a read guard over the live dependency state, bound to
@@ -863,5 +881,41 @@ mod registry_tests {
             .unwrap()
             .text;
         assert!(query.contains("depended on by: b"), "reverse edge: {query}");
+    }
+
+    // ---- Cordis P3: revertible annotation (grounded in the P1 wiring) ----
+
+    /// `revertible_of` reflects the actual P1 wiring: `improve_harness`
+    /// wired with a live EffectTracker is runtime-revertible (Some(true));
+    /// the same tool with `effects: None` is Some(false); a tool that never
+    /// opted into the P1 system (default `revertible()`) is None.
+    #[test]
+    fn p3_revertible_of_reflects_p1_wiring() {
+        use crate::tools::evolve::ImproveHarnessTool;
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-p3-revertible-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let harness = dir.join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+
+        let tracker = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+        let mut reg = ToolRegistry::new();
+        // Revertible: ImproveHarnessTool with a live EffectTracker.
+        reg.register(std::sync::Arc::new(ImproveHarnessTool {
+            harness_dir: harness.clone(),
+            local_dir: None,
+            prompt_state: None,
+            hooks_dir: None,
+            effects: Some(tracker),
+        }));
+        // A plain tool that never opts into P1 → None.
+        reg.register(dep("plain", vec![]));
+
+        assert_eq!(reg.revertible_of("improve_harness"), Some(true), "wired → Some(true)");
+        assert_eq!(reg.revertible_of("plain"), None, "not in P1 → None");
+        assert_eq!(reg.revertible_of("no_such_tool"), None, "unregistered → None");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

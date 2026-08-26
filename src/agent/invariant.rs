@@ -190,6 +190,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 args: "{}".into(),
+                revert_key: "".into(),
             },
             Event::ToolResult {
                 ts: None,
@@ -197,6 +198,7 @@ mod tests {
                 name: "read_file".into(),
                 ok: true,
                 output: "content".into(),
+                revertible: None,
             },
             Event::Assistant {
                 ts: None,

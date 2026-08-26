@@ -66,7 +66,10 @@ pub enum Event {
         text: String,
     },
     /// A tool invocation requested by the model.
-    /// `id` = tool-call id (Phase A; legacy lines may omit it → empty).
+    /// `id` = tool-call id (Phase A; legacy → empty).
+    /// `revert_key` (Cordis P3): a stable fingerprint of the call (name +
+    /// canonicalized args) — the inverse-identifier that lets a log replay
+    /// find "the same call" for per-frame rollback. Empty on legacy lines.
     ToolCall {
         #[serde(default)]
         ts: Option<String>,
@@ -74,9 +77,15 @@ pub enum Event {
         id: String,
         name: String,
         args: String,
+        #[serde(default)]
+        revert_key: String,
     },
     /// The outcome of a tool invocation.
     /// `id` pairs with the originating ToolCall (Phase A; legacy → empty).
+    /// `revertible` (Cordis P3): `Some(true)` = this call registered a
+    /// runtime-revertible effect (P1) so the session can roll it back
+    /// frame-by-frame; `Some(false)` = assessed, not revertible; `None` =
+    /// not assessed (legacy line / tool the registry doesn't track).
     ToolResult {
         #[serde(default)]
         ts: Option<String>,
@@ -86,6 +95,8 @@ pub enum Event {
         /// `true` = tool succeeded; `false` = error output.
         ok: bool,
         output: String,
+        #[serde(default)]
+        revertible: Option<bool>,
     },
     /// One agent turn begins (structural event; not projected to messages).
     TurnStart {
@@ -280,6 +291,83 @@ pub fn start_with_id(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---- Cordis P3: per-call inverse identifier (revert_key) ----
+//
+// A stable fingerprint of a tool call (name + canonicalized args) that lets
+// a log replay find "the same call" for per-frame rollback. We deliberately
+// avoid a crypto dependency: the key is an internal fingerprint, not a
+// security token, so a 64-bit FNV-1a over a canonical (key-sorted) JSON
+// form is collision-resistant enough for de-dup / lookup and needs no new
+// crate.
+
+/// FNV-1a over the given bytes → 64-bit hash.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Canonical JSON: objects emitted with their keys sorted, arrays in order,
+/// so the same logical value always serializes identically (independent of
+/// the caller's key ordering). `Value` here is `serde_json::Value`.
+fn canonical_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push('"');
+            out.push_str(&s.escape_default().to_string());
+            out.push('"');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(it, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                out.push_str(&(**k).escape_default().to_string());
+                out.push('"');
+                out.push(':');
+                if let Some(val) = map.get(*k) {
+                    canonical_json(val, out);
+                } else {
+                    out.push_str("null");
+                }
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// The Cordis P3 inverse identifier for a tool call: a hex string derived
+/// from the tool name and its canonicalized args. The same logical call
+/// (same name, same args regardless of key order) always yields the same
+/// key; different calls (even differing by one arg) yield different keys.
+pub fn revert_key(name: &str, args: &serde_json::Value) -> String {
+    let mut buf = String::new();
+    buf.push_str(name);
+    buf.push('\x1f'); // record separator: name / args boundary
+    canonical_json(args, &mut buf);
+    format!("{:016x}", fnv1a64(buf.as_bytes()))
+}
+
 /// Append one event to a session file. If the event has no `ts` yet, it
 /// is stamped with the current timestamp.
 pub fn append_event(sessions_dir: &Path, id: &str, ev: &Event) -> std::io::Result<()> {
@@ -339,6 +427,7 @@ pub fn repair_unpaired_tool_calls(sessions_dir: &Path, id: &str) -> std::io::Res
                 name: String::new(),
                 ok: false,
                 output: "[recovered: tool call interrupted before result]".into(),
+                revertible: None,
             },
         )?;
         repaired += 1;
@@ -361,17 +450,25 @@ fn stamp_event(ev: &Event) -> Event {
             ts: Some(ts),
             text: text.clone(),
         },
-        Event::ToolCall { id, name, args, .. } => Event::ToolCall {
+        Event::ToolCall {
+            id,
+            name,
+            args,
+            revert_key,
+            ..
+        } => Event::ToolCall {
             ts: Some(ts),
             id: id.clone(),
             name: name.clone(),
             args: args.clone(),
+            revert_key: revert_key.clone(),
         },
         Event::ToolResult {
             id,
             name,
             ok,
             output,
+            revertible,
             ..
         } => Event::ToolResult {
             ts: Some(ts),
@@ -379,6 +476,7 @@ fn stamp_event(ev: &Event) -> Event {
             name: name.clone(),
             ok: *ok,
             output: output.clone(),
+            revertible: *revertible,
         },
         Event::TurnStart { .. } => Event::TurnStart { ts: Some(ts) },
         Event::TurnEnd { .. } => Event::TurnEnd { ts: Some(ts) },
@@ -769,6 +867,87 @@ pub fn import_session(sessions_dir: &Path, in_path: &Path) -> std::io::Result<St
 mod tests {
     use super::*;
 
+    // ---- Cordis P3: revert_key (per-call inverse identifier) ----
+
+    #[test]
+    fn revert_key_is_stable_and_canonicalized() {
+        // Same logical call → same key, even if the args object is built
+        // with a different key insertion order (canonical = key-sorted).
+        let a = serde_json::json!({"path": "/tmp/x", "mode": "read"});
+        let b = serde_json::json!({"mode": "read", "path": "/tmp/x"});
+        assert_eq!(revert_key("read_file", &a), revert_key("read_file", &b));
+
+        // Different args → different key.
+        let c = serde_json::json!({"path": "/tmp/y", "mode": "read"});
+        assert_ne!(revert_key("read_file", &a), revert_key("read_file", &c));
+
+        // Different tool name → different key (even identical args).
+        assert_ne!(revert_key("read_file", &a), revert_key("write_file", &a));
+
+        // A non-object arg (array) is canonicalized too.
+        let arr1 = serde_json::json!([1, 2, 3]);
+        assert_eq!(revert_key("t", &arr1), revert_key("t", &serde_json::json!([1, 2, 3])));
+        assert_ne!(revert_key("t", &arr1), revert_key("t", &serde_json::json!([1, 3, 2])));
+    }
+
+    #[test]
+    fn revert_key_is_hex_16() {
+        let k = revert_key("bash", &serde_json::json!({"command": "ls"}));
+        assert_eq!(k.len(), 16, "key is a 16-hex-char fingerprint: {k}");
+        assert!(k.chars().all(|c| c.is_ascii_hexdigit()), "key is hex: {k}");
+    }
+
+    #[test]
+    fn revert_key_matches_args_string_roundtrip() {
+        // The session log stores args as a *string* (call.arguments.to_string());
+        // the revert_key is computed from the Value. Parsing the stored string
+        // back to a Value must reproduce the same key — so a log replay can
+        // recompute the key from the persisted `args` field.
+        let v = serde_json::json!({"b": 2, "a": 1, "nested": {"y": 1, "x": 2}});
+        let stored = v.to_string();
+        let reparsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(revert_key("t", &v), revert_key("t", &reparsed));
+    }
+
+    #[test]
+    fn revertible_field_roundtrips_and_defaults() {
+        // A ToolResult with revertible=Some(true) serializes and deserializes
+        // with the flag intact.
+        let ev = Event::ToolResult {
+            ts: None,
+            id: "c".into(),
+            name: "improve_harness".into(),
+            ok: true,
+            output: "ok".into(),
+            revertible: Some(true),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert!(line.contains("\"revertible\":true"), "serialized: {line}");
+        let back: Event = serde_json::from_str(&line).unwrap();
+        if let Event::ToolResult { revertible, .. } = back {
+            assert_eq!(revertible, Some(true));
+        } else {
+            panic!("expected ToolResult");
+        }
+
+        // A legacy line (no revertible key) deserializes with None (default).
+        let legacy = r#"{"e":"tool_result","id":"c","name":"bash","ok":true,"output":"x"}"#;
+        let back: Event = serde_json::from_str(legacy).unwrap();
+        if let Event::ToolResult { revertible, .. } = back {
+            assert_eq!(revertible, None, "legacy line → revertible None");
+        } else {
+            panic!("expected ToolResult");
+        }
+        // A legacy ToolCall line (no revert_key) deserializes with "".
+        let legacy_call = r#"{"e":"tool_call","id":"c","name":"bash","args":"{}"}"#;
+        let back: Event = serde_json::from_str(legacy_call).unwrap();
+        if let Event::ToolCall { revert_key, .. } = back {
+            assert_eq!(revert_key, "");
+        } else {
+            panic!("expected ToolCall");
+        }
+    }
+
     #[test]
     fn roundtrip_append_and_load() {
         let dir = std::env::temp_dir().join(format!("sigil-session-test-{}", std::process::id()));
@@ -826,6 +1005,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 args: r#"{"path":"/tmp/a.txt"}"#.into(),
+                revert_key: "".into(),
             },
         )
         .unwrap();
@@ -838,6 +1018,7 @@ mod tests {
                 name: "read_file".into(),
                 ok: true,
                 output: "content-a".into(),
+                revertible: None,
             },
         )
         .unwrap();
@@ -897,12 +1078,14 @@ mod tests {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 args: r#"{"path":"/tmp/a.txt"}"#.into(),
+                revert_key: "".into(),
             },
             Event::ToolCall {
                 ts: None,
                 id: "call_2".into(),
                 name: "read_file".into(),
                 args: r#"{"path":"/tmp/b.txt"}"#.into(),
+                revert_key: "".into(),
             },
             Event::ToolResult {
                 ts: None,
@@ -910,6 +1093,7 @@ mod tests {
                 name: "read_file".into(),
                 ok: true,
                 output: "content-a".into(),
+                revertible: None,
             },
             Event::ToolResult {
                 ts: None,
@@ -917,6 +1101,7 @@ mod tests {
                 name: "read_file".into(),
                 ok: true,
                 output: "content-b".into(),
+                revertible: None,
             },
             Event::TurnEnd { ts: None },
         ];
@@ -1035,6 +1220,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "read_file".into(),
                 args: "{}".into(),
+                revert_key: "".into(),
             },
         )
         .unwrap();
@@ -1132,6 +1318,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "bash".into(),
                 args: "ls -la".into(),
+                revert_key: "".into(),
             },
         )
         .unwrap();
@@ -1144,6 +1331,7 @@ mod tests {
                 name: "bash".into(),
                 ok: true,
                 output: "total 8".into(),
+                revertible: None,
             },
         )
         .unwrap();
@@ -1224,6 +1412,7 @@ mod tests {
             id: "call_1".into(),
             name: "create_lua_tool".into(),
             args: "{\"name\":\"x\"}".into(),
+            revert_key: "".into(),
         };
         assert_eq!(ev.kind(), "tool_call");
         let s = ev.summary();

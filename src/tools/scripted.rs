@@ -107,14 +107,21 @@ pub struct LuaTool {
     description: String,
     /// JSON Schema for arguments (optional, from `--schema` first line comment).
     schema: Value,
+    /// Cordis P2: tool names this script declares it depends on, from a
+    /// `-- requires: name_a, name_b` first-line comment. Empty = no deps
+    /// (always ready). The registry resolves these at runtime and blocks
+    /// execution until the dependency is registered.
+    requires: Vec<String>,
 }
 
 impl LuaTool {
     pub fn new(name: &str, path: &Path, lua: Arc<Mutex<LuaRuntime>>) -> Result<Self> {
-        // Optional description + arg schema from the file's first-line
-        // comment: `-- desc: does X` and `-- schema: {...}`.
+        // Optional description + arg schema + dependencies from the file's
+        // first-line comments: `-- desc: does X`, `-- schema: {...}`, and
+        // `-- requires: name_a, name_b` (Cordis P2 dependency injection).
         let mut description = format!("Lua scripted tool: {name}");
         let mut schema = json!({ "type": "object", "properties": {} });
+        let mut requires: Vec<String> = Vec::new();
         if let Ok(src) = std::fs::read_to_string(path) {
             for line in src.lines().take(8) {
                 let line = line.trim_start();
@@ -132,6 +139,17 @@ impl LuaTool {
                     // substructures (e.g. `properties` that is not an
                     // object) so they never reach the LLM endpoint.
                     schema = sanitize_schema(v);
+                } else if let Some(rest) = line.strip_prefix("-- requires:") {
+                    // Comma-separated list of tool names. Whitespace and
+                    // empty tokens are dropped; unknown names are allowed
+                    // at parse time (they may register later, e.g. an MCP
+                    // tool from a server that connects after startup).
+                    requires = rest
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
                 }
             }
         }
@@ -141,6 +159,7 @@ impl LuaTool {
             lua,
             description,
             schema,
+            requires,
         })
     }
 }
@@ -157,6 +176,11 @@ impl Tool for LuaTool {
 
     fn parameters(&self) -> Value {
         self.schema.clone()
+    }
+
+    /// Cordis P2: dependencies declared via the `-- requires:` header.
+    fn dependencies(&self) -> Vec<String> {
+        self.requires.clone()
     }
 
     async fn run(&self, args: &Value) -> Result<ToolOutput> {

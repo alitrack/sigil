@@ -47,6 +47,20 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput>;
+    /// Cordis P2 (reactive coeffects → dependency injection): the names of
+    /// OTHER tools this tool depends on. The registry resolves them at
+    /// runtime and tracks a readiness flag; when a declared dependency
+    /// registers (or a blocker unregisters), `recompute_readiness`
+    /// reactively propagates the change to this tool and its dependents.
+    ///
+    /// Default is an empty list — a tool with no declared dependencies is
+    /// always ready, which is exactly today's behavior, so every existing
+    /// tool is unaffected. Only tools that genuinely depend on another
+    /// tool (e.g. a self-authored Lua tool that `-- requires:` a
+    /// still-pending MCP tool) override this.
+    fn dependencies(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Unified registry, keyed by advertised name.
@@ -58,6 +72,51 @@ pub struct ToolRegistry {
     /// agent loop after each turn. `HotOp` carries the operation
     /// (register / unregister) so create, update and delete all work.
     hot_queue: Arc<Mutex<Vec<HotOp>>>,
+    /// Cordis P2: shared, reactive dependency/readiness state. Recomputed
+    /// on every register/unregister; read by the `tool_dependencies`
+    /// introspection tool (which holds a clone of this same Arc) without
+    /// needing the registry that registered it.
+    deps: Arc<RwLock<DependencyState>>,
+}
+
+/// Cordis P2 (reactive coeffects): the dependency graph and per-tool
+/// readiness for one registry, kept in its own `Arc<RwLock<..>>` so both
+/// the registry and the introspection tool can share it without an
+/// ownership cycle.
+#[derive(Default, Clone, Debug)]
+pub struct DependencyState {
+    /// tool name -> the names it declared it depends on.
+    pub deps: HashMap<String, Vec<String>>,
+    /// tool name -> ready? (ready = every declared dependency is itself
+    /// registered AND ready, computed transitively).
+    pub ready: HashMap<String, bool>,
+    /// tool name -> declared dependencies that are not currently
+    /// registered (the actionable "what's missing" list).
+    pub missing: HashMap<String, Vec<String>>,
+}
+
+impl DependencyState {
+    /// All tools that directly depend on `name` (reverse edges), sorted
+    /// for deterministic output.
+    pub fn dependents_of(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .deps
+            .iter()
+            .filter(|(_, ds)| ds.iter().any(|d| d == name))
+            .map(|(t, _)| t.clone())
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// The tools whose readiness flipped after a register/unregister — the
+/// "reactive coeffect" notification. `became_ready`: a (transitive)
+/// dependency registered. `became_blocked`: one unregistered.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessDelta {
+    pub became_ready: Vec<String>,
+    pub became_blocked: Vec<String>,
 }
 
 /// A queued evolution operation on a scripted tool.
@@ -97,7 +156,7 @@ impl ToolRegistry {
         self.clone()
     }
 
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+    pub fn register(&mut self, tool: Arc<dyn Tool>) -> ReadinessDelta {
         let name = tool.name().to_string();
         // Re-registering the same name replaces the impl but must not
         // duplicate the order entry (a scripted tool may shadow a
@@ -107,13 +166,145 @@ impl ToolRegistry {
             self.order.push(name.clone());
         }
         self.tools.insert(name, tool);
+        // Cordis P2 (reactive coeffect): a registration can unblock tools
+        // that depend on it (directly or transitively) — recompute
+        // readiness and return the delta so the caller learns who just
+        // became ready. (Existing callers use this as a `;` statement and
+        // ignore the delta, so the return is backward-compatible.)
+        self.recompute_readiness()
     }
 
     /// Remove a tool by name (idempotent). Used by evolution tools to
-    /// delete scripted tools at runtime.
-    pub fn unregister(&mut self, name: &str) {
+    /// delete scripted tools at runtime. Returns the reactive delta (the
+    /// tools that just became blocked on its removal).
+    pub fn unregister(&mut self, name: &str) -> ReadinessDelta {
         self.tools.remove(name);
         self.order.retain(|n| n != name);
+        self.recompute_readiness()
+    }
+
+    /// Cordis P2: recompute the dependency graph + per-tool readiness from
+    /// the tools currently registered, and return the reactive delta — the
+    /// tools whose readiness just flipped. Called on every
+    /// register/unregister so the graph and readiness stay current, and so
+    /// the shared [`DependencyState`] is always fresh for the introspection
+    /// tool. Read-only on the registry's tool map; writes only the shared
+    /// deps state.
+    pub fn recompute_readiness(&self) -> ReadinessDelta {
+        // 1. Snapshot the old readiness so we can diff at the end.
+        let old = self.deps.read().unwrap().ready.clone();
+
+        // 2. Current declared deps for every registered tool.
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, tool) in &self.tools {
+            deps.insert(name.clone(), tool.dependencies());
+        }
+        let registered: std::collections::HashSet<&str> =
+            self.tools.keys().map(String::as_str).collect();
+
+        // 3. Transitively compute readiness with cycle detection. A tool is
+        //    ready iff every declared dependency is registered AND itself
+        //    ready. A dependency cycle can never be satisfied → not ready.
+        //    Memoized DFS: 0=unvisited, 1=in-progress, 2=done.
+        let mut ready: HashMap<String, bool> = HashMap::new();
+        let mut state: HashMap<String, u8> = HashMap::new();
+        for name in deps.keys() {
+            let _ = Self::dfs_ready(name, &deps, &registered, &mut ready, &mut state);
+        }
+
+        // 4. Direct "what's missing" per tool: declared deps not registered.
+        let mut missing: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, ds) in &deps {
+            let m: Vec<String> = ds
+                .iter()
+                .filter(|d| !registered.contains(d.as_str()))
+                .cloned()
+                .collect();
+            if !m.is_empty() {
+                missing.insert(name.clone(), m);
+            }
+        }
+
+        // 5. Diff readiness against the old snapshot → the reactive delta.
+        // A "became_ready" coeffect is a tool that was ALREADY registered
+        // (present in the old snapshot) and was blocked, and is now ready
+        // because a dependency arrived. A brand-new tool arriving is the
+        // registration event itself, not a reactive flip, so it is not
+        // reported. Symmetrically, "became_blocked" is a previously-ready
+        // tool that lost a dependency.
+        let mut delta = ReadinessDelta::default();
+        for (name, &r) in &ready {
+            if r && old.get(name) == Some(&false) {
+                delta.became_ready.push(name.clone());
+            }
+        }
+        for (name, &was_ready) in &old {
+            if !was_ready {
+                continue;
+            }
+            match ready.get(name) {
+                Some(&true) => {}            // still ready: no change
+                Some(&false) => {
+                    delta.became_blocked.push(name.clone());
+                }
+                None => {}                    // removed: gone, not "blocked"
+            }
+        }
+        delta.became_ready.sort();
+        delta.became_blocked.sort();
+
+        // 6. Publish the fresh state to the shared slot.
+        *self.deps.write().unwrap() = DependencyState {
+            deps,
+            ready,
+            missing,
+        };
+        delta
+    }
+
+    fn dfs_ready(
+        name: &str,
+        deps: &HashMap<String, Vec<String>>,
+        registered: &std::collections::HashSet<&str>,
+        ready: &mut HashMap<String, bool>,
+        state: &mut HashMap<String, u8>,
+    ) -> bool {
+        match state.get(name).copied().unwrap_or(0) {
+            2 => return ready[name],          // done: memoized
+            1 => return false,                 // cycle: unsatisfiable
+            _ => {}
+        }
+        state.insert(name.to_string(), 1);     // in-progress
+        let ds = deps.get(name);
+        let mut r = true;
+        if let Some(ds) = ds {
+            for d in ds {
+                if !registered.contains(d.as_str()) {
+                    r = false;
+                    break;
+                }
+                if !Self::dfs_ready(d, deps, registered, ready, state) {
+                    r = false;
+                    break;
+                }
+            }
+        }
+        state.insert(name.to_string(), 2);     // done
+        ready.insert(name.to_string(), r);
+        r
+    }
+
+    /// Shared handle to the reactive dependency state (for the
+    /// `tool_dependencies` introspection tool).
+    pub fn dependency_state(&self) -> Arc<RwLock<DependencyState>> {
+        self.deps.clone()
+    }
+
+    /// Test helper: a read guard over the live dependency state, bound to
+    /// `self`'s lifetime (avoids holding a guard on a dropped Arc).
+    #[cfg(test)]
+    pub fn read_deps(&self) -> std::sync::RwLockReadGuard<'_, DependencyState> {
+        self.deps.read().unwrap()
     }
 
     #[allow(dead_code)]
@@ -227,6 +418,14 @@ impl ToolRegistry {
         if let Some(dir) = scripted_dir {
             registry.register_scripted(dir);
         }
+        // Cordis P2: introspection — let the agent (or a human) inspect the
+        // live tool dependency graph + readiness. Holds a clone of the same
+        // shared DependencyState the registry rewrites on every
+        // register/unregister, so it always sees the current graph without
+        // borrowing the registry that holds it (no ownership cycle).
+        registry.register(Arc::new(ToolDependenciesTool {
+            state: registry.dependency_state(),
+        }));
         registry
     }
 
@@ -238,7 +437,9 @@ impl ToolRegistry {
                 continue;
             };
             match scripted::LuaTool::new(stem, &path, lua.clone()) {
-                Ok(tool) => self.register(Arc::new(tool)),
+                Ok(tool) => {
+                    self.register(Arc::new(tool));
+                }
                 Err(e) => eprintln!("warning: skipping scripted tool {stem}: {e}"),
             }
         }
@@ -293,9 +494,163 @@ impl ToolRegistry {
             .tools
             .get(&call.name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", call.name))?;
+        // Cordis P2 (reactive coeffects): if this tool declared dependencies
+        // and any of them is not currently registered, degrade gracefully
+        // instead of running against a missing service — the model sees
+        // exactly what is missing and can decide (wait, re-register, or
+        // drop the call). A tool with no declared dependencies is always
+        // ready, so this is a no-op for every pre-existing tool.
+        let deps = tool.dependencies();
+        let missing: Vec<&str> = deps
+            .iter()
+            .map(String::as_str)
+            .filter(|d| !self.tools.contains_key(*d))
+            .collect();
+        if !missing.is_empty() {
+            return Ok(format!(
+                "tool '{}' is not ready — its dependencies are not registered yet: {}. Register (or reconnect) the dependency first; this call was not executed.",
+                call.name,
+                missing.join(", ")
+            ));
+        }
         match tool.run(&call.arguments).await {
             Ok(out) => Ok(out.text),
             Err(e) => Ok(format!("error: {e}")),
+        }
+    }
+}
+
+/// Cordis P2: introspection tool that lets the agent (or a human) inspect
+/// the live tool dependency graph and per-tool readiness. Holds a clone of
+/// the registry's shared [`DependencyState`] (the same `Arc<RwLock<..>>`
+/// the registry rewrites on every register/unregister), so it always sees
+/// the current graph without borrowing the registry that registered it —
+/// no ownership cycle.
+///
+/// Actions: `graph` (every tool that declares dependencies, with its ready
+/// state and the specific deps still missing), `blocked` (only the tools
+/// that are not ready), `query` (pass `name`: one tool's deps, its
+/// readiness, its missing deps, and the reverse edges — which tools depend
+/// on it).
+pub struct ToolDependenciesTool {
+    state: Arc<RwLock<DependencyState>>,
+}
+
+#[async_trait]
+impl Tool for ToolDependenciesTool {
+    fn name(&self) -> &str {
+        "tool_dependencies"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect the live tool dependency graph (Cordis P2: reactive \
+         coeffects / dependency injection). Tools can declare what they \
+         depend on (e.g. a self-authored Lua tool's `-- requires:` line); \
+         the registry tracks which are ready (all deps registered) and \
+         which are blocked. Actions: 'graph' (every dependent tool + its \
+         readiness + what's missing), 'blocked' (only tools that are not \
+         ready), 'query' (pass 'name': one tool's deps, readiness, missing \
+         deps, and the reverse edges — which tools depend on it)."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["graph", "blocked", "query"],
+                    "description": "'graph' = full dependent list, 'blocked' = not-ready tools only, 'query' = one tool."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Required for action='query': the tool to inspect."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("graph");
+        let s = self.state.read().unwrap();
+        match action {
+            "blocked" => {
+                let mut blocked: Vec<&String> = s
+                    .ready
+                    .iter()
+                    .filter(|(_, r)| !**r)
+                    .map(|(t, _)| t)
+                    .collect();
+                blocked.sort();
+                if blocked.is_empty() {
+                    return Ok(ToolOutput {
+                        text: "all tools are ready (no declared dependencies are missing)".to_string(),
+                    });
+                }
+                let mut out = format!("{} tool(s) currently blocked on missing dependencies:\n", blocked.len());
+                for t in blocked {
+                    let miss = s.missing.get(t).cloned().unwrap_or_default();
+                    out.push_str(&format!("- {t}: missing {}\n", miss.join(", ")));
+                }
+                Ok(ToolOutput { text: out.trim_end().to_string() })
+            }
+            "query" => {
+                let Some(name) = args.get("name").and_then(Value::as_str) else {
+                    anyhow::bail!("tool_dependencies: action='query' requires 'name'");
+                };
+                let deps = s.deps.get(name).cloned().unwrap_or_default();
+                let ready = s.ready.get(name).copied();
+                let missing = s.missing.get(name).cloned().unwrap_or_default();
+                let dependents = s.dependents_of(name);
+                let mut out = String::new();
+                out.push_str(&format!("tool '{name}':\n"));
+                out.push_str(&format!(
+                    "- ready: {}\n",
+                    match ready {
+                        Some(true) => "yes",
+                        Some(false) => "NO",
+                        None => "unknown (not a dependent tool / not registered)",
+                    }
+                ));
+                out.push_str(&format!(
+                    "- depends on: {}\n",
+                    if deps.is_empty() { "(none)".to_string() } else { deps.join(", ") }
+                ));
+                if !missing.is_empty() {
+                    out.push_str(&format!("- missing deps: {}\n", missing.join(", ")));
+                }
+                out.push_str(&format!(
+                    "- depended on by: {}",
+                    if dependents.is_empty() { "(none)".to_string() } else { dependents.join(", ") }
+                ));
+                Ok(ToolOutput { text: out })
+            }
+            _ => {
+                // "graph" (default): list every tool that declares deps.
+                let mut names: Vec<&String> = s.deps.keys().filter(|t| {
+                    s.deps.get(*t).map(|ds| !ds.is_empty()).unwrap_or(false)
+                }).collect();
+                names.sort();
+                if names.is_empty() {
+                    return Ok(ToolOutput {
+                        text: "no tools declare dependencies (every tool is standalone/always-ready)".to_string(),
+                    });
+                }
+                let mut out = format!("{} tool(s) declare dependencies:\n", names.len());
+                for t in names {
+                    let ds = &s.deps[t];
+                    let ready = s.ready.get(t).copied().unwrap_or(false);
+                    let miss = s.missing.get(t).cloned().unwrap_or_default();
+                    out.push_str(&format!("- {t} [{}]: needs {}\n",
+                        if ready { "ready" } else { "BLOCKED" },
+                        ds.join(", ")));
+                    if !miss.is_empty() {
+                        out.push_str(&format!("    missing: {}\n", miss.join(", ")));
+                    }
+                }
+                Ok(ToolOutput { text: out.trim_end().to_string() })
+            }
         }
     }
 }
@@ -322,5 +677,191 @@ mod registry_tests {
         let specs = reg.specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "bash");
+    }
+
+    // ---- Cordis P2: reactive coeffects / dependency injection ----
+
+    /// A stub tool that can be told which other tools it depends on.
+    struct DepTool {
+        name: String,
+        deps: Vec<String>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for DepTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "dep stub"
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn run(&self, _args: &Value) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput { text: self.name.clone() })
+        }
+        fn dependencies(&self) -> Vec<String> {
+            self.deps.clone()
+        }
+    }
+    fn dep(name: &str, deps: Vec<&str>) -> std::sync::Arc<dyn Tool> {
+        std::sync::Arc::new(DepTool {
+            name: name.to_string(),
+            deps: deps.into_iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// A tool blocked on a missing dep is NOT ready, and reports the
+    /// missing dep; registering the dep makes it ready again (the reactive
+    /// coeffect).
+    #[test]
+    fn p2_register_unblocks_dependent_tool() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("a", vec![]));
+        reg.register(dep("b", vec!["a"]));
+        reg.register(dep("c", vec!["a", "missing"]));
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("a"), Some(&true));
+        assert_eq!(s.ready.get("b"), Some(&true));
+        assert_eq!(s.ready.get("c"), Some(&false), "c is blocked on 'missing'");
+        assert_eq!(
+            s.missing.get("c").cloned().unwrap_or_default(),
+            vec!["missing".to_string()]
+        );
+        // 'a' is directly depended on by both 'b' and 'c' (sorted).
+        assert_eq!(s.dependents_of("a"), vec!["b".to_string(), "c".to_string()]);
+        drop(s);
+        // Register the missing dep -> 'c' becomes ready (reactive).
+        reg.register(dep("missing", vec![]));
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("c"), Some(&true), "c is ready once its dep registers");
+    }
+
+    /// Unregistering a dependency blocks its dependents reactively.
+    #[test]
+    fn p2_unregister_blocks_dependent_tool() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("a", vec![]));
+        reg.register(dep("b", vec!["a"]));
+        assert_eq!(reg.dependency_state().read().unwrap().ready.get("b"), Some(&true));
+        reg.unregister("a");
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("b"), Some(&false), "b is blocked once 'a' unregisters");
+        assert_eq!(s.missing.get("b").cloned().unwrap_or_default(), vec!["a".to_string()]);
+    }
+
+    /// Readiness propagates transitively (b depends on a; c depends on b):
+    /// missing 'a' blocks both 'b' and 'c'; adding 'a' readies all.
+    #[test]
+    fn p2_transitive_readiness() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("b", vec!["a"]));
+        reg.register(dep("c", vec!["b"]));
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("b"), Some(&false));
+        assert_eq!(s.ready.get("c"), Some(&false), "c is blocked transitively via b");
+        drop(s);
+        reg.register(dep("a", vec![]));
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("b"), Some(&true));
+        assert_eq!(s.ready.get("c"), Some(&true));
+    }
+
+    /// A dependency cycle can never be satisfied -> both tools are blocked
+    /// (no infinite loop during recompute).
+    #[test]
+    fn p2_cycle_is_never_ready() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("x", vec!["y"]));
+        reg.register(dep("y", vec!["x"]));
+        let s = reg.read_deps();
+        assert_eq!(s.ready.get("x"), Some(&false));
+        assert_eq!(s.ready.get("y"), Some(&false));
+    }
+
+    /// The recompute delta reports exactly which tools became ready.
+    #[test]
+    fn p2_delta_reports_became_ready() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("b", vec!["a"]));
+        let before = reg.recompute_readiness();
+        assert!(before.became_ready.is_empty(), "no flip on a pure recompute");
+        let d = reg.register(dep("a", vec![]));
+        assert_eq!(d.became_ready, vec!["b".to_string()]);
+        // Re-registering an already-ready dep produces no new flip.
+        let d2 = reg.register(dep("a", vec![]));
+        assert!(d2.became_ready.is_empty());
+    }
+
+    /// `execute` degrades gracefully for a tool blocked on a missing dep
+    /// (the stub's `run` is never reached); a ready tool executes normally.
+    #[tokio::test]
+    async fn p2_execute_gates_blocked_tool() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("a", vec![]));
+        reg.register(dep("b", vec!["a"]));
+        reg.register(dep("c", vec!["missing"]));
+        let call = |name: &str| crate::llm::ToolCall {
+            id: "1".to_string(),
+            name: name.to_string(),
+            arguments: json!({}),
+        };
+        let out = reg.execute(&call("b")).await.unwrap();
+        assert_eq!(out, "b", "ready tool runs normally");
+        let out = reg.execute(&call("c")).await.unwrap();
+        assert!(out.contains("not ready"), "blocked tool degrades: {out}");
+        assert!(out.contains("missing"), "message names the missing dep: {out}");
+        assert!(!out.eq("c"), "the blocked tool's body did not run");
+    }
+
+    /// A Lua tool's `-- requires:` header becomes its declared
+    /// dependencies (the real Cordis `inject` landing point).
+    #[test]
+    fn p2_lua_requires_header_parses() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-p2-lua-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("needs_tool.lua");
+        std::fs::write(
+            &path,
+            "-- desc: needs two tools\n-- requires: other_tool, another_tool\nreturn 0\n",
+        )
+        .unwrap();
+        let lua = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::lua::LuaRuntime::new().expect("lua init"),
+        ));
+        let tool = scripted::LuaTool::new("needs_tool", &path, lua).unwrap();
+        let mut deps = tool.dependencies();
+        deps.sort();
+        assert_eq!(deps, vec!["another_tool".to_string(), "other_tool".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The introspection tool reads the live shared dependency state.
+    #[tokio::test]
+    async fn p2_tool_dependencies_introspection() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dep("a", vec![]));
+        reg.register(dep("b", vec!["a"]));
+        reg.register(dep("c", vec!["missing"]));
+        let tdeps = ToolDependenciesTool {
+            state: reg.dependency_state(),
+        };
+        let graph = tdeps.run(&json!({ "action": "graph" })).await.unwrap().text;
+        assert!(graph.contains("b [ready]: needs a"), "graph shows b: {graph}");
+        assert!(graph.contains("c [BLOCKED]: needs missing"), "graph shows c: {graph}");
+        assert!(graph.contains("missing: missing"), "graph names c's missing dep");
+        let blocked = tdeps.run(&json!({ "action": "blocked" })).await.unwrap().text;
+        assert!(blocked.contains("c") && !blocked.contains("b ["));
+        let query = tdeps
+            .run(&json!({ "action": "query", "name": "a" }))
+            .await
+            .unwrap()
+            .text;
+        assert!(query.contains("depended on by: b"), "reverse edge: {query}");
     }
 }

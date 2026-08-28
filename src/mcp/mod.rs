@@ -100,14 +100,34 @@ impl McpClient {
     ) -> Result<(McpClient, Vec<McpToolInfo>)> {
         // env_clear: never leak the parent's secrets to a third-party
         // MCP server (same policy as Hermes' native client).
-        let mut child = Command::new(command)
-            .args(args)
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", std::env::var("HOME").unwrap_or_default())
+        //
+        // Windows: WSAEDISTRO (10106) — any child that does Winsock I/O
+        // (python3, node, curl, ...) fails to initialize Winsock when
+        // SystemRoot is missing from its environment; .NET resolves it
+        // another way so Rust-std children masked the bug. Pass through
+        // the public system-path vars (not secrets).
+        let mut child = Command::new(command);
+        let child = child.args(args).env_clear();
+        let child = child.env("PATH", std::env::var("PATH").unwrap_or_default());
+        let child = child.env("HOME", std::env::var("HOME").unwrap_or_default());
+        #[cfg(windows)]
+        {
+            // WSAEDISTRO (10106) — children doing Winsock I/O fail to init
+            // Winsock without SystemRoot (python3/node/curl); .NET hides the
+            // bug by resolving it separately, so only non-.NET MCP servers
+            // hit it. Pass public system-path vars (not secrets).
+            let sysroot = std::env::var("SystemRoot").unwrap_or_default();
+            let windir = std::env::var("WINDIR").unwrap_or_default();
+            let temp = std::env::var("TEMP").unwrap_or_default();
+            let child = child.env("SystemRoot", sysroot);
+            let child = child.env("WINDIR", windir);
+            let child = child.env("TEMP", temp);
+        }
+        let child = child
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = child
             .spawn()
             .with_context(|| format!("spawning MCP server '{name}' ({command})"))?;
 

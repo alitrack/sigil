@@ -92,3 +92,10 @@ safety > compliance > completeness > correctness > efficiency > exploration
 2. **验证**: 重跑 b1（反问场景）——通过判据: 不再反问，直接落地执行。
 3. **扩展**: demand 权重做成可配置表（`config.toml`），把 selfcheck 模板的检查项逐步搬进 decider（文件名核对 → on_done）。
 4. **验收**: 三弱点场景（b1 反问 / b2 seed 口径 / b3 文件名汇总）各重跑一次，全部闭环即算落地；对照 [references/benchmark-vs-cc-hermes.md](references/benchmark-vs-cc-hermes.md) 记录对比。
+
+### 2026-09-01 实测补充（三连跑验证，见 sigil skill"NPP 工作流搭建实测"）
+
+- **纪律注入已验证有效**: 任务文本注入 v1 优先级规则后，NPP 画布搭建一次闭环（无反问/无源码考古/受阻走脚本兜底/输出与独立复算字节级一致）。
+- **新规则: 探索上限触发兜底**——实测暴露模型会无限换关键词搜节点（"找双列分组节点"搜了 N 轮）。decider 需加: **探索类工具（search/list/scan）连续 N 次无新发现（N=5）→ 强制降级 exploration demand，切入脚本兜底通道**。这是 run1/run2 失败的根因之一。
+- **运维参数: max-steps ≥ 40**——NPP 工作流搭建任务的探索阶段就要 20–30 步，`--max-steps 15` 必废（进程 exit 0 但无交付）。
+- **已知 sigil UX bug（3/3 复现）**: 步数耗尽时最后一步含 tool_calls 的回复被原样当最终答案输出。**判定交付以文件系统为准，不信 stdout 报告**。

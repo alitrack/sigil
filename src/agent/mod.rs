@@ -651,6 +651,25 @@ pub async fn run_messages(
                     ),
                 };
             accumulate_usage(&mut tokens, summary_tokens);
+            // P0 hook (emit observation): observe the step-limit wrap-up
+            // too — step-budget exhaustion is exactly when delivery audit
+            // (on_done) matters most (failures land here, not on the
+            // tool-less final-answer path).
+            if let Some(hooks) = &config.hooks
+                && let Err(e) = hooks
+                    .dispatch(
+                        "on_done",
+                        crate::hooks::HookMode::Emit,
+                        serde_json::json!({
+                            "output": summary.trim(),
+                            "steps": step,
+                            "model": config.model,
+                        }),
+                    )
+                    .await
+            {
+                eprintln!("warning: on_done hook failed: {e:#}");
+            }
             return Ok(RunResult {
                 output: summary,
                 steps: step,

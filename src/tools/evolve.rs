@@ -217,9 +217,7 @@ fn refresh_prompt_state(
     let Ok(mut s) = state.write() else {
         return;
     };
-    if let Ok(merged) =
-        crate::harness::Harness::load_with_local(Some(harness_dir), local_dir)
-    {
+    if let Ok(merged) = crate::harness::Harness::load_with_local(Some(harness_dir), local_dir) {
         s.system_prompt = merged.system_prompt;
         s.skills = merged.skills;
     }
@@ -899,16 +897,14 @@ impl Tool for RevertEffectsTool {
             .and_then(Value::as_str)
             .unwrap_or_default();
         match action {
-            "last" => {
-                match self.tracker.rollback_one()? {
-                    Some(label) => Ok(ToolOutput {
-                        text: format!("reverted: {label}"),
-                    }),
-                    None => Ok(ToolOutput {
-                        text: "nothing to revert — no pending improve_harness writes".into(),
-                    }),
-                }
-            }
+            "last" => match self.tracker.rollback_one()? {
+                Some(label) => Ok(ToolOutput {
+                    text: format!("reverted: {label}"),
+                }),
+                None => Ok(ToolOutput {
+                    text: "nothing to revert — no pending improve_harness writes".into(),
+                }),
+            },
             "all" => {
                 let before = self.tracker.pending();
                 if before == 0 {
@@ -925,7 +921,9 @@ impl Tool for RevertEffectsTool {
                     ),
                 })
             }
-            other => anyhow::bail!("revert_effects: unknown action '{other}' (expected 'last' or 'all')"),
+            other => {
+                anyhow::bail!("revert_effects: unknown action '{other}' (expected 'last' or 'all')")
+            }
         }
     }
 }

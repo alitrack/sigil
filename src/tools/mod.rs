@@ -254,11 +254,11 @@ impl ToolRegistry {
                 continue;
             }
             match ready.get(name) {
-                Some(&true) => {}            // still ready: no change
+                Some(&true) => {} // still ready: no change
                 Some(&false) => {
                     delta.became_blocked.push(name.clone());
                 }
-                None => {}                    // removed: gone, not "blocked"
+                None => {} // removed: gone, not "blocked"
             }
         }
         delta.became_ready.sort();
@@ -281,11 +281,11 @@ impl ToolRegistry {
         state: &mut HashMap<String, u8>,
     ) -> bool {
         match state.get(name).copied().unwrap_or(0) {
-            2 => return ready[name],          // done: memoized
-            1 => return false,                 // cycle: unsatisfiable
+            2 => return ready[name], // done: memoized
+            1 => return false,       // cycle: unsatisfiable
             _ => {}
         }
-        state.insert(name.to_string(), 1);     // in-progress
+        state.insert(name.to_string(), 1); // in-progress
         let ds = deps.get(name);
         let mut r = true;
         if let Some(ds) = ds {
@@ -300,7 +300,7 @@ impl ToolRegistry {
                 }
             }
         }
-        state.insert(name.to_string(), 2);     // done
+        state.insert(name.to_string(), 2); // done
         ready.insert(name.to_string(), r);
         r
     }
@@ -394,9 +394,7 @@ impl ToolRegistry {
         // Runtime rollback of the above: undo the most recent improve_harness
         // write(s) in-process, LIFO. The model gets a one-call "undo my last
         // harness edit" without reaching for git or the on-disk archive.
-        registry.register(Arc::new(evolve::RevertEffectsTool {
-            tracker: effects,
-        }));
+        registry.register(Arc::new(evolve::RevertEffectsTool { tracker: effects }));
         // Persistent goals: the model declares long-running objectives;
         // active goals are injected into the system context each turn.
         // (The same `Arc` is handed to the agent loop, so tool writes
@@ -590,7 +588,10 @@ impl Tool for ToolDependenciesTool {
     }
 
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("graph");
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("graph");
         let s = self.state.read().unwrap();
         match action {
             "blocked" => {
@@ -603,15 +604,21 @@ impl Tool for ToolDependenciesTool {
                 blocked.sort();
                 if blocked.is_empty() {
                     return Ok(ToolOutput {
-                        text: "all tools are ready (no declared dependencies are missing)".to_string(),
+                        text: "all tools are ready (no declared dependencies are missing)"
+                            .to_string(),
                     });
                 }
-                let mut out = format!("{} tool(s) currently blocked on missing dependencies:\n", blocked.len());
+                let mut out = format!(
+                    "{} tool(s) currently blocked on missing dependencies:\n",
+                    blocked.len()
+                );
                 for t in blocked {
                     let miss = s.missing.get(t).cloned().unwrap_or_default();
                     out.push_str(&format!("- {t}: missing {}\n", miss.join(", ")));
                 }
-                Ok(ToolOutput { text: out.trim_end().to_string() })
+                Ok(ToolOutput {
+                    text: out.trim_end().to_string(),
+                })
             }
             "query" => {
                 let Some(name) = args.get("name").and_then(Value::as_str) else {
@@ -633,26 +640,38 @@ impl Tool for ToolDependenciesTool {
                 ));
                 out.push_str(&format!(
                     "- depends on: {}\n",
-                    if deps.is_empty() { "(none)".to_string() } else { deps.join(", ") }
+                    if deps.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        deps.join(", ")
+                    }
                 ));
                 if !missing.is_empty() {
                     out.push_str(&format!("- missing deps: {}\n", missing.join(", ")));
                 }
                 out.push_str(&format!(
                     "- depended on by: {}",
-                    if dependents.is_empty() { "(none)".to_string() } else { dependents.join(", ") }
+                    if dependents.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        dependents.join(", ")
+                    }
                 ));
                 Ok(ToolOutput { text: out })
             }
             _ => {
                 // "graph" (default): list every tool that declares deps.
-                let mut names: Vec<&String> = s.deps.keys().filter(|t| {
-                    s.deps.get(*t).map(|ds| !ds.is_empty()).unwrap_or(false)
-                }).collect();
+                let mut names: Vec<&String> = s
+                    .deps
+                    .keys()
+                    .filter(|t| s.deps.get(*t).map(|ds| !ds.is_empty()).unwrap_or(false))
+                    .collect();
                 names.sort();
                 if names.is_empty() {
                     return Ok(ToolOutput {
-                        text: "no tools declare dependencies (every tool is standalone/always-ready)".to_string(),
+                        text:
+                            "no tools declare dependencies (every tool is standalone/always-ready)"
+                                .to_string(),
                     });
                 }
                 let mut out = format!("{} tool(s) declare dependencies:\n", names.len());
@@ -660,14 +679,18 @@ impl Tool for ToolDependenciesTool {
                     let ds = &s.deps[t];
                     let ready = s.ready.get(t).copied().unwrap_or(false);
                     let miss = s.missing.get(t).cloned().unwrap_or_default();
-                    out.push_str(&format!("- {t} [{}]: needs {}\n",
+                    out.push_str(&format!(
+                        "- {t} [{}]: needs {}\n",
                         if ready { "ready" } else { "BLOCKED" },
-                        ds.join(", ")));
+                        ds.join(", ")
+                    ));
                     if !miss.is_empty() {
                         out.push_str(&format!("    missing: {}\n", miss.join(", ")));
                     }
                 }
-                Ok(ToolOutput { text: out.trim_end().to_string() })
+                Ok(ToolOutput {
+                    text: out.trim_end().to_string(),
+                })
             }
         }
     }
@@ -716,7 +739,9 @@ mod registry_tests {
             json!({ "type": "object", "properties": {} })
         }
         async fn run(&self, _args: &Value) -> anyhow::Result<ToolOutput> {
-            Ok(ToolOutput { text: self.name.clone() })
+            Ok(ToolOutput {
+                text: self.name.clone(),
+            })
         }
         fn dependencies(&self) -> Vec<String> {
             self.deps.clone()
@@ -752,7 +777,11 @@ mod registry_tests {
         // Register the missing dep -> 'c' becomes ready (reactive).
         reg.register(dep("missing", vec![]));
         let s = reg.read_deps();
-        assert_eq!(s.ready.get("c"), Some(&true), "c is ready once its dep registers");
+        assert_eq!(
+            s.ready.get("c"),
+            Some(&true),
+            "c is ready once its dep registers"
+        );
     }
 
     /// Unregistering a dependency blocks its dependents reactively.
@@ -761,11 +790,21 @@ mod registry_tests {
         let mut reg = ToolRegistry::new();
         reg.register(dep("a", vec![]));
         reg.register(dep("b", vec!["a"]));
-        assert_eq!(reg.dependency_state().read().unwrap().ready.get("b"), Some(&true));
+        assert_eq!(
+            reg.dependency_state().read().unwrap().ready.get("b"),
+            Some(&true)
+        );
         reg.unregister("a");
         let s = reg.read_deps();
-        assert_eq!(s.ready.get("b"), Some(&false), "b is blocked once 'a' unregisters");
-        assert_eq!(s.missing.get("b").cloned().unwrap_or_default(), vec!["a".to_string()]);
+        assert_eq!(
+            s.ready.get("b"),
+            Some(&false),
+            "b is blocked once 'a' unregisters"
+        );
+        assert_eq!(
+            s.missing.get("b").cloned().unwrap_or_default(),
+            vec!["a".to_string()]
+        );
     }
 
     /// Readiness propagates transitively (b depends on a; c depends on b):
@@ -777,7 +816,11 @@ mod registry_tests {
         reg.register(dep("c", vec!["b"]));
         let s = reg.read_deps();
         assert_eq!(s.ready.get("b"), Some(&false));
-        assert_eq!(s.ready.get("c"), Some(&false), "c is blocked transitively via b");
+        assert_eq!(
+            s.ready.get("c"),
+            Some(&false),
+            "c is blocked transitively via b"
+        );
         drop(s);
         reg.register(dep("a", vec![]));
         let s = reg.read_deps();
@@ -803,7 +846,10 @@ mod registry_tests {
         let mut reg = ToolRegistry::new();
         reg.register(dep("b", vec!["a"]));
         let before = reg.recompute_readiness();
-        assert!(before.became_ready.is_empty(), "no flip on a pure recompute");
+        assert!(
+            before.became_ready.is_empty(),
+            "no flip on a pure recompute"
+        );
         let d = reg.register(dep("a", vec![]));
         assert_eq!(d.became_ready, vec!["b".to_string()]);
         // Re-registering an already-ready dep produces no new flip.
@@ -828,7 +874,10 @@ mod registry_tests {
         assert_eq!(out, "b", "ready tool runs normally");
         let out = reg.execute(&call("c")).await.unwrap();
         assert!(out.contains("not ready"), "blocked tool degrades: {out}");
-        assert!(out.contains("missing"), "message names the missing dep: {out}");
+        assert!(
+            out.contains("missing"),
+            "message names the missing dep: {out}"
+        );
         assert!(!out.eq("c"), "the blocked tool's body did not run");
     }
 
@@ -855,7 +904,10 @@ mod registry_tests {
         let tool = scripted::LuaTool::new("needs_tool", &path, lua).unwrap();
         let mut deps = tool.dependencies();
         deps.sort();
-        assert_eq!(deps, vec!["another_tool".to_string(), "other_tool".to_string()]);
+        assert_eq!(
+            deps,
+            vec!["another_tool".to_string(), "other_tool".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -870,10 +922,23 @@ mod registry_tests {
             state: reg.dependency_state(),
         };
         let graph = tdeps.run(&json!({ "action": "graph" })).await.unwrap().text;
-        assert!(graph.contains("b [ready]: needs a"), "graph shows b: {graph}");
-        assert!(graph.contains("c [BLOCKED]: needs missing"), "graph shows c: {graph}");
-        assert!(graph.contains("missing: missing"), "graph names c's missing dep");
-        let blocked = tdeps.run(&json!({ "action": "blocked" })).await.unwrap().text;
+        assert!(
+            graph.contains("b [ready]: needs a"),
+            "graph shows b: {graph}"
+        );
+        assert!(
+            graph.contains("c [BLOCKED]: needs missing"),
+            "graph shows c: {graph}"
+        );
+        assert!(
+            graph.contains("missing: missing"),
+            "graph names c's missing dep"
+        );
+        let blocked = tdeps
+            .run(&json!({ "action": "blocked" }))
+            .await
+            .unwrap()
+            .text;
         assert!(blocked.contains("c") && !blocked.contains("b ["));
         let query = tdeps
             .run(&json!({ "action": "query", "name": "a" }))
@@ -913,9 +978,17 @@ mod registry_tests {
         // A plain tool that never opts into P1 → None.
         reg.register(dep("plain", vec![]));
 
-        assert_eq!(reg.revertible_of("improve_harness"), Some(true), "wired → Some(true)");
+        assert_eq!(
+            reg.revertible_of("improve_harness"),
+            Some(true),
+            "wired → Some(true)"
+        );
         assert_eq!(reg.revertible_of("plain"), None, "not in P1 → None");
-        assert_eq!(reg.revertible_of("no_such_tool"), None, "unregistered → None");
+        assert_eq!(
+            reg.revertible_of("no_such_tool"),
+            None,
+            "unregistered → None"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

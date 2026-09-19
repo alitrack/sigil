@@ -886,8 +886,14 @@ mod tests {
 
         // A non-object arg (array) is canonicalized too.
         let arr1 = serde_json::json!([1, 2, 3]);
-        assert_eq!(revert_key("t", &arr1), revert_key("t", &serde_json::json!([1, 2, 3])));
-        assert_ne!(revert_key("t", &arr1), revert_key("t", &serde_json::json!([1, 3, 2])));
+        assert_eq!(
+            revert_key("t", &arr1),
+            revert_key("t", &serde_json::json!([1, 2, 3]))
+        );
+        assert_ne!(
+            revert_key("t", &arr1),
+            revert_key("t", &serde_json::json!([1, 3, 2]))
+        );
     }
 
     #[test]

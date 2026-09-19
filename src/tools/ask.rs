@@ -57,7 +57,10 @@ impl Tool for AskTool {
             .map_err(|e| anyhow::anyhow!("ask: bad arguments: {e}"))?;
         // Normalize: confirm/text never carry options (mirrors the NPP
         // contract "ask_text question must not include options").
-        if matches!(req.kind, crate::agent::QuestionKind::Confirm | crate::agent::QuestionKind::Text) {
+        if matches!(
+            req.kind,
+            crate::agent::QuestionKind::Confirm | crate::agent::QuestionKind::Text
+        ) {
             req.options.clear();
         }
         let answer = (self.cb)(req).await?;
@@ -73,9 +76,8 @@ mod tests {
 
     fn tool() -> AskTool {
         // A callback that captures nothing and always answers "ok".
-        let cb: Arc<AskCb> = Arc::new(|_req| {
-            Box::pin(async { Ok(crate::agent::AskAnswer { text: "ok".into() }) })
-        });
+        let cb: Arc<AskCb> =
+            Arc::new(|_req| Box::pin(async { Ok(crate::agent::AskAnswer { text: "ok".into() }) }));
         AskTool { cb }
     }
 

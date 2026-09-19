@@ -718,11 +718,16 @@ async fn revertible_edit_prompt_roundtrip() {
     assert!(changed.contains("revised prompt v2"));
 
     // Runtime rollback restores the original.
-    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let revert = RevertEffectsTool {
+        tracker: tracker.clone(),
+    };
     let r = revert.run(&json!({ "action": "all" })).await.unwrap();
     assert!(r.text.contains("reverted 1 effect"), "got: {}", r.text);
     let restored = std::fs::read_to_string(harness.join("system_prompt.md")).unwrap();
-    assert_eq!(restored, original, "revert must restore the exact previous prompt");
+    assert_eq!(
+        restored, original,
+        "revert must restore the exact previous prompt"
+    );
     assert_eq!(tracker.pending(), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -756,7 +761,9 @@ async fn revertible_add_skill_roundtrip() {
     assert!(skill_path.exists());
     assert_eq!(tracker.pending(), 1);
 
-    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let revert = RevertEffectsTool {
+        tracker: tracker.clone(),
+    };
     let r = revert.run(&json!({ "action": "last" })).await.unwrap();
     assert!(r.text.contains("add_skill"), "got: {}", r.text);
     assert!(!skill_path.exists(), "revert of a new skill deletes it");
@@ -796,7 +803,9 @@ async fn revertible_edit_hook_roundtrip() {
     assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), after);
     assert_eq!(tracker.pending(), 1);
 
-    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let revert = RevertEffectsTool {
+        tracker: tracker.clone(),
+    };
     revert.run(&json!({ "action": "last" })).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&hook_path).unwrap(),
@@ -838,16 +847,23 @@ async fn revertible_lifo_multi_write() {
     tool.run(&write("prompt v2")).await.unwrap();
     tool.run(&write("prompt v3")).await.unwrap();
     assert_eq!(tracker.pending(), 3);
-    assert!(std::fs::read_to_string(harness.join("system_prompt.md"))
-        .unwrap()
-        .starts_with("prompt v3"));
+    assert!(
+        std::fs::read_to_string(harness.join("system_prompt.md"))
+            .unwrap()
+            .starts_with("prompt v3")
+    );
 
-    let revert = RevertEffectsTool { tracker: tracker.clone() };
+    let revert = RevertEffectsTool {
+        tracker: tracker.clone(),
+    };
     // Undo the single newest (v3 -> v2).
     revert.run(&json!({ "action": "last" })).await.unwrap();
-    assert!(std::fs::read_to_string(harness.join("system_prompt.md"))
-        .unwrap()
-        .starts_with("prompt v2"), "LIFO: only the newest is undone");
+    assert!(
+        std::fs::read_to_string(harness.join("system_prompt.md"))
+            .unwrap()
+            .starts_with("prompt v2"),
+        "LIFO: only the newest is undone"
+    );
     assert_eq!(tracker.pending(), 2);
     // Undo the remaining two (v2 -> v1 -> v0).
     revert.run(&json!({ "action": "all" })).await.unwrap();

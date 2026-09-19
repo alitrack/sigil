@@ -448,10 +448,7 @@ impl DelegateTool {
     /// A copy of this tool wired to a progress reporter — used by the
     /// ACP server so a live delegate batch streams sub-agent lifecycle
     /// events to the host (brainflow decision canvas).
-    pub fn with_progress(
-        self,
-        progress: Arc<dyn Fn(DelegateProgress) + Send + Sync>,
-    ) -> Self {
+    pub fn with_progress(self, progress: Arc<dyn Fn(DelegateProgress) + Send + Sync>) -> Self {
         Self {
             progress: Some(progress),
             ..self
@@ -727,10 +724,8 @@ async fn wait_for_delegates(
             if reported.contains(id.as_str()) {
                 continue;
             }
-            if let (Some(st), Some(cb)) = (
-                states.iter().find(|s| &s.id == id),
-                progress,
-            ) && st.status != DelegateStatus::Running
+            if let (Some(st), Some(cb)) = (states.iter().find(|s| &s.id == id), progress)
+                && st.status != DelegateStatus::Running
             {
                 cb(DelegateProgress {
                     id: id.clone(),
@@ -963,8 +958,7 @@ impl Tool for DelegateTool {
                 if let Some(cb) = &self.progress {
                     cb(DelegateProgress {
                         id: id.clone(),
-                        name: spawn_name(args)?
-                            .unwrap_or_else(|| task_for_progress.clone()),
+                        name: spawn_name(args)?.unwrap_or_else(|| task_for_progress.clone()),
                         status: "running",
                         step: 1,
                         total: 1,
@@ -1057,7 +1051,14 @@ impl Tool for DelegateTool {
                     ids.push(id.clone());
                     step_of.push((id, step, format!("pending-{step}")));
                 }
-                let text = wait_for_delegates(&self.delegates, &ids, &step_of, timeout, self.progress.as_deref()).await?;
+                let text = wait_for_delegates(
+                    &self.delegates,
+                    &ids,
+                    &step_of,
+                    timeout,
+                    self.progress.as_deref(),
+                )
+                .await?;
                 Ok(ToolOutput { text })
             }
             "resume" => {
@@ -1470,9 +1471,14 @@ mod tests {
             .await;
             ids.push(id);
         }
-        let step_of: Vec<(String, usize, String)> =
-            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
-        let text = wait_for_delegates(&reg, &ids, &step_of, 2, None).await.unwrap();
+        let step_of: Vec<(String, usize, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i + 1, format!("task-{i}")))
+            .collect();
+        let text = wait_for_delegates(&reg, &ids, &step_of, 2, None)
+            .await
+            .unwrap();
         assert!(text.contains("delegate batch (2 tasks)"), "got: {text}");
         assert!(
             text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
@@ -1517,17 +1523,27 @@ mod tests {
                 .unwrap()
                 .push(format!("{}:{}:{}", p.id, p.status, p.step));
         };
-        let step_of: Vec<(String, usize, String)> =
-            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
-        let text =
-            wait_for_delegates(&reg, &ids, &step_of, 2, Some(&cb)).await.unwrap();
+        let step_of: Vec<(String, usize, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i + 1, format!("task-{i}")))
+            .collect();
+        let text = wait_for_delegates(&reg, &ids, &step_of, 2, Some(&cb))
+            .await
+            .unwrap();
         assert!(text.contains("delegate batch (2 tasks)"), "got: {text}");
         let got = events.lock().unwrap().clone();
         // Both already terminal on the first poll → exactly one event each,
         // with correct step ordinals and terminal statuses.
         assert_eq!(got.len(), 2, "events: {got:?}");
-        assert!(got.iter().any(|e| e == "d00000:completed:1"), "events: {got:?}");
-        assert!(got.iter().any(|e| e == "d00001:completed:2"), "events: {got:?}");
+        assert!(
+            got.iter().any(|e| e == "d00000:completed:1"),
+            "events: {got:?}"
+        );
+        assert!(
+            got.iter().any(|e| e == "d00001:completed:2"),
+            "events: {got:?}"
+        );
     }
 
     #[tokio::test]
@@ -1564,11 +1580,16 @@ mod tests {
             .await;
             ids.push(id);
         }
-        let step_of: Vec<(String, usize, String)> =
-            ids.iter().enumerate().map(|(i, id)| (id.clone(), i + 1, format!("task-{i}"))).collect();
+        let step_of: Vec<(String, usize, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i + 1, format!("task-{i}")))
+            .collect();
         // 1s timeout: must return promptly with the partial aggregate,
         // not hang.
-        let text = wait_for_delegates(&reg, &ids, &step_of, 1, None).await.unwrap();
+        let text = wait_for_delegates(&reg, &ids, &step_of, 1, None)
+            .await
+            .unwrap();
         assert!(
             text.contains("d00000 [completed] task-0 (1 steps) — answer-0"),
             "got: {text}"

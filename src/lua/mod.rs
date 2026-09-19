@@ -288,11 +288,13 @@ mod tests {
         let p = dir.join("veto.lua");
         std::fs::write(&p, "return function(ctx) return ctx.block == true end").unwrap();
         assert_eq!(
-            rt.run_file_value(p.to_str().unwrap(), r#"{"block":true}"#).unwrap(),
+            rt.run_file_value(p.to_str().unwrap(), r#"{"block":true}"#)
+                .unwrap(),
             serde_json::Value::Bool(true)
         );
         assert_eq!(
-            rt.run_file_value(p.to_str().unwrap(), r#"{"block":false}"#).unwrap(),
+            rt.run_file_value(p.to_str().unwrap(), r#"{"block":false}"#)
+                .unwrap(),
             serde_json::Value::Bool(false)
         );
 
@@ -305,10 +307,11 @@ mod tests {
 
         let p = dir.join("nil.lua");
         std::fs::write(&p, "return function() return nil end").unwrap();
-        assert!(rt
-            .run_file_value(p.to_str().unwrap(), "{}")
-            .unwrap()
-            .is_null());
+        assert!(
+            rt.run_file_value(p.to_str().unwrap(), "{}")
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]

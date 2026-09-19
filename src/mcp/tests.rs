@@ -111,4 +111,60 @@ mod mcp_tests {
         let err = client.get_prompt("nope").await;
         assert!(err.is_err());
     }
+
+    mod sse_parse_tests {
+        use crate::mcp::parse_sse_messages;
+        use serde_json::json;
+
+        #[test]
+        fn parses_all_events_and_joins_multiline_data() {
+            // Two events; the first carries a JSON payload split across two
+            // `data:` lines (SSE multi-line data must be joined with '\n').
+            let body = "event: message\n\
+                    data: {\"id\": 7, \"result\": {\"a\":\n\
+                    data:  1}}\n\n\
+                    event: message\n\
+                    data: {\"id\": 8, \"result\": {\"b\": 2}}\n\n";
+            let msgs = parse_sse_messages(body);
+            assert_eq!(msgs.len(), 2, "both events must parse: {msgs:?}");
+            assert_eq!(msgs[0], json!({"id": 7, "result": {"a": 1}}));
+            assert_eq!(msgs[1], json!({"id": 8, "result": {"b": 2}}));
+        }
+
+        #[test]
+        fn notifications_before_response_are_separate_messages() {
+            // A Streamable-HTTP server may send progress notifications
+            // before the JSON-RPC response: callers must be able to pick the
+            // response by id (the old first-data:-line parser matched the
+            // notification instead).
+            let body = "event: message\n\
+                    data: {\"jsonrpc\": \"2.0\", \"method\": \"notifications/progress\", \"params\": {\"progress\": 0.5}}\n\n\
+                    event: message\n\
+                    data: {\"jsonrpc\": \"2.0\", \"id\": 42, \"result\": {\"ok\": true}}\n\n";
+            let msgs = parse_sse_messages(body);
+            assert_eq!(msgs.len(), 2);
+            let resp = msgs
+                .iter()
+                .find(|m| m.get("id").and_then(serde_json::Value::as_u64) == Some(42))
+                .expect("response with id 42 must be findable");
+            assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        #[test]
+        fn data_without_space_and_nonjson_payloads() {
+            // `data:x` (no leading space) is a valid SSE field; non-JSON
+            // payloads (the [DONE] sentinel) are skipped, not fatal.
+            let body = "data:{\"id\": 1}\n\ndata: [DONE]\n\n: keep-alive comment\ndata:\n\n";
+            let msgs = parse_sse_messages(body);
+            assert_eq!(msgs.len(), 1, "only the JSON event must parse: {msgs:?}");
+            assert_eq!(msgs[0]["id"], json!(1));
+        }
+
+        #[test]
+        fn no_data_lines_yields_empty() {
+            assert!(parse_sse_messages("").is_empty());
+            assert!(parse_sse_messages(": ping\n: ping\n\n").is_empty());
+            assert!(parse_sse_messages("event: message\nid: 1\n\n").is_empty());
+        }
+    }
 }

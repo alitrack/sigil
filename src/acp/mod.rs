@@ -67,15 +67,15 @@ pub enum Out {
 /// the stored transcript back in, and `agent/session/fork` clones it
 /// (NPP: each answer branch is a forked Codex thread with its own
 /// context).
-pub type TurnFn =
-    dyn Fn(
+pub type TurnFn = dyn Fn(
         String,
         String,
         Vec<crate::llm::provider::ChatMessage>,
     ) -> futures_util::future::BoxFuture<
         'static,
         Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
-    > + Send + Sync;
+    > + Send
+    + Sync;
 
 /// Shared transcript store: session id → accumulated transcript.
 ///
@@ -134,10 +134,11 @@ pub struct AcpState {
 
 impl AcpState {
     pub fn new() -> Self {
-        let mut s = Self::default();
-        s.transcripts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        s.current_session = Arc::new(std::sync::Mutex::new(String::new()));
-        s
+        Self {
+            transcripts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            current_session: Arc::new(std::sync::Mutex::new(String::new())),
+            ..Self::default()
+        }
     }
 
     /// The shared transcript store (background turns write transcripts
@@ -530,9 +531,9 @@ pub async fn serve(
               prompt: String,
               history: Vec<crate::llm::provider::ChatMessage>|
               -> futures_util::future::BoxFuture<
-                'static,
-                Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
-              > {
+            'static,
+            Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
+        > {
             let mut tools = tools.clone_shallow();
             let config = agent_config.clone();
             let provider = provider.clone();

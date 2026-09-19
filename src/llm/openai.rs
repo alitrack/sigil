@@ -90,6 +90,10 @@ impl OpenAiProvider {
     /// Override the head-wait bound (tests use short values so a
     /// "server accepts the connection but never answers" scenario fails
     /// in milliseconds instead of 300s).
+    ///
+    /// Test-only configuration seam today; production always uses
+    /// [`Self::default_head_timeout`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_head_timeout(mut self, d: std::time::Duration) -> Self {
         self.head_timeout = d;
         self
@@ -175,7 +179,7 @@ impl OpenAiProvider {
                 return Err(PostError::Transient(format!(
                     "timed out after {:?} waiting for response headers from {} (endpoint may have dropped the request without closing the connection)",
                     self.head_timeout, config.base_url
-                )))
+                )));
             }
         };
 
@@ -288,7 +292,7 @@ impl LlmProvider for OpenAiProvider {
 /// Build the OpenAI chat-completions request body.
 fn build_body(req: &ChatRequest) -> Value {
     // Normalize the message list into JSON values up front.
-    let mut msgs: Vec<Value> = req.messages.iter().map(message_to_json).collect();
+    let msgs: Vec<Value> = req.messages.iter().map(message_to_json).collect();
 
     // Strict chat-template backends (SGLang, some vLLM builds) reject a
     // request that does not begin with EXACTLY ONE system message — a direct
@@ -315,7 +319,12 @@ fn build_body(req: &ChatRequest) -> Value {
                 .get("content")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .unwrap_or_else(|| m.get("content").cloned().map(|v| v.to_string()).unwrap_or_default());
+                .unwrap_or_else(|| {
+                    m.get("content")
+                        .cloned()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                });
             sys_parts.push(text);
         } else {
             rest.push(m);
@@ -530,7 +539,12 @@ where
 /// (a torn frame left behind by a mid-stream disconnect).
 struct SseLines<S> {
     inner: S,
-    pending: String,
+    /// Raw undecoded bytes of the (possibly) partial current line. Bytes,
+    /// NOT a String: a multi-byte UTF-8 character may straddle a network
+    /// chunk boundary, and per-chunk lossy decoding would corrupt it into
+    /// U+FFFD replacement pairs. Only complete lines are decoded
+    /// (see poll_next).
+    pending: Vec<u8>,
     queued: std::collections::VecDeque<anyhow::Result<ChatChunk>>,
     /// Saw a terminal chunk (`[DONE]` or `finish_reason`)? When the body
     /// stream reaches EOF WITHOUT one, the provider dropped the connection
@@ -554,7 +568,7 @@ where
 {
     SseLines {
         inner: stream,
-        pending: String::new(),
+        pending: Vec::new(),
         queued: std::collections::VecDeque::new(),
         saw_terminal: false,
         finished: false,
@@ -591,15 +605,21 @@ where
         loop {
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    this.pending
-                        .push_str(&String::from_utf8_lossy(chunk.as_ref()));
-                    let mut lines: Vec<String> =
-                        this.pending.split('\n').map(str::to_string).collect();
-                    // The last element is the unfinished line — keep it
-                    // pending for the next chunk.
-                    this.pending = lines.pop().unwrap_or_default();
-                    this.queued
-                        .extend(lines.into_iter().filter_map(|l| parse_sse_line(&l)));
+                    // Accumulate raw bytes, then split into complete lines
+                    // at byte boundaries. UTF-8 continuation bytes are
+                    // never 0x0A, so cutting on b'\n' cannot split a
+                    // character; a codepoint that spans chunk boundaries
+                    // stays buffered until its line is complete and only
+                    // then gets decoded (per-chunk lossy decoding would
+                    // corrupt it into U+FFFD pairs).
+                    this.pending.extend_from_slice(chunk.as_ref());
+                    while let Some(nl) = this.pending.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = this.pending.drain(..=nl).collect();
+                        let line = String::from_utf8_lossy(&line_bytes[..nl]).into_owned();
+                        if let Some(item) = parse_sse_line(&line) {
+                            this.queued.push_back(item);
+                        }
+                    }
                     if let Some(item) = this.queued.pop_front() {
                         if item.as_ref().ok().map(|c| c.done).unwrap_or(false) {
                             this.saw_terminal = true;
@@ -623,7 +643,7 @@ where
                         // a torn final frame.
                         return Poll::Ready(Some(Err(anyhow::anyhow!(
                             "provider closed the stream mid-completion (torn final frame: {:?})",
-                            &this.pending
+                            String::from_utf8_lossy(&this.pending)
                         ))));
                     }
                     if !this.saw_terminal {
@@ -684,7 +704,7 @@ fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
             Some(Ok(ChatChunk {
                 delta,
                 thinking: !reasoning.is_empty(),
-                done: finish == Some("stop") || tool_calls_requested,
+                done: finish.is_some(),
                 tool_calls_requested,
                 usage,
             }))
@@ -907,20 +927,79 @@ mod tests {
     async fn mid_stream_eof_without_terminal_is_an_error() {
         use futures_util::StreamExt;
         // One partial data frame, then EOF — no finish_reason, no [DONE].
-        let frames: Vec<Vec<u8>> = vec![
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_vec(),
-        ];
+        let frames: Vec<Vec<u8>> =
+            vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_vec()];
         let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
-        let parsed: Vec<anyhow::Result<ChatChunk>> =
-            sse_line_stream(stream).collect().await;
+        let parsed: Vec<anyhow::Result<ChatChunk>> = sse_line_stream(stream).collect().await;
         // The partial delta arrives, then an EOF-without-terminal error.
-        assert_eq!(parsed.len(), 2, "expected a delta + a terminal error: {parsed:?}");
+        assert_eq!(
+            parsed.len(),
+            2,
+            "expected a delta + a terminal error: {parsed:?}"
+        );
         assert_eq!(parsed[0].as_ref().unwrap().delta, "partial");
         let err = parsed[1].as_ref().unwrap_err().to_string();
         assert!(
             err.contains("no [DONE]/finish_reason"),
             "expected truncation error, got: {err}"
         );
+    }
+
+    /// A multi-byte UTF-8 character split across network chunks must
+    /// reassemble into the original character — per-chunk lossy decoding
+    /// would corrupt it into U+FFFD replacement pairs (seen with CJK
+    /// answers on chunked transfers).
+    #[tokio::test]
+    async fn multibyte_char_split_across_chunks_reassembles() {
+        use futures_util::StreamExt;
+        // "你好" = E4 BD A0 E5 A5 BD. The characters are split at
+        // arbitrary (non-character) byte offsets across frames.
+        let frames: Vec<Vec<u8>> = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"".to_vec(),
+            b"\xE4\xBD".to_vec(), // 你 — first two bytes
+            b"\xA0\xE5".to_vec(), // 你 tail + 好 head
+            b"\xA5\xBD".to_vec(), // 好 — last two bytes
+            b"\"}}]}\n\n".to_vec(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
+        let parsed: Vec<anyhow::Result<ChatChunk>> = sse_line_stream(stream).collect().await;
+        assert_eq!(
+            parsed.len(),
+            3,
+            "expected delta + finish + [DONE]: {parsed:?}"
+        );
+        let delta = parsed[0].as_ref().unwrap().delta.clone();
+        assert_eq!(
+            delta, "你好",
+            "split codepoints must reassemble, got {delta:?}"
+        );
+    }
+
+    /// `finish_reason: "length"` terminates the stream cleanly: a provider
+    /// that cuts off at max_tokens without a trailing [DONE] must not trip
+    /// the mid-stream EOF detector — the answer is complete (just
+    /// truncated), not dropped.
+    #[tokio::test]
+    async fn finish_reason_length_is_terminal() {
+        use futures_util::StreamExt;
+        let frames: Vec<Vec<u8>> = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"cut off mid ans\"},\"finish_reason\":\"length\"}]}\n\n"
+                .to_vec(),
+            // No [DONE] — the body ends right after the frame.
+        ];
+        let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
+        let parsed: Vec<anyhow::Result<ChatChunk>> = sse_line_stream(stream).collect().await;
+        assert_eq!(
+            parsed.len(),
+            1,
+            "single terminal chunk, no error: {parsed:?}"
+        );
+        let c = parsed[0].as_ref().unwrap();
+        assert!(c.done, "length must count as terminal: {c:?}");
+        assert_eq!(c.delta, "cut off mid ans");
     }
 
     /// A well-formed stream that ends with [DONE] must still close
@@ -934,11 +1013,14 @@ mod tests {
             b"data: [DONE]\n\n".to_vec(),
         ];
         let stream = futures_util::stream::iter(frames.into_iter().map(Ok));
-        let parsed: Vec<anyhow::Result<ChatChunk>> =
-            sse_line_stream(stream).collect().await;
+        let parsed: Vec<anyhow::Result<ChatChunk>> = sse_line_stream(stream).collect().await;
         // The finish_reason chunk (done=true) AND the [DONE] chunk both
         // surface; no truncation error item. Both are terminal markers.
-        assert_eq!(parsed.len(), 2, "expected finish chunk + [DONE] chunk: {parsed:?}");
+        assert_eq!(
+            parsed.len(),
+            2,
+            "expected finish chunk + [DONE] chunk: {parsed:?}"
+        );
         for c in parsed.iter().map(|r| r.as_ref().unwrap()) {
             assert!(c.done, "both terminal chunks must be done: {c:?}");
         }
@@ -1096,7 +1178,7 @@ mod tests {
         // The delta chunk and the [DONE] chunk both surface; no stall, no
         // truncation error. Both are terminal.
         assert!(
-            chunks.len() >= 1,
+            !chunks.is_empty(),
             "pending-then-ready must not stall on the idle timer"
         );
         let first = chunks[0].as_ref().expect("first chunk is Ok");

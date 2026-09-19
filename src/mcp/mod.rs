@@ -56,6 +56,12 @@ enum McpTransport {
         client: reqwest::Client,
         url: String,
         token: Option<String>,
+        /// Server-assigned session (`Mcp-Session-Id` response header on
+        /// initialize). Stateful Streamable-HTTP servers 404 any request
+        /// that does not present it, so it is captured on first sight and
+        /// echoed on every subsequent request. Brief synchronous lock —
+        /// never held across an await.
+        session: std::sync::Mutex<Option<String>>,
     },
 }
 
@@ -86,7 +92,51 @@ fn parse_tools(tools_result: Value) -> Vec<McpToolInfo> {
         .collect()
 }
 
-/// First 200 chars of a string (for error messages).
+/// Parse an SSE (Server-Sent Events) body into its JSON-RPC messages.
+///
+/// SSE framing per the spec: events are separated by blank lines; each
+/// event is a set of `field: value` lines, of which consecutive `data:`
+/// lines are joined with '\n' into one payload. A field value may carry
+/// one optional leading space (`data:x` and `data: x` are equivalent).
+/// Non-`data` fields (`event:`, `id:`, `retry:`, `: ping` comments)
+/// carry no JSON-RPC payload and are ignored.
+///
+/// Returns every payload that parses as JSON. Callers pick the message
+/// matching their request id: a Streamable-HTTP server may send
+/// notifications (progress, logging, pings) BEFORE the response, so
+/// taking the first `data:` line blindly matched a notification (or a
+/// `data: {}` ping) instead of the actual response.
+fn parse_sse_messages(body: &str) -> Vec<serde_json::Value> {
+    fn flush(data: &mut Vec<String>, out: &mut Vec<serde_json::Value>) {
+        if data.is_empty() {
+            return;
+        }
+        let joined = data.join("\n");
+        data.clear();
+        // A non-JSON data payload (e.g. the `[DONE]` sentinel some
+        // gateways send) is skipped, not fatal — it is not our response.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&joined) {
+            out.push(v);
+        }
+    }
+    let mut out = Vec::new();
+    let mut data: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            // Blank line: the event is complete.
+            flush(&mut data, &mut out);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            data.push(payload.to_string());
+        }
+    }
+    flush(&mut data, &mut out);
+    out
+}
+
+/// Preview of a string for error messages (first 200 chars).
 fn preview(s: &str) -> String {
     s.chars().take(200).collect()
 }
@@ -200,11 +250,14 @@ impl McpClient {
 
         Ok((client, tools))
     }
-
     /// Connect to a Streamable HTTP MCP server (JSON-RPC 2.0 over HTTP).
     ///
-    /// One POST per request; responses come back as a plain JSON body.
+    /// One POST per request; responses come back as a plain JSON body or
+    /// an SSE stream (the request parses both, matching by JSON-RPC id).
     /// `token` is sent as `Authorization: Bearer <token>` when present.
+    /// A server-assigned `Mcp-Session-Id` header is captured from the
+    /// initialize response and echoed on every later request (stateful
+    /// servers 404 without it).
     pub async fn connect_http(
         name: &str,
         url: &str,
@@ -213,6 +266,13 @@ impl McpClient {
         let http = reqwest::Client::builder()
             // loopback must never go through http_proxy (P66: proxy hijack)
             .no_proxy()
+            // Bound the whole request, body read included: a Streamable
+            // HTTP server that opens an SSE stream and never closes it
+            // would otherwise hang the agent forever on resp.bytes(),
+            // which reads until EOF. 180s is generous for real tool
+            // calls (which may legitimately take minutes).
+            .timeout(std::time::Duration::from_secs(180))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building reqwest client for MCP HTTP transport")?;
         let client = McpClient {
@@ -221,6 +281,7 @@ impl McpClient {
                 client: http,
                 url: url.to_string(),
                 token: token.map(str::to_string),
+                session: std::sync::Mutex::new(None),
             },
             next_id: std::sync::atomic::AtomicU64::new(1),
         };
@@ -245,6 +306,7 @@ impl McpClient {
         let tools_result = client.request("tools/list", json!({})).await?;
         let tools = parse_tools(tools_result);
 
+        client.notify("notifications/initialized", json!({})).await;
         Ok((client, tools))
     }
 
@@ -279,31 +341,95 @@ impl McpClient {
                     .await
                     .context(format!("MCP request '{method}' timed out or server died"))?
             }
-            McpTransport::Http { client, url, token } => {
+            McpTransport::Http {
+                client,
+                url,
+                token,
+                session,
+            } => {
                 let body = serde_json::to_string(&frame)?;
                 let mut req = client
                     .post(url)
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json, text/event-stream")
+                    // Newer Streamable-HTTP servers require the protocol
+                    // version on every request, not just initialize.
+                    .header("Mcp-Protocol-Version", "2024-11-05")
                     .body(body);
                 if let Some(t) = token {
                     req = req.bearer_auth(t);
                 }
+                {
+                    // Echo the server-assigned session id when we have
+                    // one (captured below on first sight).
+                    let guard = session.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sid) = guard.as_deref() {
+                        req = req.header("Mcp-Session-Id", sid);
+                    }
+                }
                 let resp = req.send().await.context("MCP HTTP request")?;
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    return Err(anyhow!(
-                        "MCP HTTP {status} for '{method}': {}",
-                        preview(&body)
-                    ));
+                // Capture the session id the first time the server
+                // presents it (initialize assigns it; later responses
+                // repeat it harmlessly).
+                if let Some(sid) = resp
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|s| !s.is_empty())
+                {
+                    *session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
                 }
-                let v: Value = serde_json::from_str(&body)
-                    .with_context(|| format!("MCP HTTP bad JSON: {}", preview(&body)))?;
-                if let Some(err) = v.get("error") {
-                    return Err(anyhow!("MCP error: {err}"));
+                let content_type = resp
+                    .headers()
+                    .get("Content-Type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                if content_type.contains("text/event-stream") {
+                    // SSE response from Streamable HTTP MCP servers.
+                    // Events may interleave: the server can send
+                    // notifications (progress/logging/ping) BEFORE the
+                    // JSON-RPC response, so parse every event and pick
+                    // the message whose id matches ours.
+                    let body_bytes = resp.bytes().await.context("reading MCP SSE body")?;
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    if !status.is_success() {
+                        return Err(anyhow!(
+                            "MCP HTTP {status} for '{method}': {}",
+                            preview(&body_str)
+                        ));
+                    }
+                    let v = parse_sse_messages(&body_str)
+                        .into_iter()
+                        .find(|m| m.get("id").and_then(Value::as_u64) == Some(id))
+                        .with_context(|| {
+                            format!(
+                                "MCP SSE: no response for request id {id} in stream: {}",
+                                preview(&body_str)
+                            )
+                        })?;
+                    if let Some(err) = v.get("error") {
+                        return Err(anyhow!("MCP error: {err}"));
+                    }
+                    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                } else {
+                    // Plain JSON response
+                    let body = resp.text().await.context("reading MCP HTTP body")?;
+                    if !status.is_success() {
+                        return Err(anyhow!(
+                            "MCP HTTP {status} for '{method}': {}",
+                            preview(&body)
+                        ));
+                    }
+                    let v: Value = serde_json::from_str(&body)
+                        .with_context(|| format!("MCP HTTP bad JSON: {}", preview(&body)))?;
+                    if let Some(err) = v.get("error") {
+                        return Err(anyhow!("MCP error: {err}"));
+                    }
+                    Ok(v.get("result").cloned().unwrap_or(Value::Null))
                 }
-                Ok(v.get("result").cloned().unwrap_or(Value::Null))
             }
         }
     }
@@ -323,14 +449,27 @@ impl McpClient {
                     let _ = stdin.lock().await.flush().await;
                 }
             }
-            McpTransport::Http { client, url, token } => {
+            McpTransport::Http {
+                client,
+                url,
+                token,
+                session,
+            } => {
                 let body = serde_json::to_string(&frame).unwrap_or_default();
                 let mut req = client
                     .post(url)
                     .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .header("Mcp-Protocol-Version", "2024-11-05")
                     .body(body);
                 if let Some(t) = token {
                     req = req.bearer_auth(t);
+                }
+                {
+                    let guard = session.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sid) = guard.as_deref() {
+                        req = req.header("Mcp-Session-Id", sid);
+                    }
                 }
                 let _ = req.send().await;
             }

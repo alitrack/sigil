@@ -107,6 +107,11 @@ pub struct ChatRequest {
 pub struct ChatChunk {
     pub delta: String,
     pub thinking: bool,
+    /// Terminal chunk: the provider sent a non-null `finish_reason`
+    /// (`stop`, `tool_calls`, `length`, `content_filter`, ...) or the
+    /// `[DONE]` sentinel. Any finish_reason terminates — a `length`-
+    /// truncated answer is a complete, usable completion, not a
+    /// mid-stream drop.
     pub done: bool,
     /// `finish_reason == "tool_calls"` — the model wants to call tools;
     /// the call details arrive in the non-streaming replay.

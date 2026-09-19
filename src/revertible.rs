@@ -45,10 +45,7 @@ pub struct EvolveEffect {
 
 impl EvolveEffect {
     /// Build an effect from a label and an explicit inverse closure.
-    pub fn new(
-        label: String,
-        revert: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
-    ) -> Self {
+    pub fn new(label: String, revert: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>) -> Self {
         EvolveEffect { label, revert }
     }
 
@@ -56,11 +53,12 @@ impl EvolveEffect {
     /// (or deletes the file if `previous` is `None`, i.e. the file did not
     /// exist before the forward change). This is the inverse of a single
     /// file write / create / delete.
-    pub fn restore_file(
-        label: String,
-        path: std::path::PathBuf,
-        previous: Option<String>,
-    ) -> Self {
+    ///
+    /// Note: production callers record effects with `EvolveEffect::new`
+    /// today; `restore_file` is the ready-made inverse for the pending
+    /// revert wiring (tests exercise it).
+    #[allow(dead_code)]
+    pub fn restore_file(label: String, path: std::path::PathBuf, previous: Option<String>) -> Self {
         let revert = move || {
             match previous.as_deref() {
                 Some(c) => std::fs::write(&path, c)?,
@@ -87,13 +85,12 @@ impl EffectTracker {
 
     /// Number of effects currently pending rollback.
     pub fn pending(&self) -> usize {
-        self.stack
-            .lock()
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.stack.lock().map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Labels of the pending effects, in *application* order (oldest first).
+    /// Labels of the pending effects, in *application* order (oldest
+    /// first). Introspection for the pending revert UI/wiring.
+    #[allow(dead_code)]
     pub fn labels(&self) -> Vec<String> {
         self.stack
             .lock()
@@ -116,9 +113,8 @@ impl EffectTracker {
         match effect {
             Some(e) => {
                 let label = e.label.clone();
-                (e.revert)().map_err(|err| {
-                    anyhow::anyhow!("revert failed for '{label}': {err}")
-                })?;
+                (e.revert)()
+                    .map_err(|err| anyhow::anyhow!("revert failed for '{label}': {err}"))?;
                 Ok(Some(label))
             }
             None => Ok(None),
@@ -150,6 +146,9 @@ impl EffectTracker {
     /// Drop all pending effects *without* running their inverses. Used after
     /// a successful full rollback (or to discard) so the stack does not
     /// accumulate. Does not touch the file system.
+    ///
+    /// Kept for the pending revert wiring (tests exercise it).
+    #[allow(dead_code)]
     pub fn clear(&self) {
         if let Ok(mut s) = self.stack.lock() {
             s.clear();
@@ -260,8 +259,16 @@ mod tests {
         std::fs::write(&p1, "x").unwrap();
         std::fs::write(&p2, "y").unwrap();
         let t = EffectTracker::new();
-        t.record(EvolveEffect::restore_file("d1".into(), p1.clone(), Some("x".into())));
-        t.record(EvolveEffect::restore_file("d2".into(), p2.clone(), Some("y".into())));
+        t.record(EvolveEffect::restore_file(
+            "d1".into(),
+            p1.clone(),
+            Some("x".into()),
+        ));
+        t.record(EvolveEffect::restore_file(
+            "d2".into(),
+            p2.clone(),
+            Some("y".into()),
+        ));
         // n=1 reverts only the newest (d2)
         let r = t.rollback(1).unwrap();
         assert_eq!(r, vec!["d2"]);
@@ -283,7 +290,11 @@ mod tests {
         let p = dir.join("c.txt");
         std::fs::write(&p, "orig").unwrap();
         let t = EffectTracker::new();
-        t.record(EvolveEffect::restore_file("c".into(), p.clone(), Some("orig".into())));
+        t.record(EvolveEffect::restore_file(
+            "c".into(),
+            p.clone(),
+            Some("orig".into()),
+        ));
         std::fs::write(&p, "modified").unwrap();
         assert_eq!(t.pending(), 1);
         t.clear();
@@ -297,8 +308,16 @@ mod tests {
         let t = EffectTracker::new();
         assert_eq!(t.pending(), 0);
         assert!(t.labels().is_empty());
-        t.record(EvolveEffect::restore_file("first".into(), std::env::temp_dir().join("nope-a"), None));
-        t.record(EvolveEffect::restore_file("second".into(), std::env::temp_dir().join("nope-b"), None));
+        t.record(EvolveEffect::restore_file(
+            "first".into(),
+            std::env::temp_dir().join("nope-a"),
+            None,
+        ));
+        t.record(EvolveEffect::restore_file(
+            "second".into(),
+            std::env::temp_dir().join("nope-b"),
+            None,
+        ));
         assert_eq!(t.pending(), 2);
         assert_eq!(t.labels(), vec!["first", "second"]);
     }

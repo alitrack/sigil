@@ -258,6 +258,15 @@ fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
     (read, modified)
 }
 
+/// A message that may start the retained compaction tail: a user turn
+/// or a tool-free assistant message. Assistant messages with pending
+/// tool calls and tool results must never start the tail — strict
+/// OpenAI-compatible APIs reject an assistant `tool_calls` block whose
+/// results were folded away (and a tool result whose call was).
+fn is_safe_tail_start(m: &ChatMessage) -> bool {
+    matches!(m.role, Role::User) || (matches!(m.role, Role::Assistant) && m.tool_calls.is_none())
+}
+
 /// [`compact_messages`] with a token budget: compress when the
 /// estimated transcript size exceeds `max_tokens` OR the message count
 /// exceeds `max_msgs`. Either budget may be `0` to disable that axis.
@@ -306,7 +315,16 @@ pub fn compact_messages_with_budget(
 
     // Walk backwards, accumulating token estimates, until the token
     // budget or the message budget (minus the summary slot) is met.
-    let keep_count = max_msgs.saturating_sub(2).max(2);
+    // `max_msgs == 0` disables the message-count axis entirely: the walk
+    // is bounded by tokens alone. (A token-only config used to collapse
+    // onto the 2-message floor via `saturating_sub(2).max(2)`, folding
+    // whole sessions into one summary line no matter how large the
+    // token budget was.)
+    let keep_count = if max_msgs > 0 {
+        max_msgs.saturating_sub(2).max(2)
+    } else {
+        usize::MAX
+    };
     let mut cut = 1usize;
     let mut acc = 0usize;
     for i in (1..messages.len()).rev() {
@@ -322,7 +340,28 @@ pub fn compact_messages_with_budget(
         // Nothing safe to trim — keep everything.
         return messages.to_vec();
     }
-    // Extend forward to the first safe boundary at-or-after `cut`.
+    // Extend forward to the first safe boundary at-or-after `cut`. If the
+    // tail has no safe start at all (a mid-turn tail of tool results),
+    // do NOT run off the end — that would fold the CURRENT turn's
+    // in-flight tool results into one-line excerpts, silently dropping
+    // the output of calls the model just made. Back off to the newest
+    // safe boundary before `cut` instead: over-retention is recoverable
+    // on the next compaction, silent result loss is not.
+    let origin = cut;
+    while cut < messages.len() && !is_safe_tail_start(&messages[cut]) {
+        cut += 1;
+    }
+    if cut >= messages.len() {
+        // No safe boundary at-or-after the cut: walk back instead.
+        cut = origin;
+        while cut > 1 && !is_safe_tail_start(&messages[cut]) {
+            cut -= 1;
+        }
+    }
+    if cut <= 1 {
+        // Nothing safe to trim — keep everything.
+        return messages.to_vec();
+    }
     while cut < messages.len() {
         let safe = matches!(messages[cut].role, Role::User)
             || (matches!(messages[cut].role, Role::Assistant)
@@ -367,7 +406,7 @@ pub fn compact_messages_with_budget(
     }
     summary.push_str(&format!("\n{}", excerpts.join(" | ")));
 
-    let mut out = Vec::with_capacity(max_msgs.max(8));
+    let mut out = Vec::with_capacity(messages.len() - cut + 2);
     out.push(messages[0].clone());
     out.push(ChatMessage::system(summary));
     out.extend_from_slice(&messages[cut..]);
@@ -474,10 +513,7 @@ pub async fn run_session_turn(
     user_prompt: &str,
 ) -> Result<RunResult> {
     let mut messages: Vec<ChatMessage> = history.to_vec();
-    if !messages
-        .iter()
-        .any(|m| matches!(m.role, Role::System))
-    {
+    if !messages.iter().any(|m| matches!(m.role, Role::System)) {
         messages.insert(
             0,
             ChatMessage::system(config.system_prompt_for(user_prompt)),
@@ -727,7 +763,7 @@ pub async fn run_messages(
             anyhow::anyhow!("会话一致性校验失败（Model-visible means logged）：{v}")
         })?;
 
-        let req = ChatRequest {
+        let mut req = ChatRequest {
             model: config.model.clone(),
             messages: messages.clone(),
             tools: specs.clone(),
@@ -758,15 +794,24 @@ pub async fn run_messages(
                         messages.len(),
                         compacted.len()
                     );
-                    let retry_req = ChatRequest {
+                    // Adopt the compacted transcript for the REST of the
+                    // turn too, not just the retry: `messages` drives the
+                    // remaining loop steps and `req` is what the
+                    // tool-call replay re-sends below. Without this the
+                    // replay reproduced the exact request that just
+                    // failed (context overflow again) and every
+                    // subsequent step re-paid a failed request +
+                    // re-compaction.
+                    messages = compacted.clone();
+                    req = ChatRequest {
                         model: config.model.clone(),
                         messages: compacted,
-                        tools: specs,
+                        tools: specs.clone(),
                         stream: true,
                         temperature: None,
                     };
                     provider
-                        .chat_stream(retry_req)
+                        .chat_stream(req.clone())
                         .await
                         .context("starting completion (after compaction)")?
                 } else {
@@ -2054,7 +2099,7 @@ mod parallel_tests {
         // proving on_done fired and received the final answer.
         std::fs::write(
             slot.join("01.log.lua"),
-            &format!(
+            format!(
                 "return function(ctx) host.write_file('{marker_s}', 'on_done:' .. ctx.output); return nil end"
             ),
         )
@@ -2502,6 +2547,76 @@ mod compact_tests {
         let tail = &c[2..]; // system + summary + tail
         assert!(matches!(tail[0].role, Role::User | Role::Assistant));
         assert!(!tail.iter().any(|m| m.tool_call_id.is_some()));
+    }
+
+    #[test]
+    fn token_only_budget_walks_tokens_not_message_count() {
+        // max_msgs == 0 disables the message-count axis: a token-only
+        // budget must retain as many recent messages as the TOKEN budget
+        // allows — not collapse onto the 2-message floor (the old
+        // `saturating_sub(2).max(2)` keep_count folded whole sessions
+        // into one summary line no matter how large the token budget).
+        let m = msgs(12); // 25 messages, ~70 heuristic tokens
+        let total: usize = m.iter().map(estimate_message_tokens).sum();
+        // Over budget by a little → compact, but keep a token-sized tail.
+        let budget = total / 2; // ~20 tokens: under half the transcript
+        let c = compact_messages_with_budget(&m, 0, budget, None);
+        assert!(c.len() < m.len(), "over-budget must compress");
+        assert!(
+            c.len() > 6,
+            "token-only walk must keep a token-sized tail, got {} messages",
+            c.len()
+        );
+        // The newest turn survives verbatim.
+        assert!(c.iter().any(|x| x.content.contains("assistant-11")));
+        // Way under budget → untouched.
+        let c2 = compact_messages_with_budget(&m, 0, 10_000, None);
+        assert_eq!(c2.len(), m.len());
+    }
+
+    #[test]
+    fn compact_never_folds_inflight_tool_results() {
+        // A transcript that ends mid-turn — assistant tool_calls whose
+        // results just came back — must never have the CURRENT turn's
+        // results folded into the summary (the model would lose the
+        // output of the calls it just made, with no error). Compaction
+        // backs off to the enclosing safe boundary instead.
+        let call = |id: &str| crate::llm::provider::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        };
+        let m = vec![
+            ChatMessage::system("SYS"),
+            ChatMessage::user("first task"),
+            ChatMessage::assistant_with_tools("call-1", vec![call("c1")]),
+            ChatMessage::tool_result("result-1", "c1"),
+            ChatMessage::user("second task"),
+            ChatMessage::assistant_with_tools("call-2", vec![call("c2")]),
+            ChatMessage::tool_result("result-2", "c2"),
+        ];
+        // Aggressive message budget: the walk wants a tiny tail.
+        let c = compact_messages(&m, 4);
+        // The in-flight pair (assistant c2 + its result) survives.
+        assert!(
+            c.iter().any(|x| x.tool_call_id.as_deref() == Some("c2")),
+            "in-flight tool result folded away: {}",
+            c.iter()
+                .map(|x| x.content.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        let has_c2_call = c.iter().any(|x| {
+            x.tool_calls
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|tc| tc.id == "c2"))
+        });
+        assert!(
+            has_c2_call,
+            "assistant call c2 must survive with its result"
+        );
+        // And the compacted transcript stays tool-pairing valid.
+        crate::agent::invariant::check_tool_pairing(&c).expect("pairing must survive compaction");
     }
 
     #[test]

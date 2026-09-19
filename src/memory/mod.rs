@@ -81,17 +81,29 @@ pub fn recall(path: &PathBuf, filter: Option<&str>) -> anyhow::Result<String> {
 }
 
 /// Today's date as YYYY-MM-DD without pulling in chrono.
+/// Today's date as YYYY-MM-DD without pulling in chrono.
+///
+/// Civil date from days-since-epoch via Howard Hinnant's algorithm
+/// (same one `lua/mod.rs` uses for `host.date` — a pure-Rust port, so
+/// it works on every platform; the old implementation shelled out to
+/// the Unix `date` command, which does not exist on Windows and made
+/// every memory entry read "(unknown)" there).
 fn chrono_lite_today() -> String {
-    // std has no date formatting; use a tiny wall-clock via libc-free
-    // approach: parse `date +%F`? No — keep it pure Rust with std.
-    // We shell out once per remember call; acceptable for a CLI tool.
-    std::process::Command::new("date")
-        .arg("+%F")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mon = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = (yoe + era as u64 * 400 + (if mon <= 2 { 1 } else { 0 })) as u32;
+    format!("{y:04}-{mon:02}-{d:02}")
 }
 
 /// List memory entries as numbered lines (1-based). Includes every
@@ -174,6 +186,17 @@ pub fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn today_is_iso_date_no_shellout() {
+        // Pure-Rust civil date (no `date` command — Windows has none):
+        // YYYY-MM-DD, digits and dashes only.
+        let today = chrono_lite_today();
+        assert_eq!(today.len(), 10, "got {today}");
+        assert_eq!(today.as_bytes()[4], b'-');
+        assert_eq!(today.as_bytes()[7], b'-');
+        assert!(today.chars().all(|c| c.is_ascii_digit() || c == '-'));
+    }
 
     #[test]
     fn remember_appends_and_is_idempotent() {

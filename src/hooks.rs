@@ -18,21 +18,21 @@
 //!
 //! **Dispatch modes** (Cordis "4 种事件分发"):
 //!
-//!   * `Emit`     — observation: every listener runs, non-null results are
-//!                  collected. Order-insensitive, fire-and-forget.
-//!   * `Waterfall`— middleware: a running value is threaded through the
-//!                  listeners in order; each may replace it (return a
-//!                  value) or defer (return nil). A returned string with
-//!                  the `__SHORTCIRCUIT__` prefix halts the chain.
+//!   * `Emit` — observation: every listener runs, non-null results are
+//!     collected. Order-insensitive, fire-and-forget.
+//!   * `Waterfall` — middleware: a running value is threaded through the
+//!     listeners in order; each may replace it (return a value) or defer
+//!     (return nil). A returned string with the `__SHORTCIRCUIT__` prefix
+//!     halts the chain.
 //!   * `Parallel` — every independent monitor runs (concurrently), and
-//!                  *all* results are collected in listener order.
-//!   * `Serial`   — ordered decision: the first non-null result wins and
-//!                  the rest are skipped (multi-stage approval).
+//!     *all* results are collected in listener order.
+//!   * `Serial` — ordered decision: the first non-null result wins and
+//!     the rest are skipped (multi-stage approval).
 //!
 //! Hooks run in the shared restricted Lua state (no `io`/`os`, host
 //! helpers only, allowlisted `require`), same sandbox as scripted tools.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -56,6 +56,11 @@ pub enum HookMode {
     /// Middleware: a value is threaded through the chain in order.
     Waterfall,
     /// Independent monitors: all run; every result collected in order.
+    ///
+    /// Currently exercised only by tests: no production dispatch site has
+    /// adopted it yet (kept — the mode is complete and part of the
+    /// documented 4-mode contract).
+    #[allow(dead_code)]
     Parallel,
     /// Ordered decision: first non-null result wins, rest skipped.
     Serial,
@@ -125,11 +130,7 @@ impl HookRunner {
 
     /// Run one listener file with a JSON ctx, returning the typed result.
     /// Blocking — call on a worker thread (or from a sync path).
-    fn run_listener(
-        lua: &Arc<Mutex<LuaRuntime>>,
-        path: &PathBuf,
-        ctx_json: &str,
-    ) -> Result<Value> {
+    fn run_listener(lua: &Arc<Mutex<LuaRuntime>>, path: &Path, ctx_json: &str) -> Result<Value> {
         let lua = lua.lock().expect("lua lock poisoned");
         lua.run_file_value(path.to_str().unwrap_or("hook"), ctx_json)
     }
@@ -249,12 +250,7 @@ impl HookRunner {
     /// current thread. Same semantics as [`Self::dispatch`]; `Emit` /
     /// `Parallel` are not fanned out (a sync caller cannot block on a
     /// worker join without a runtime handle).
-    pub fn dispatch_sync(
-        &self,
-        name: &str,
-        mode: HookMode,
-        ctx: Value,
-    ) -> Result<DispatchOutput> {
+    pub fn dispatch_sync(&self, name: &str, mode: HookMode, ctx: Value) -> Result<DispatchOutput> {
         let files = self.slot_files(name);
         if files.is_empty() {
             return Ok(Self::empty(mode));
@@ -272,8 +268,10 @@ impl HookRunner {
                 Ok(DispatchOutput::All(out))
             }
             HookMode::Parallel => {
-                let out: Vec<Value> =
-                    files.iter().map(|p| Self::run_listener(&self.lua, p, &base_json)).collect::<Result<_>>()?;
+                let out: Vec<Value> = files
+                    .iter()
+                    .map(|p| Self::run_listener(&self.lua, p, &base_json))
+                    .collect::<Result<_>>()?;
                 Ok(DispatchOutput::All(out))
             }
             HookMode::Waterfall => {
@@ -492,8 +490,20 @@ mod tests {
         let runner = HookRunner::new(lua_runtime(), base);
         let files = runner.slot_files("h");
         assert_eq!(files.len(), 2, "dir slot should override the single file");
-        assert!(files[0].file_name().unwrap().to_string_lossy().ends_with("01_a.lua"));
-        assert!(files[1].file_name().unwrap().to_string_lossy().ends_with("02_b.lua"));
+        assert!(
+            files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("01_a.lua")
+        );
+        assert!(
+            files[1]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("02_b.lua")
+        );
     }
 
     // ── Emit: observation, non-null results collected ──
@@ -502,11 +512,23 @@ mod tests {
     async fn emit_collects_non_null_results_in_order() {
         let base = tmp_hooks_dir("emit");
         let slot = tmp_slot_dir("emit", "on_done");
-        std::fs::write(slot.join("01.log.lua"), "return function() return 'first' end").unwrap();
+        std::fs::write(
+            slot.join("01.log.lua"),
+            "return function() return 'first' end",
+        )
+        .unwrap();
         std::fs::write(slot.join("02.skip.lua"), "return function() return nil end").unwrap();
-        std::fs::write(slot.join("03.count.lua"), "return function() return 'third' end").unwrap();
+        std::fs::write(
+            slot.join("03.count.lua"),
+            "return function() return 'third' end",
+        )
+        .unwrap();
         let runner = HookRunner::new(lua_runtime(), base);
-        match runner.dispatch("on_done", HookMode::Emit, Value::Null).await.unwrap() {
+        match runner
+            .dispatch("on_done", HookMode::Emit, Value::Null)
+            .await
+            .unwrap()
+        {
             DispatchOutput::All(out) => {
                 assert_eq!(
                     out,
@@ -587,7 +609,11 @@ mod tests {
         let slot = tmp_slot_dir("par", "on_tool_result");
         std::fs::write(slot.join("01.lua"), "return function() return 'a' end").unwrap();
         std::fs::write(slot.join("02.lua"), "return function() return nil end").unwrap();
-        std::fs::write(slot.join("03.lua"), "return function() return {ok=true} end").unwrap();
+        std::fs::write(
+            slot.join("03.lua"),
+            "return function() return {ok=true} end",
+        )
+        .unwrap();
         let runner = HookRunner::new(lua_runtime(), base);
         match runner
             .dispatch("on_tool_result", HookMode::Parallel, Value::Null)

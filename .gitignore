@@ -2,3 +2,4 @@
 __pycache__/
 build-win.log
 test-win.log
+.codegraph/

@@ -14,7 +14,9 @@ use crate::acp::{AcpState, Out, TranscriptStore, TurnFn, handle_message};
 /// prompt handler reads on the next turn / fork clones from).
 fn make_fake_turn(store: TranscriptStore) -> Arc<TurnFn> {
     Arc::new(
-        move |session_id: String, prompt: String, history: Vec<crate::llm::provider::ChatMessage>| {
+        move |session_id: String,
+              prompt: String,
+              history: Vec<crate::llm::provider::ChatMessage>| {
             let store2 = store.clone();
             let prompt2 = prompt.clone();
             let sid2 = session_id.clone();
@@ -38,10 +40,13 @@ fn fake_state() -> AcpState {
     s
 }
 
-/// Extract the (id, session_id, done) triple from a Deferred out.
-fn deferred(out: Out) -> (serde_json::Value, String, tokio::sync::oneshot::Receiver<
+/// The channel payload a deferred prompt turn completes with.
+type DeferredDone = tokio::sync::oneshot::Receiver<
     anyhow::Result<(String, Vec<crate::llm::provider::ChatMessage>)>,
->) {
+>;
+
+/// Extract the (id, session_id, done) triple from a Deferred out.
+fn deferred(out: Out) -> (serde_json::Value, String, DeferredDone) {
     match out {
         Out::Deferred {
             id,
@@ -55,10 +60,9 @@ fn deferred(out: Out) -> (serde_json::Value, String, tokio::sync::oneshot::Recei
 /// Pull `result.sessionId` out of a Response (session/new, fork).
 fn session_id_of(out: &Out) -> String {
     match out {
-        Out::Response { result: Some(r), .. } => r["sessionId"]
-            .as_str()
-            .unwrap()
-            .to_string(),
+        Out::Response {
+            result: Some(r), ..
+        } => r["sessionId"].as_str().unwrap().to_string(),
         _ => panic!("expected sessionId response"),
     }
 }
@@ -175,8 +179,11 @@ mod acp_tests {
         let mut s = AcpState::new();
         s.turn = Some(Arc::new(
             |_sid: String, _p: String, _h: Vec<crate::llm::provider::ChatMessage>| {
-                let fut =
-                    async move { Err::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>(anyhow::anyhow!("boom")) };
+                let fut = async move {
+                    Err::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>(
+                        anyhow::anyhow!("boom"),
+                    )
+                };
                 Box::pin(fut)
             },
         ));
@@ -291,22 +298,24 @@ mod acp_tests {
         let rx = s.register_input("req-2".to_string());
         let rx_slot: Arc<std::sync::Mutex<Option<_>>> = Arc::new(std::sync::Mutex::new(Some(rx)));
         let rx_slot2 = rx_slot.clone();
-        s.turn = Some(Arc::new(move |_sid: String, prompt: String, _h: Vec<crate::llm::provider::ChatMessage>| {
-            let rx_slot2 = rx_slot2.clone();
-            Box::pin(async move {
-                let rx = rx_slot2
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("input already taken"))?;
-                let answer = rx.await.map_err(|_| anyhow::anyhow!("input dropped"))?;
-                let choice = answer["answers"][0].as_str().unwrap_or("?");
-                Ok::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>((
-                    format!("{prompt} → chose {choice}"),
-                    Vec::new(),
-                ))
-            })
-        }));
+        s.turn = Some(Arc::new(
+            move |_sid: String, prompt: String, _h: Vec<crate::llm::provider::ChatMessage>| {
+                let rx_slot2 = rx_slot2.clone();
+                Box::pin(async move {
+                    let rx = rx_slot2
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("input already taken"))?;
+                    let answer = rx.await.map_err(|_| anyhow::anyhow!("input dropped"))?;
+                    let choice = answer["answers"][0].as_str().unwrap_or("?");
+                    Ok::<(String, Vec<crate::llm::provider::ChatMessage>), anyhow::Error>((
+                        format!("{prompt} → chose {choice}"),
+                        Vec::new(),
+                    ))
+                })
+            },
+        ));
 
         // Prompt → deferred; the background turn blocks on the question.
         let outs = handle_message(
@@ -404,12 +413,8 @@ mod acp_tests {
         // returned transcript proves turn 2 saw turn 1's context.
         let (_text2, transcript2) = done2.await.unwrap().unwrap();
         assert_eq!(transcript2.len(), 2);
-        assert!(transcript2
-            .iter()
-            .any(|m| m.content.contains("first")));
-        assert!(transcript2
-            .iter()
-            .any(|m| m.content.contains("second")));
+        assert!(transcript2.iter().any(|m| m.content.contains("first")));
+        assert!(transcript2.iter().any(|m| m.content.contains("second")));
     }
 
     #[tokio::test]
@@ -455,17 +460,13 @@ mod acp_tests {
         assert_ne!(branch, parent);
         assert!(branch.starts_with("sigil-fork-"));
 
-        let branch_transcript = s
-            .transcripts
-            .lock()
-            .unwrap()
-            .get(&branch)
-            .cloned()
-            .unwrap();
-        assert!(branch_transcript
-            .iter()
-            .any(|m| m.content.contains("parent turn")),
-            "branch must inherit the parent's context");
+        let branch_transcript = s.transcripts.lock().unwrap().get(&branch).cloned().unwrap();
+        assert!(
+            branch_transcript
+                .iter()
+                .any(|m| m.content.contains("parent turn")),
+            "branch must inherit the parent's context"
+        );
 
         // Prompting the branch sees the inherited context.
         let (_id, _sid, done2) = deferred(
@@ -484,9 +485,7 @@ mod acp_tests {
         );
         let (text, transcript) = done2.await.unwrap().unwrap();
         assert_eq!(text, format!("fake-echo[{branch}]: branch turn"));
-        assert!(transcript
-            .iter()
-            .any(|m| m.content.contains("parent turn")));
+        assert!(transcript.iter().any(|m| m.content.contains("parent turn")));
 
         // Closing the branch removes only the branch's state.
         let outs = handle_message(
@@ -498,10 +497,7 @@ mod acp_tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            &outs[0],
-            Out::Response { error: None, .. }
-        ));
+        assert!(matches!(&outs[0], Out::Response { error: None, .. }));
         let store = s.transcripts.lock().unwrap();
         assert!(!store.contains_key(&branch));
         assert!(store.contains_key(&parent), "parent must survive");

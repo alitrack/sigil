@@ -14,7 +14,7 @@ file tells agent tooling how to work here without breaking things.
 ```bash
 cargo build                # debug
 cargo build --release      # release (strip + lto, single binary)
-cargo test                 # unit tests (45: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
+cargo test                 # unit tests (286: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
 cargo fmt -- --check       # must be zero diff
 cargo clippy --all-targets -- -D warnings   # must be zero warnings
 ```

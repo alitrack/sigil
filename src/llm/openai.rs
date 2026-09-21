@@ -213,14 +213,20 @@ impl OpenAiProvider {
 /// Read a response body up to 16 KiB — enough for a diagnostic message,
 /// not enough to buffer a full request echo.
 async fn bounded_error_text(resp: reqwest::Response) -> String {
+    // Read the body in chunks and stop at the cap: a gateway echoing a
+    // multi-MB request body back must not be buffered whole (per failed
+    // attempt, per fallback endpoint) only to be truncated afterwards.
     const CAP: usize = 16 * 1024;
-    match resp.bytes().await {
-        Ok(bytes) => {
-            let head = &bytes[..bytes.len().min(CAP)];
-            String::from_utf8_lossy(head).to_string()
+    let mut out: Vec<u8> = Vec::with_capacity(2 * 1024);
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.ok().flatten() {
+        if out.len() >= CAP {
+            break;
         }
-        Err(_) => String::new(),
+        let room = CAP - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
     }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 /// Reject malformed base URLs at construction time so a typo fails fast

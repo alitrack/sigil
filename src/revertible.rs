@@ -129,10 +129,9 @@ impl EffectTracker {
     /// broke).
     pub fn rollback(&self, n: usize) -> anyhow::Result<Vec<String>> {
         let mut reverted = Vec::new();
-        for _ in 0..n.saturating_add(usize::MAX) {
+        loop {
             // n == 0 rolls back everything; otherwise exactly n.
-            let stop = if n == 0 { false } else { reverted.len() >= n };
-            if stop {
+            if n > 0 && reverted.len() >= n {
                 break;
             }
             match self.rollback_one()? {

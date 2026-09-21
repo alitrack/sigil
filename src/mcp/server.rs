@@ -197,32 +197,38 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                     id: format!("mcp-{}", next_id),
                 };
                 next_id += 1;
-                // Progress: started before executing, finished after.
-                let progress_start = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/progress",
-                    "params": {
-                        "progressToken": format!("tool-{name}"),
-                        "progress": 0.0,
-                        "total": 1.0,
-                        "message": format!("tool {name} started")
-                    }
-                });
-                write_frame(&mut stdout, &progress_start).await?;
-                let result = registry.execute(&call).await;
-                match result {
-                    Ok(out) => {
-                        let progress = json!({
+                // Progress (spec): echo the token the CLIENT supplied in
+                // `_meta.progressToken` — a fabricated token cannot be
+                // correlated by the caller. Unsolicited progress (no
+                // token) is skipped: notifications a client never asked
+                // for are at best noise.
+                let progress_token = params
+                    .get("_meta")
+                    .and_then(|m| m.get("progressToken"))
+                    .cloned();
+                let progress = |fraction: f64, message: String| {
+                    progress_token.clone().map(|token| {
+                        json!({
                             "jsonrpc": "2.0",
                             "method": "notifications/progress",
                             "params": {
-                                "progressToken": format!("tool-{name}"),
-                                "progress": 1.0,
+                                "progressToken": token,
+                                "progress": fraction,
                                 "total": 1.0,
-                                "message": format!("tool {name} finished")
+                                "message": message,
                             }
-                        });
-                        write_frame(&mut stdout, &progress).await?;
+                        })
+                    })
+                };
+                if let Some(frame) = progress(0.0, format!("tool {name} started")) {
+                    write_frame(&mut stdout, &frame).await?;
+                }
+                let result = registry.execute(&call).await;
+                match result {
+                    Ok(out) => {
+                        if let Some(frame) = progress(1.0, format!("tool {name} finished")) {
+                            write_frame(&mut stdout, &frame).await?;
+                        }
                         // A tool may have hot-registered / unregistered
                         // scripted tools (create_lua_tool, skill_rollback);
                         // apply the queued ops so the very next tools/call
@@ -241,17 +247,9 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                         write_frame(&mut stdout, &resp).await?;
                     }
                     Err(e) => {
-                        let progress = json!({
-                            "jsonrpc": "2.0",
-                            "method": "notifications/progress",
-                            "params": {
-                                "progressToken": format!("tool-{name}"),
-                                "progress": 1.0,
-                                "total": 1.0,
-                                "message": format!("tool {name} failed: {e:#}")
-                            }
-                        });
-                        write_frame(&mut stdout, &progress).await?;
+                        if let Some(frame) = progress(1.0, format!("tool {name} failed: {e:#}")) {
+                            write_frame(&mut stdout, &frame).await?;
+                        }
                         let resp = json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -273,16 +271,21 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                 write_frame(&mut stdout, &resp).await?;
             }
             _ => {
-                // Unknown method: JSON-RPC error response.
-                let resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("method not found: {method}")
-                    }
-                });
-                write_frame(&mut stdout, &resp).await?;
+                // Unknown REQUEST: JSON-RPC error response. Unknown
+                // NOTIFICATION (no id): no response — JSON-RPC
+                // notifications never get replies, and an `id: null`
+                // error frame trips strict clients.
+                if let Some(id) = id {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("method not found: {method}")
+                        }
+                    });
+                    write_frame(&mut stdout, &resp).await?;
+                }
             }
         }
     }

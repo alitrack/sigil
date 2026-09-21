@@ -199,15 +199,8 @@ pub async fn serve(
                         let mut messages = session.messages.lock().await;
                         messages.push(ChatMessage::assistant(result.output.clone()));
                     }
-                    let _ = crate::session::append(
-                        &cron_sessions_dir,
-                        &sid,
-                        &Turn {
-                            role: "assistant".into(),
-                            text: result.output,
-                            ts: None,
-                        },
-                    );
+                    // (assistant turn is logged by the loop's session
+                    //  sink — job_config carries the per-job sink above)
                 }
                 for j in jobs.iter_mut() {
                     if j.id == job.id {
@@ -393,6 +386,22 @@ async fn handle_connection(
                     let messages = session.messages.lock().await;
                     run_msgs.extend(messages.clone());
                 }
+                // Event-sourced logging (Phase 63): wire a sink pinned to
+                // this turn's session so ToolCall/ToolResult events land in
+                // the event log. Without it, ordinary daemon turns logged
+                // only the user/assistant turns and ALL tool history was
+                // silently lost across a daemon restart — yet serve()
+                // restores context from exactly that event log
+                // (repair_unpaired_tool_calls + events_to_messages).
+                let mut turn_config = config.clone();
+                {
+                    let sink_dir = sessions_dir.to_path_buf();
+                    let sink_sid = session_id.clone();
+                    turn_config.session_sink =
+                        Some(std::sync::Arc::new(move |ev: crate::session::Event| {
+                            let _ = crate::session::append_event(&sink_dir, &sink_sid, &ev);
+                        }));
+                }
 
                 // Stream deltas to this client via the channel.
                 let tx2 = tx.clone();
@@ -404,7 +413,7 @@ async fn handle_connection(
                 let result = run_messages(
                     provider.as_ref(),
                     &mut tools,
-                    config,
+                    &turn_config,
                     &run_msgs,
                     None,
                     Some(&stream_cb),
@@ -424,15 +433,8 @@ async fn handle_connection(
                             let mut messages = session.messages.lock().await;
                             messages.push(ChatMessage::assistant(result.output.clone()));
                         }
-                        crate::session::append(
-                            sessions_dir,
-                            &session_id,
-                            &Turn {
-                                role: "assistant".into(),
-                                text: result.output.clone(),
-                                ts: None,
-                            },
-                        )?;
+                        // (assistant turn is logged by the loop's session
+                        //  sink on every success exit — see turn_config)
                         let state_tag = match result.state {
                             crate::agent::RunState::StepLimitReached => "step_limit",
                             crate::agent::RunState::Success => "ok",

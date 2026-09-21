@@ -313,15 +313,9 @@ pub async fn run(
             eprintln!("\n{msg}");
         }
         let answer = result.output;
-        crate::session::append(
-            sessions_dir,
-            &session_id,
-            &crate::session::Turn {
-                role: "assistant".into(),
-                text: answer.clone(),
-                ts: None,
-            },
-        )?;
+        // (assistant turn is logged by the loop's session sink — repl wired
+        //  it above; run_messages emits Assistant/TurnEnd on every success
+        //  exit. Appending here too would double-log the answer.)
         messages.push(crate::llm::ChatMessage::assistant(&answer));
         println!();
         let _ = stdout.flush();

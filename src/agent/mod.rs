@@ -606,6 +606,10 @@ pub async fn run_messages(
     let mut last_prompt_tokens: Option<usize> = None;
     // Phase A2: turn 事件只写一次（run = 一个 turn，多 step）。
     let mut turn_started = false;
+    // One retry after an EMPTY non-tool response (reasoning models can
+    // put everything in reasoning_content, leaving content empty — a
+    // silent Success("") is worse than asking once more).
+    let mut retried_empty = false;
 
     loop {
         // Cross-instance sync: if another sigil process edited the
@@ -705,6 +709,16 @@ pub async fn run_messages(
                     .await
             {
                 eprintln!("warning: on_done hook failed: {e:#}");
+            }
+            // Event sink: the wrap-up summary is model-visible output —
+            // log it (callers do not append the assistant turn themselves;
+            // the loop owns assistant events on every success exit).
+            if let Some(sink) = &config.session_sink {
+                sink(crate::session::Event::Assistant {
+                    ts: None,
+                    text: summary.clone(),
+                });
+                sink(crate::session::Event::TurnEnd { ts: None });
             }
             return Ok(RunResult {
                 output: summary,
@@ -1150,6 +1164,18 @@ pub async fn run_messages(
         }
 
         // No tool call — this is the final answer.
+        // Empty answer guard: if the stream produced no visible content
+        // and no tool calls, ask once more (bounded — a model that keeps
+        // answering empty yields the empty answer, not an infinite loop).
+        if text.trim().is_empty() && !retried_empty {
+            retried_empty = true;
+            eprintln!("  warning: empty response — nudging the model to answer in content");
+            messages.push(ChatMessage::system(
+                "Your previous reply carried no visible message content \
+                 (it may have gone to a reasoning channel). Restate your                  final answer as normal message content now.",
+            ));
+            continue;
+        }
         // P0 hook (emit observation): an `on_done` listener may react to
         // the finished turn (log, metrics, notify). Purely observational —
         // a hook error is logged, never fatal, since the answer is already
@@ -1168,6 +1194,17 @@ pub async fn run_messages(
                 .await
         {
             eprintln!("warning: on_done hook failed: {e:#}");
+        }
+        // Event sink: the final answer is model-visible output — log it
+        // on every success exit (previously only the tool-call-replay
+        // exit did, so callers had to append the assistant turn manually
+        // and the replay-empty path double-logged).
+        if let Some(sink) = &config.session_sink {
+            sink(crate::session::Event::Assistant {
+                ts: None,
+                text: text.trim().to_string(),
+            });
+            sink(crate::session::Event::TurnEnd { ts: None });
         }
         return Ok(RunResult {
             output: text.trim().to_string(),
@@ -2463,6 +2500,255 @@ mod parallel_tests {
                 usage: None,
             })
         }
+    }
+
+    /// Straight-to-answer provider: one stream with text + done, no
+    /// tools. chat_complete is never called on this path.
+    #[derive(Debug)]
+    struct AnswerProvider;
+    #[async_trait]
+    impl LlmProvider for AnswerProvider {
+        fn name(&self) -> &str {
+            "answer-test"
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> anyhow::Result<ChatStream> {
+            Ok(Box::new(futures_util::stream::iter(vec![
+                Ok(crate::llm::provider::ChatChunk {
+                    delta: "the answer".into(),
+                    thinking: false,
+                    done: false,
+                    tool_calls_requested: false,
+                    usage: None,
+                }),
+                Ok(crate::llm::provider::ChatChunk {
+                    delta: String::new(),
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: false,
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            anyhow::bail!("not expected on this path")
+        }
+    }
+
+    /// Empty-then-answer provider: first stream returns no content,
+    /// second (after the nudge) answers. Guards the bounded empty-
+    /// response retry.
+    #[derive(Debug)]
+    struct EmptyThenAnswerProvider(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LlmProvider for EmptyThenAnswerProvider {
+        fn name(&self) -> &str {
+            "empty-then-answer-test"
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            let delta = if n == 0 { "" } else { "recovered answer" };
+            Ok(Box::new(futures_util::stream::iter(vec![
+                Ok(crate::llm::provider::ChatChunk {
+                    delta: delta.into(),
+                    thinking: false,
+                    done: false,
+                    tool_calls_requested: false,
+                    usage: None,
+                }),
+                Ok(crate::llm::provider::ChatChunk {
+                    delta: String::new(),
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: false,
+                    usage: None,
+                }),
+            ])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            anyhow::bail!("not expected on this path")
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_response_gets_one_bounded_retry() {
+        let provider = EmptyThenAnswerProvider(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = crate::tools::ToolRegistry::new();
+        let config = test_config();
+        let out = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("q")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.output, "recovered answer",
+            "empty stream must trigger one nudge retry, got {:?}",
+            out.output
+        );
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            2,
+            "exactly two streams: empty + retry"
+        );
+    }
+
+    /// Contract the daemon/REPL rely on since the callers stopped
+    /// appending the assistant turn manually: EVERY success exit of
+    /// run_messages must emit the final answer as an Assistant event
+    /// and close the turn with TurnEnd through the session sink. The
+    /// plain final-answer exit used to emit neither (daemon turns lost
+    /// tool history AND relied on manual appends).
+    #[tokio::test]
+    async fn success_exits_log_assistant_and_turn_end_via_sink() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = test_config();
+        {
+            let ev = events.clone();
+            config.session_sink = Some(std::sync::Arc::new(move |e| {
+                ev.lock().unwrap().push(e);
+            }));
+        }
+        let provider = AnswerProvider;
+        let mut tools = crate::tools::ToolRegistry::new();
+        let msgs = vec![ChatMessage::user("q")];
+
+        // Plain final-answer exit.
+        let out = run_messages(&provider, &mut tools, &config, &msgs, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.output, "the answer");
+        let logged = events.lock().unwrap().clone();
+        let kind = |e: &crate::session::Event| -> &'static str {
+            match e {
+                crate::session::Event::Assistant { .. } => "assistant",
+                crate::session::Event::TurnEnd { .. } => "turn_end",
+                crate::session::Event::TurnStart { .. } => "turn_start",
+                _ => "other",
+            }
+        };
+        let kinds: Vec<&str> = logged.iter().map(kind).collect();
+        assert!(
+            kinds.contains(&"assistant"),
+            "plain exit must log Assistant: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"turn_end"),
+            "plain exit must log TurnEnd: {kinds:?}"
+        );
+
+        // Step-limit exit: one tool round first (the budget check fires
+        // at the top of the loop, so the turn must consume its step
+        // before the wrap-up), then the limit forces provide_final_answer.
+        #[derive(Debug)]
+        struct ToolOnceProvider(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl LlmProvider for ToolOnceProvider {
+            fn name(&self) -> &str {
+                "tool-once-test"
+            }
+            async fn chat_stream(&self, _req: ChatRequest) -> anyhow::Result<ChatStream> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (delta, tool_calls_requested) = if n == 0 {
+                    (String::new(), true)
+                } else {
+                    ("wrap-up summary".into(), false)
+                };
+                Ok(Box::new(futures_util::stream::iter(vec![
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta,
+                        thinking: false,
+                        done: false,
+                        tool_calls_requested,
+                        usage: None,
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested,
+                        usage: None,
+                    }),
+                ])))
+            }
+            async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+                Ok(ChatComplete {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: None,
+                })
+            }
+        }
+        struct NoopTool;
+        #[async_trait]
+        impl crate::tools::Tool for NoopTool {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn description(&self) -> &str {
+                "noop for the step-limit test"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn run(
+                &self,
+                _args: &serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput { text: "ok".into() })
+            }
+        }
+        events.lock().unwrap().clear();
+        let mut limit_config = config.clone();
+        limit_config.max_steps = 1;
+        let mut limit_tools = crate::tools::ToolRegistry::new();
+        limit_tools.register(std::sync::Arc::new(NoopTool));
+        let out = run_messages(
+            &ToolOnceProvider(std::sync::atomic::AtomicUsize::new(0)),
+            &mut limit_tools,
+            &limit_config,
+            &msgs,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.state, crate::agent::RunState::StepLimitReached);
+        assert_eq!(out.output, "wrap-up summary");
+        // The tool round must be logged too (the daemon gap this wiring
+        // closes): ToolCall + ToolResult + wrap-up Assistant + TurnEnd.
+        let logged = events.lock().unwrap().clone();
+        let kind2 = |e: &crate::session::Event| -> &'static str {
+            match e {
+                crate::session::Event::ToolCall { .. } => "tool_call",
+                crate::session::Event::ToolResult { .. } => "tool_result",
+                _ => kind(e),
+            }
+        };
+        let kinds: Vec<&str> = logged.iter().map(kind2).collect();
+        for want in ["tool_call", "tool_result", "assistant", "turn_end"] {
+            assert!(
+                kinds.contains(&want),
+                "step-limit exit must log {want}: {kinds:?}"
+            );
+        }
+        let logged = events.lock().unwrap().clone();
+        let kinds: Vec<&str> = logged.iter().map(kind).collect();
+        assert!(
+            kinds.contains(&"assistant"),
+            "step-limit exit must log the wrap-up summary: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"turn_end"),
+            "step-limit exit must log TurnEnd: {kinds:?}"
+        );
     }
 }
 

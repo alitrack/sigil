@@ -31,7 +31,8 @@ pub struct AcpClient {
 
 /// Spawn an ACP server and initialize a session.
 pub async fn connect(cmd: &str, args: &[String]) -> Result<AcpClient> {
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -39,7 +40,21 @@ pub async fn connect(cmd: &str, args: &[String]) -> Result<AcpClient> {
         // Never leak parent secrets into the ACP child.
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default());
+    // Windows parity with the MCP stdio transport (upstream 731ca1e):
+    // children doing Winsock I/O fail to initialize it without
+    // SystemRoot (WSAEDISTRO 10106 — python3/node/curl children);
+    // TEMP is needed by anything using the temp dir. Public system
+    // paths, not secrets.
+    #[cfg(windows)]
+    {
+        for key in ["SystemRoot", "WINDIR", "TEMP"] {
+            if let Ok(v) = std::env::var(key) {
+                command.env(key, v);
+            }
+        }
+    }
+    let mut child = command
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning ACP server {cmd}"))?;

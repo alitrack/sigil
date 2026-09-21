@@ -22,7 +22,7 @@
 //! untouched.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Default sessions directory.
@@ -372,10 +372,23 @@ pub fn revert_key(name: &str, args: &serde_json::Value) -> String {
 /// is stamped with the current timestamp.
 pub fn append_event(sessions_dir: &Path, id: &str, ev: &Event) -> std::io::Result<()> {
     let path = sessions_dir.join(format!("{id}.jsonl"));
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     let stamped = stamp_event(ev);
     let line = serde_json::to_string(&stamped).map_err(std::io::Error::other)?;
-    writeln!(f, "{line}")
+    // One write() of payload+newline (writeln! issues two — a crash
+    // between them leaves an unterminated line that the next append
+    // concatenates onto, corrupting both events). Under the dir lock:
+    // the REPL, the daemon, and `sigil send --session` can all append
+    // to the same session id from different processes.
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(&line);
+    buf.push('\n');
+    crate::harness::lock::with_dir_lock(sessions_dir, || {
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        use std::io::Write;
+        f.write_all(buf.as_bytes())?;
+        Ok(())
+    })
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Append one turn (compat wrapper: writes the equivalent event line).
@@ -548,8 +561,11 @@ pub fn load_events(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Event>>
     }
     let f = fs::File::open(path)?;
     let mut events = Vec::new();
+    let mut lineno = 0usize;
+    let mut dropped = 0usize;
     for line in BufReader::new(f).lines() {
         let line = line?;
+        lineno += 1;
         if line.trim().is_empty() {
             continue;
         }
@@ -570,9 +586,22 @@ pub fn load_events(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Event>>
                         },
                     };
                     events.push(e);
+                } else {
+                    // Corrupt line (torn write, disk damage, foreign
+                    // writer): never silent — an unreported drop means
+                    // context quietly disappearing from the session.
+                    dropped += 1;
+                    eprintln!(
+                        "warning: session '{id}' line {lineno} is not a valid event                          (dropped; {} chars): {}",
+                        line.chars().count(),
+                        line.chars().take(80).collect::<String>()
+                    );
                 }
             }
         }
+    }
+    if dropped > 1 {
+        eprintln!("warning: session '{id}' dropped {dropped} unparseable lines in total");
     }
     Ok(events)
 }

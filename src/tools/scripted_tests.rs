@@ -31,6 +31,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "lua-ffi")]
     async fn runs_scripted_tool_with_ffi() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-tools");
         let tool = LuaTool::new("crc32", &dir.join("crc32.lua"), lua_rt()).unwrap();

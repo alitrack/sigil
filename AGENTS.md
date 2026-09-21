@@ -14,10 +14,23 @@ file tells agent tooling how to work here without breaking things.
 ```bash
 cargo build                # debug
 cargo build --release      # release (strip + lto, single binary)
-cargo test                 # unit tests (286: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
+cargo test                 # unit tests (290: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
 cargo fmt -- --check       # must be zero diff
 cargo clippy --all-targets -- -D warnings   # must be zero warnings
 ```
+
+### Build modes (Lua sandbox)
+
+Default (`lua-ffi` feature ON): scripted tools may `require("ffi")` and
+load system C libraries — the core self-evolution capability; the
+sandbox is intentionally porous (documented risk, see src/lua/mod.rs).
+
+Containment build: `cargo build --no-default-features` strips the FFI
+library, its `package.preload`/`loaded` entries, and the require
+allowlist entry — no Lua script can reach C libraries. Use it for
+untrusted/leveraged environments. Verify with
+`cargo test --no-default-features` (FFI-dependent tests are feature-
+gated; a dedicated containment test asserts FFI is unreachable).
 
 - Rust 2024 edition, `rust-version = "1.97"`.
 - Crate name is `sigil-agent` (crates.io name), binary is `sigil`.

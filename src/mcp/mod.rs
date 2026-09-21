@@ -27,6 +27,14 @@ pub mod server;
 #[cfg(test)]
 mod server_tests;
 
+/// How long a stdio MCP request may wait for its response before the
+/// caller gets an error instead of hanging forever. Generous on
+/// purpose: `tools/call` can legitimately run minutes (builds, test
+/// suites) — but a server that is alive yet never answers used to
+/// block the agent indefinitely (`rx.recv()` has no deadline; the
+/// error message even claimed a timeout that did not exist).
+const STDIO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A tool discovered on an MCP server.
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {
@@ -337,9 +345,16 @@ impl McpClient {
                     .context("writing to MCP server")?;
                 stdin.lock().await.flush().await.ok();
 
-                rx.recv()
-                    .await
-                    .context(format!("MCP request '{method}' timed out or server died"))?
+                match tokio::time::timeout(STDIO_REQUEST_TIMEOUT, rx.recv()).await {
+                    Ok(res) => res.context(format!(
+                        "MCP request '{method}' failed: server closed the connection"
+                    ))?,
+                    Err(_) => anyhow::bail!(
+                        "MCP request '{method}' timed out after {STDIO_REQUEST_TIMEOUT:?} \
+                         (server alive but unresponsive — it was NOT killed; \
+                         retry, or check the server)"
+                    ),
+                }
             }
             McpTransport::Http {
                 client,

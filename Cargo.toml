@@ -11,6 +11,14 @@ rust-version = "1.97"
 name = "sigil"
 path = "src/main.rs"
 
+[features]
+default = ["lua-ffi"]
+# LuaJIT FFI for scripted tools (`ffi` library + require allowlist
+# entry). OFF = a containment build: no FFI, no arbitrary C library
+# loading from Lua — the sandbox story for untrusted/leveraged
+# environments. Default ON: FFI is the core self-evolution capability.
+lua-ffi = []
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"

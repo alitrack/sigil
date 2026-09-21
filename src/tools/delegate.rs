@@ -138,11 +138,15 @@ impl DelegateRegistry {
                     let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
                         continue;
                     };
+                    // Index from the directory NAME, not meta.json: a
+                    // slot claimed by allocate_id (dir created, state not
+                    // yet persisted) or a torn meta must still reindex
+                    // `next` above it — otherwise a restart would hand
+                    // out a colliding id.
+                    if let Some(n) = id.strip_prefix('d').and_then(|x| x.parse::<u64>().ok()) {
+                        max = max.max(n);
+                    }
                     if let Ok(st) = DelegateState::load(dir, id) {
-                        if let Some(n) = st.id.strip_prefix('d').and_then(|s| s.parse::<u64>().ok())
-                        {
-                            max = max.max(n);
-                        }
                         m.insert(st.id.clone(), st);
                     }
                 }
@@ -156,6 +160,52 @@ impl DelegateRegistry {
             next: AtomicU64::new(next),
             dir,
         }
+    }
+
+    /// Allocate the next delegate id. With a configured dir this runs
+    /// under the cross-process dir lock and CLAIMS the slot by creating
+    /// `<dir>/<id>/` before returning: two sigil processes sharing the
+    /// delegates dir used to both hand out `d00000` (plain fetch_add on
+    /// a startup-reindexed counter — a TOCTOU). The empty claimed dir
+    /// is safe: `new` reindexes from directory names, and insert()
+    /// persists the real state into it.
+    fn allocate_id(&self) -> String {
+        let Some(dir) = &self.dir else {
+            return format!("d{:05}", self.next.fetch_add(1, Ordering::SeqCst));
+        };
+        crate::harness::lock::with_dir_lock(dir, || {
+            let mut n = self.next.load(Ordering::SeqCst);
+            // Trust the disk over the in-memory counter: another
+            // process may have claimed ahead of us since startup.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    if let Some(k) = name.strip_prefix('d').and_then(|x| x.parse::<u64>().ok()) {
+                        n = n.max(k + 1);
+                    }
+                }
+            }
+            loop {
+                let id = format!("d{:05}", n);
+                let slot = dir.join(&id);
+                match std::fs::create_dir(&slot) {
+                    Ok(()) => {
+                        self.next.store(n + 1, Ordering::SeqCst);
+                        return Ok(id);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        n += 1; // claimed (live or deleted-between-scan) — try the next
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("claiming delegate slot {slot:?}: {e}"));
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|_| format!("d{:05}", self.next.fetch_add(1, Ordering::SeqCst)))
     }
 
     async fn insert(&self, state: DelegateState) {
@@ -561,7 +611,7 @@ impl DelegateTool {
             Some(n) => n,
             None => task.chars().take(40).collect::<String>(),
         };
-        let id = format!("d{:05}", self.delegates.next.fetch_add(1, Ordering::SeqCst));
+        let id = self.delegates.allocate_id();
         let ts = crate::session::chrono_like_timestamp();
         // The sub-agent can message its parent while running (rlm
         // agent_message.send semantics). Registered after the type's
@@ -1306,6 +1356,36 @@ impl Tool for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocate_id_is_cross_process_safe() {
+        // Two registries over the same delegates dir (two sigil
+        // processes) must never hand out the same id: the claim is a
+        // create_dir under the dir lock, and the counter reindexes from
+        // directory names — not from a startup snapshot.
+        let dir = std::env::temp_dir().join(format!("sigil-delegate-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = DelegateRegistry::new(Some(dir.clone()));
+        let b = DelegateRegistry::new(Some(dir.clone()));
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..5 {
+            ids.insert(a.allocate_id());
+            ids.insert(b.allocate_id());
+        }
+        assert_eq!(ids.len(), 10, "every id must be unique: {ids:?}");
+
+        // A restart reindexes above every claimed slot, including an
+        // empty one (claimed but no meta.json yet).
+        let c = DelegateRegistry::new(Some(dir.clone()));
+        let fresh = c.allocate_id();
+        let n: u64 = fresh.strip_prefix('d').unwrap().parse().unwrap();
+        assert!(n >= 10, "restart must not reuse a claimed id: {fresh}");
+        assert!(!ids.contains(&fresh), "fresh id collided: {fresh}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn delegate_schema_is_valid() {

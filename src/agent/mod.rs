@@ -837,21 +837,57 @@ pub async fn run_messages(
 
         let mut text = String::new();
         let mut tool_calls_requested = false;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading stream")?;
-            accumulate_usage(&mut tokens, chunk.usage);
-            if let Some(u) = chunk.usage {
-                last_prompt_tokens = Some(u.prompt_tokens as usize);
-            }
-            if !chunk.thinking {
-                text.push_str(&chunk.delta);
-                if let Some(cb) = stream_cb {
-                    cb(Some(&chunk.delta));
+        // One bounded mid-stream retry: a transient drop (502/429/reset)
+        // after the request was accepted used to abort the whole turn
+        // and discard every streamed token — the endpoint fallback chain
+        // only covers the pre-headers phase. The retry restarts the
+        // request from the CURRENT transcript and discards the partial
+        // text (keeping it would duplicate content across the retry).
+        let mut stream_retries = 0u8;
+        loop {
+            let mut stream_err: Option<anyhow::Error> = None;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        accumulate_usage(&mut tokens, chunk.usage);
+                        if let Some(u) = chunk.usage {
+                            last_prompt_tokens = Some(u.prompt_tokens as usize);
+                        }
+                        if !chunk.thinking {
+                            text.push_str(&chunk.delta);
+                            if let Some(cb) = stream_cb {
+                                cb(Some(&chunk.delta));
+                            }
+                        }
+                        tool_calls_requested |= chunk.tool_calls_requested;
+                        if chunk.done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
                 }
             }
-            tool_calls_requested |= chunk.tool_calls_requested;
-            if chunk.done {
-                break;
+            match stream_err {
+                None => break, // completed (done or clean EOF)
+                Some(e) if stream_retries < 1 && is_transient_stream_error(&e) => {
+                    stream_retries += 1;
+                    eprintln!(
+                        "  warning: stream died mid-completion ({e:#}); \
+                         retrying once from the current transcript"
+                    );
+                    text.clear();
+                    tool_calls_requested = false;
+                    match provider.chat_stream(req.clone()).await {
+                        Ok(s) => stream = s,
+                        Err(e2) => {
+                            return Err(e2).context("starting completion (after mid-stream retry)");
+                        }
+                    }
+                }
+                Some(e) => return Err(e).context("reading stream"),
             }
         }
         // Cache-discipline diagnostics (Phase 65): with SIGIL_DEBUG_CACHE
@@ -909,10 +945,23 @@ pub async fn run_messages(
                 cb(None);
             }
             // Replay non-streaming to get the full tool-call payload.
-            let complete: ChatComplete = provider
-                .chat_complete(req)
-                .await
-                .context("replaying completion for tool calls")?;
+            // Same bounded transient retry as the stream: the replay is
+            // a second full request and dies on transient 5xx/429 the
+            // same way (the provider's fallback chain visits each
+            // endpoint at most once per request).
+            let mut replay_retries = 0u8;
+            let complete: ChatComplete = loop {
+                match provider.chat_complete(req.clone()).await {
+                    Ok(c) => break c,
+                    Err(e) if replay_retries < 1 && is_transient_stream_error(&e) => {
+                        replay_retries += 1;
+                        eprintln!(
+                            "  warning: tool-call replay failed transiently ({e:#}); retrying once"
+                        );
+                    }
+                    Err(e) => return Err(e).context("replaying completion for tool calls"),
+                }
+            };
             accumulate_usage(&mut tokens, complete.usage);
             if let Some(u) = complete.usage {
                 last_prompt_tokens = Some(u.prompt_tokens as usize);
@@ -1282,6 +1331,37 @@ fn is_recoverable_llm_error(err: &anyhow::Error) -> bool {
         "previous response",
     ];
     RECOVERABLE.iter().any(|k| msg.contains(k))
+}
+
+/// Classify a MID-STREAM failure (the request was accepted, some or no
+/// chunks arrived, then the body died) as transient: one bounded retry
+/// of the request is reasonable. Mirrors the provider's own
+/// pre-headers taxonomy (429 → transient, 5xx → transient, 4xx →
+/// fatal) which only covers the send phase — once streaming started,
+/// nothing retried until now.
+fn is_transient_stream_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    const TRANSIENT: &[&str] = &[
+        "429",
+        "too many requests",
+        "500",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "incomplete message",
+        "hyper",
+        "closed the stream", // the mid-stream EOF detector's own wording
+    ];
+    TRANSIENT.iter().any(|k| msg.contains(k))
 }
 
 #[cfg(test)]
@@ -2567,6 +2647,78 @@ mod parallel_tests {
         async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
             anyhow::bail!("not expected on this path")
         }
+    }
+
+    /// Mid-stream transient failure: first stream delivers a partial
+    /// delta then errors with a 502-class message; the retry must
+    /// restart the request and produce the full answer (the partial
+    /// text is discarded, not concatenated).
+    #[derive(Debug)]
+    struct FlakyStreamProvider(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LlmProvider for FlakyStreamProvider {
+        fn name(&self) -> &str {
+            "flaky-stream-test"
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // One delta, then the connection dies mid-completion.
+                Ok(Box::new(futures_util::stream::iter(vec![
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: "part".into(),
+                        thinking: false,
+                        done: false,
+                        tool_calls_requested: false,
+                        usage: None,
+                    }),
+                    Err(anyhow::anyhow!("HTTP 502 bad gateway from upstream")),
+                ])))
+            } else {
+                Ok(Box::new(futures_util::stream::iter(vec![
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: "full answer".into(),
+                        thinking: false,
+                        done: false,
+                        tool_calls_requested: false,
+                        usage: None,
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: String::new(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            anyhow::bail!("not expected on this path")
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_mid_stream_failure_gets_one_retry() {
+        let provider = FlakyStreamProvider(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = crate::tools::ToolRegistry::new();
+        let config = test_config();
+        let out = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("q")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.output, "full answer",
+            "mid-stream 502 must retry, got {:?}",
+            out.output
+        );
+        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

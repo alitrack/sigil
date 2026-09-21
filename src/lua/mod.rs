@@ -31,17 +31,37 @@ impl LuaRuntime {
         // Standard library *without* the unsafe `io` and `os` modules
         // (file/process access — scripts must go through host helpers)
         // and without `debug` (rejected by mlua's safe new_with).
-        // `ffi` is included — it is excluded from the default safe
-        // subset and is the entire point of the vendored LuaJIT build.
+        //
+        // `ffi` is a build mode (default ON): scripted tools calling
+        // system C libraries is the core self-evolution capability. A
+        // containment build (`--no-default-features`) drops it — then
+        // no Lua script can load arbitrary C libraries.
         use mlua::StdLib as S;
-        let stdlib = S::TABLE | S::STRING | S::MATH | S::PACKAGE | S::FFI | S::BIT | S::JIT;
+        let stdlib = S::TABLE | S::STRING | S::MATH | S::PACKAGE | S::BIT | S::JIT;
+        #[cfg(feature = "lua-ffi")]
+        let stdlib = stdlib | S::FFI;
         // SAFETY: mlua's safe `new_with` refuses the `ffi` standard
         // library (it's classified unsafe because Lua scripts could
-        // load arbitrary C libraries). sigil *wants* exactly that —
-        // scripted tools calling system C libraries is the core feature
-        // (LuaJIT FFI). We are the host; we accept the risk. All other
-        // safety properties of mlua still hold.
+        // load arbitrary C libraries). sigil *wants* exactly that in
+        // the default build — we are the host; we accept the risk. All
+        // other safety properties of mlua still hold. The containment
+        // build simply omits FFI from the set.
         let lua = unsafe { Lua::unsafe_new_with(stdlib, mlua::LuaOptions::default()) };
+        // Containment build: LuaJIT registers `ffi` in package.preload
+        // even when the stdlib flag is absent — strip the loaders so
+        // `require("ffi")` cannot reach it (belt and suspenders on top
+        // of the require allowlist below).
+        #[cfg(not(feature = "lua-ffi"))]
+        {
+            if let Ok(pkg) = lua.globals().get::<mlua::Table>("package") {
+                if let Ok(preload) = pkg.get::<mlua::Table>("preload") {
+                    let _ = preload.set("ffi", mlua::Nil);
+                }
+                if let Ok(loaded) = pkg.get::<mlua::Table>("loaded") {
+                    let _ = loaded.set("ffi", mlua::Nil);
+                }
+            }
+        }
         // Restricted `require`: only allowlisted built-in modules may be
         // loaded (smolagents' `authorized_imports` pattern). Without
         // this, `require` can walk the filesystem loaders and load
@@ -50,12 +70,24 @@ impl LuaRuntime {
             let real_require: mlua::Function = lua.globals().get("require").map_err(lua_err)?;
             let wrapped = lua
                 .create_function(move |_lua, name: String| {
+                    #[cfg(feature = "lua-ffi")]
                     const ALLOWED: &[&str] =
                         &["ffi", "string", "table", "math", "bit", "jit", "coroutine"];
+                    #[cfg(not(feature = "lua-ffi"))]
+                    const ALLOWED: &[&str] =
+                        &["string", "table", "math", "bit", "jit", "coroutine"];
                     if !ALLOWED.contains(&name.as_str()) {
+                        #[cfg(feature = "lua-ffi")]
+                        let list = "ffi, string, table, math, bit, jit, coroutine";
+                        #[cfg(not(feature = "lua-ffi"))]
+                        let list = "string, table, math, bit, jit, coroutine";
+                        #[cfg(feature = "lua-ffi")]
+                        let extra = "";
+                        #[cfg(not(feature = "lua-ffi"))]
+                        let extra = " (this is a containment build: FFI is disabled)";
                         return Err(mlua::Error::RuntimeError(format!(
                             "unauthorized require('{name}'): only built-in modules are \
-                             allowed (ffi, string, table, math, bit, jit, coroutine). \
+                             allowed ({list}).{extra} \
                              File access goes through host helpers."
                         )));
                     }
@@ -315,6 +347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lua-ffi")]
     fn lua_ffi_available() {
         // LuaJIT's FFI library must be require-able — this is the whole
         // point of the vendored LuaJIT build.
@@ -326,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lua-ffi")]
     fn lua_ffi_calls_system_libc() {
         // Real FFI: call strlen from libc. Exercises cdef + ffi.load +
         // cdata conversion in one shot.
@@ -405,6 +439,7 @@ return tostring(libc.strlen('hello'))
     }
 
     #[test]
+    #[cfg(feature = "lua-ffi")]
     fn require_allowlist_still_loads_ffi() {
         // The core feature survives the allowlist: ffi must remain
         // require-able.
@@ -413,6 +448,35 @@ return tostring(libc.strlen('hello'))
             .run("local ffi = require('ffi'); return type(ffi)")
             .unwrap();
         assert_eq!(out, "\"table\"");
+    }
+
+    /// Containment build (`--no-default-features`): FFI must be
+    /// unreachable — not via require, not via package.preload, not
+    /// preloaded as a global. This is the sandbox contract that makes
+    /// the no-FFI build suitable for untrusted environments.
+    #[test]
+    #[cfg(not(feature = "lua-ffi"))]
+    fn containment_build_blocks_ffi() {
+        let rt = LuaRuntime::new().unwrap();
+        // require('ffi') is rejected by the allowlist...
+        let err = rt.run("return require('ffi')").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unauthorized require('ffi')"),
+            "allowlist must reject ffi: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("containment build"),
+            "error must name the build mode: {err:#}"
+        );
+        // ...and the loader is stripped, so the raw require (bypassing
+        // our wrapper via package.preload) cannot reach it either.
+        let out = rt
+            .run("local p = package and package.preload; return p and p['ffi']")
+            .unwrap();
+        // Lua nil serializes to JSON null through run().
+        assert_eq!(out, "null", "package.preload['ffi'] must be stripped");
+        // No ffi global leaked into the sandbox.
+        assert_eq!(rt.run("return ffi").unwrap(), "null");
     }
 
     #[test]

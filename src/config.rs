@@ -1,5 +1,7 @@
-//! Configuration: TOML file (default `~/.sigil/config.toml`) with
-//! env-var and CLI overrides. Precedence: CLI > env > file > defaults.
+//! Configuration: TOML file (default `config_dir()/sigil/config.toml`,
+//! i.e. `~/.config/sigil/config.toml` on Linux, `%APPDATA%\sigil\`
+//! `config.toml` on Windows) with env-var and CLI overrides.
+//! Precedence: CLI > env > file > defaults.
 //!
 //! File schema:
 //! ```toml
@@ -108,7 +110,17 @@ impl Config {
     pub fn load(file: Option<&str>) -> Result<Self> {
         let path = file.map(PathBuf::from).unwrap_or(default_config_path());
         let file_cfg: FileConfig = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
+            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+                // A malformed config must not silently become defaults —
+                // silently losing the user's model/endpoint settings is
+                // worse than noise.
+                eprintln!(
+                    "warning: ignoring malformed config file {}: {e} \
+                     (using built-in defaults; fix or delete the file)",
+                    path.display()
+                );
+                FileConfig::default()
+            }),
             Err(_) => FileConfig::default(),
         };
 

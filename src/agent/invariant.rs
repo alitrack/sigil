@@ -259,6 +259,7 @@ mod tests {
             content: "被篡改的回答".into(),
             tool_calls: None,
             tool_call_id: None,
+            planning_checkpoint: false,
         };
 
         assert!(validate_against_derived(&events, &messages).is_err());

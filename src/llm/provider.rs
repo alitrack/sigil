@@ -19,6 +19,14 @@ pub struct ChatMessage {
     /// Tool-only: id of the tool call this message answers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Structural marker for the agent-loop-injected planning
+    /// checkpoint. Never reaches the provider (build_body is
+    /// hand-written JSON and ignores it) and is not part of the session
+    /// log: the checkpoint is request-scoped loop machinery, so a tool
+    /// result quoting its text must not be mistaken for it (the old
+    /// substring-match cleanup could delete such messages).
+    #[serde(default, skip_serializing)]
+    pub planning_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +45,19 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            planning_checkpoint: false,
+        }
+    }
+    /// The planning checkpoint the agent loop injects and cleans up —
+    /// structurally tagged so the loop removes exactly its own
+    /// injections (and can stop matching by content).
+    pub fn planning_checkpoint() -> Self {
+        Self {
+            role: Role::System,
+            content: crate::agent::PLANNING_CHECKPOINT_PROMPT.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            planning_checkpoint: true,
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -45,6 +66,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            planning_checkpoint: false,
         }
     }
     #[allow(dead_code)]
@@ -56,6 +78,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            planning_checkpoint: false,
         }
     }
     pub fn assistant_with_tools(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
@@ -64,6 +87,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Some(calls),
             tool_call_id: None,
+            planning_checkpoint: false,
         }
     }
     pub fn tool_result(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
@@ -72,6 +96,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            planning_checkpoint: false,
         }
     }
 }

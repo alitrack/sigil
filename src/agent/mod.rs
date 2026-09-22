@@ -662,11 +662,16 @@ pub async fn run_messages(
         // checkpoint is dropped first so the history never carries a
         // stale one between checkpoints (and the model does not keep
         // re-answering it on every step).
-        messages.retain(|m| !m.content.contains("PLANNING CHECKPOINT"));
+        // Structural cleanup: remove exactly the checkpoint we injected
+        // (tagged messages), never a tool result or user text that
+        // merely quotes the prompt (the old substring match could).
+        // Legacy untagged checkpoints are still matched by content prefix.
+        messages
+            .retain(|m| !m.planning_checkpoint && !m.content.starts_with("PLANNING CHECKPOINT:"));
         if config.planning_interval > 0
             && (step == 0 || step.is_multiple_of(config.planning_interval))
         {
-            messages.push(ChatMessage::system(PLANNING_CHECKPOINT_PROMPT));
+            messages.push(ChatMessage::planning_checkpoint());
         }
 
         // Fresh specs every turn: evolution tools may have added tools
@@ -2647,6 +2652,46 @@ mod parallel_tests {
         async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
             anyhow::bail!("not expected on this path")
         }
+    }
+
+    #[test]
+    fn planning_checkpoint_cleanup_is_structural() {
+        // The checkpoint tag, not the prompt text, decides what gets
+        // removed: a tool result quoting the checkpoint prompt (or any
+        // other message carrying that text) must survive cleanup.
+        let mut msgs = vec![
+            ChatMessage::system("SYS"),
+            ChatMessage::user("q"),
+            ChatMessage::planning_checkpoint(), // tagged injection
+            ChatMessage::tool_result(
+                format!("output: {}", crate::agent::PLANNING_CHECKPOINT_PROMPT),
+                "c1",
+            ),
+            ChatMessage::assistant_with_tools(
+                crate::agent::PLANNING_CHECKPOINT_PROMPT, // legacy untagged
+                vec![crate::llm::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+        ];
+        // Same retain as the loop's cleanup.
+        msgs.retain(|m| !m.planning_checkpoint && !m.content.starts_with("PLANNING CHECKPOINT:"));
+        assert_eq!(
+            msgs.len(),
+            3,
+            "only the two checkpoint texts must go: {:?}",
+            msgs.len()
+        );
+        assert_eq!(msgs[0].role, Role::System);
+        assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(
+            msgs[2].role,
+            Role::Tool,
+            "tool result quoting the prompt must survive: {:?}",
+            msgs[2].content
+        );
     }
 
     /// Mid-stream transient failure: first stream delivers a partial

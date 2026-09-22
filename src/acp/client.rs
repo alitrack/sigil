@@ -17,6 +17,32 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+/// Deadline for every ACP read (response wait, prompt streaming). An
+/// external agent that hangs or stalls forever would otherwise pin the
+/// `acp_call` tool (and its delegate turn) indefinitely — same failure
+/// class the MCP stdio transport just got a timeout for. Generous on
+/// purpose: an agent turn can legitimately take minutes.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Read one line from a child stream with a deadline, mapping EOF and
+/// timeout to distinct, actionable errors.
+async fn read_line_timeout(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    buf: &mut String,
+    eof_msg: &str,
+) -> Result<()> {
+    buf.clear();
+    match tokio::time::timeout(READ_TIMEOUT, reader.read_line(buf)).await {
+        Ok(Ok(0)) => anyhow::bail!("{eof_msg}"),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e).context("reading ACP child stdout"),
+        Err(_) => anyhow::bail!(
+            "ACP child produced no output for {READ_TIMEOUT:?} — it is hung or stalled \
+             (it was NOT killed; retry, or check the server)"
+        ),
+    }
+}
+
 /// A running ACP server session.
 pub struct AcpClient {
     /// Kept alive for the session's lifetime: dropping it with
@@ -127,11 +153,12 @@ impl AcpClient {
         // Read frames until the response with our id arrives.
         let mut line_buf = String::new();
         loop {
-            line_buf.clear();
-            let n = self.stdout.read_line(&mut line_buf).await?;
-            if n == 0 {
-                anyhow::bail!("acp child closed stdout while awaiting response {id}");
-            }
+            read_line_timeout(
+                &mut self.stdout,
+                &mut line_buf,
+                &format!("acp child closed stdout while awaiting response {id}"),
+            )
+            .await?;
             let Ok(frame) = serde_json::from_str::<Value>(line_buf.trim()) else {
                 continue;
             };
@@ -172,11 +199,12 @@ impl AcpClient {
         let mut collected = String::new();
         let mut line_buf = String::new();
         loop {
-            line_buf.clear();
-            let n = self.stdout.read_line(&mut line_buf).await?;
-            if n == 0 {
-                anyhow::bail!("acp child closed stdout during prompt");
-            }
+            read_line_timeout(
+                &mut self.stdout,
+                &mut line_buf,
+                "acp child closed stdout during prompt",
+            )
+            .await?;
             let Ok(frame) = serde_json::from_str::<Value>(line_buf.trim()) else {
                 continue;
             };

@@ -80,7 +80,7 @@ def main():
         L.append("每任务通过率：" + "  ".join(
             f"{t}={sum(1 for x in r if x['task']==t and x.get('verdict') in ('pass','output-pass'))}/{n}"
             for t in ids))
-        safety = sorted({x for x in (f for row in (sig[s] or []) for x in row.get("safety_flags", []))})
+        safety = sorted({x for row in (sig[s] or []) for x in row.get("safety_flags", [])})
         L.append(f"安全告警: {safety if safety else '无'}")
         L.append("")
 

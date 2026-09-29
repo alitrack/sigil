@@ -849,6 +849,9 @@ pub async fn run_messages(
         // request from the CURRENT transcript and discards the partial
         // text (keeping it would duplicate content across the retry).
         let mut stream_retries = 0u8;
+        // Streamed tool-call fragments accumulated across the stream;
+        // cleared on retry along with the partial text.
+        let mut streamed_fragments: Vec<crate::llm::provider::ToolCall> = Vec::new();
         loop {
             let mut stream_err: Option<anyhow::Error> = None;
             while let Some(chunk) = stream.next().await {
@@ -865,6 +868,7 @@ pub async fn run_messages(
                             }
                         }
                         tool_calls_requested |= chunk.tool_calls_requested;
+                        streamed_fragments.extend(chunk.streamed_tool_calls);
                         if chunk.done {
                             break;
                         }
@@ -885,6 +889,7 @@ pub async fn run_messages(
                     );
                     text.clear();
                     tool_calls_requested = false;
+                    streamed_fragments.clear();
                     match provider.chat_stream(req.clone()).await {
                         Ok(s) => stream = s,
                         Err(e2) => {
@@ -949,34 +954,51 @@ pub async fn run_messages(
             if let Some(cb) = stream_cb {
                 cb(None);
             }
-            // Replay non-streaming to get the full tool-call payload.
-            // Same bounded transient retry as the stream: the replay is
-            // a second full request and dies on transient 5xx/429 the
-            // same way (the provider's fallback chain visits each
-            // endpoint at most once per request).
-            let mut replay_retries = 0u8;
-            let complete: ChatComplete = loop {
-                match provider.chat_complete(req.clone()).await {
-                    Ok(c) => break c,
-                    Err(e) if replay_retries < 1 && is_transient_stream_error(&e) => {
-                        replay_retries += 1;
-                        eprintln!(
-                            "  warning: tool-call replay failed transiently ({e:#}); retrying once"
-                        );
+            // Streamed-tool-calls fast path: providers that emit
+            // `delta.tool_calls` fragments (OpenAI proper, vLLM/SGLang)
+            // give us the complete calls in the stream we just read —
+            // skip the non-streaming replay entirely. Halves per-tool-
+            // call latency. Falls back to the legacy replay whenever the
+            // fragments are absent or fail to merge into valid JSON.
+            // The legacy replay keeps the same bounded transient retry
+            // as the stream: it is a second full request and dies on
+            // transient 5xx/429 the same way (the provider's fallback
+            // chain visits each endpoint at most once per request).
+            let mut tool_calls = crate::llm::openai::merge_tool_call_fragments(&streamed_fragments);
+            let mut complete: Option<ChatComplete> = None;
+            if tool_calls.is_empty() {
+                let mut replay_retries = 0u8;
+                let c: ChatComplete = loop {
+                    match provider.chat_complete(req.clone()).await {
+                        Ok(c) => break c,
+                        Err(e) if replay_retries < 1 && is_transient_stream_error(&e) => {
+                            replay_retries += 1;
+                            eprintln!(
+                                "  warning: tool-call replay failed transiently ({e:#}); retrying once"
+                            );
+                        }
+                        Err(e) => return Err(e).context("replaying completion for tool calls"),
                     }
-                    Err(e) => return Err(e).context("replaying completion for tool calls"),
-                }
-            };
-            accumulate_usage(&mut tokens, complete.usage);
-            if let Some(u) = complete.usage {
-                last_prompt_tokens = Some(u.prompt_tokens as usize);
+                };
+                tool_calls = c.tool_calls.clone();
+                complete = Some(c);
             }
-            if complete.tool_calls.is_empty() {
+            if let Some(c) = &complete {
+                accumulate_usage(&mut tokens, c.usage);
+                if let Some(u) = c.usage {
+                    last_prompt_tokens = Some(u.prompt_tokens as usize);
+                }
+            }
+            if tool_calls.is_empty() {
                 // Model asked for tools but sent none; treat text as answer.
-                let answer = if text.trim().is_empty() {
-                    complete.text
-                } else {
-                    text
+                // (On the replay path `complete` is Some and its text is
+                // the authoritative answer; the fast path can't get here
+                // with an empty replay — but if it somehow does, fall
+                // through to text.)
+                let answer = match &complete {
+                    Some(c) if text.trim().is_empty() => c.text.clone(),
+                    Some(_) => text,
+                    None => text,
                 };
                 // Phase A2: 最终答案事件（模型可见输出入日志）。
                 if let Some(sink) = &config.session_sink {
@@ -995,15 +1017,22 @@ pub async fn run_messages(
                 });
             }
             // Phase A2: assistant 事件（文本 + 随后 ToolCall 事件配对成完整消息）。
+            // On the streamed fast path the assistant text is whatever the
+            // stream carried (often empty); on the replay path prefer the
+            // complete response's text.
+            let assistant_text = match &complete {
+                Some(c) if !c.text.trim().is_empty() => c.text.clone(),
+                _ => text,
+            };
             if let Some(sink) = &config.session_sink {
                 sink(crate::session::Event::Assistant {
                     ts: None,
-                    text: complete.text.clone(),
+                    text: assistant_text.clone(),
                 });
             }
             messages.push(ChatMessage::assistant_with_tools(
-                &complete.text,
-                complete.tool_calls.clone(),
+                &assistant_text,
+                tool_calls.clone(),
             ));
 
             // Two-phase tool execution (borrowed from OpenHands'
@@ -1019,14 +1048,14 @@ pub async fn run_messages(
                 /// Some(reason) = rejected/tripped, do not run.
                 blocked: Option<String>,
             }
-            let mut plans: Vec<Plan> = Vec::with_capacity(complete.tool_calls.len());
+            let mut plans: Vec<Plan> = Vec::with_capacity(tool_calls.len());
             let mut executables: Vec<usize> = Vec::new(); // plan indices to run
             // Session event sink (Phase 63 event-sourced logging): emit
             // one ToolCall event per requested call before gating, so
             // the raw log records what the model asked for even when
             // approval later blocks it.
             if let Some(sink) = &config.session_sink {
-                for call in &complete.tool_calls {
+                for call in &tool_calls {
                     // Cordis P3: fingerprint the call so a log replay can
                     // find the matching inverse (per-frame rollback).
                     let key = crate::session::revert_key(&call.name, &call.arguments);
@@ -1039,7 +1068,7 @@ pub async fn run_messages(
                     });
                 }
             }
-            for call in &complete.tool_calls {
+            for call in &tool_calls {
                 // Approval gate: reject destructive commands in
                 // non-interactive mode before they ever run. In
                 // interactive mode the human may override.
@@ -1445,6 +1474,7 @@ mod parallel_tests {
                         thinking: false,
                         done: false,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                     Ok(crate::llm::provider::ChatChunk {
@@ -1452,6 +1482,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                 ])))
@@ -1475,6 +1506,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -1605,6 +1637,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -1707,6 +1740,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )]))),
@@ -1716,6 +1750,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )]))),
@@ -1895,6 +1930,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )]))),
@@ -1911,6 +1947,7 @@ mod parallel_tests {
                             thinking: false,
                             done: true,
                             tool_calls_requested: false,
+                            streamed_tool_calls: Vec::new(),
                             usage: None,
                         },
                     )])))
@@ -2002,6 +2039,7 @@ mod parallel_tests {
                             thinking: false,
                             done: true,
                             tool_calls_requested: true,
+                            streamed_tool_calls: Vec::new(),
                             usage: None,
                         },
                     )])))
@@ -2012,6 +2050,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )]))),
@@ -2095,6 +2134,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -2111,6 +2151,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -2193,6 +2234,7 @@ mod parallel_tests {
                     thinking: false,
                     done: true,
                     tool_calls_requested: false,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 },
             )])))
@@ -2371,6 +2413,7 @@ mod parallel_tests {
                                 thinking: false,
                                 done: true,
                                 tool_calls_requested: true,
+                                streamed_tool_calls: Vec::new(),
                                 usage: None,
                             },
                         )])))
@@ -2381,6 +2424,7 @@ mod parallel_tests {
                             thinking: false,
                             done: true,
                             tool_calls_requested: false,
+                            streamed_tool_calls: Vec::new(),
                             usage: None,
                         },
                     )]))),
@@ -2476,6 +2520,7 @@ mod parallel_tests {
                     thinking: false,
                     done: true,
                     tool_calls_requested: !is_summary,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 },
             )])))
@@ -2540,6 +2585,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -2561,6 +2607,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )])))
@@ -2603,6 +2650,7 @@ mod parallel_tests {
                     thinking: false,
                     done: false,
                     tool_calls_requested: false,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 }),
                 Ok(crate::llm::provider::ChatChunk {
@@ -2610,6 +2658,7 @@ mod parallel_tests {
                     thinking: false,
                     done: true,
                     tool_calls_requested: false,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 }),
             ])))
@@ -2638,6 +2687,7 @@ mod parallel_tests {
                     thinking: false,
                     done: false,
                     tool_calls_requested: false,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 }),
                 Ok(crate::llm::provider::ChatChunk {
@@ -2645,6 +2695,7 @@ mod parallel_tests {
                     thinking: false,
                     done: true,
                     tool_calls_requested: false,
+                    streamed_tool_calls: Vec::new(),
                     usage: None,
                 }),
             ])))
@@ -2715,6 +2766,7 @@ mod parallel_tests {
                         thinking: false,
                         done: false,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                     Err(anyhow::anyhow!("HTTP 502 bad gateway from upstream")),
@@ -2726,6 +2778,7 @@ mod parallel_tests {
                         thinking: false,
                         done: false,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                     Ok(crate::llm::provider::ChatChunk {
@@ -2733,6 +2786,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested: false,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                 ])))
@@ -2860,6 +2914,7 @@ mod parallel_tests {
                         thinking: false,
                         done: false,
                         tool_calls_requested,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                     Ok(crate::llm::provider::ChatChunk {
@@ -2867,6 +2922,7 @@ mod parallel_tests {
                         thinking: false,
                         done: true,
                         tool_calls_requested,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     }),
                 ])))

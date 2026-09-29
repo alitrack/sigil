@@ -295,6 +295,7 @@ async fn self_evolution_loop_hook_goes_live_same_session() {
                         thinking: false,
                         done: true,
                         tool_calls_requested: true,
+                        streamed_tool_calls: Vec::new(),
                         usage: None,
                     },
                 )]))),
@@ -311,6 +312,7 @@ async fn self_evolution_loop_hook_goes_live_same_session() {
                             thinking: false,
                             done: true,
                             tool_calls_requested: false,
+                            streamed_tool_calls: Vec::new(),
                             usage: None,
                         },
                     )])))

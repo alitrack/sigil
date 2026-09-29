@@ -128,7 +128,7 @@ pub struct ChatRequest {
 }
 
 /// One streaming chunk from the provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatChunk {
     pub delta: String,
     pub thinking: bool,
@@ -138,9 +138,18 @@ pub struct ChatChunk {
     /// truncated answer is a complete, usable completion, not a
     /// mid-stream drop.
     pub done: bool,
-    /// `finish_reason == "tool_calls"` — the model wants to call tools;
-    /// the call details arrive in the non-streaming replay.
+    /// `finish_reason == "tool_calls"` — the model wants to call tools.
+    /// The call details arrive either in `streamed_tool_calls` (when the
+    /// provider streams them in deltas) or in the non-streaming replay.
     pub tool_calls_requested: bool,
+    /// Tool calls accumulated from `delta.tool_calls` fragments while
+    /// streaming. Providers differ: vLLM/SGLang and OpenAI proper emit
+    /// `delta.tool_calls` fragments; some proxies suppress them entirely
+    /// and only set `finish_reason == "tool_calls"`. When this vec is
+    /// non-empty at end-of-stream, the agent loop skips the non-streaming
+    /// replay (halves per-tool-call latency); when empty, the legacy
+    /// replay path runs unchanged.
+    pub streamed_tool_calls: Vec<ToolCall>,
     /// Token usage, when the provider includes a `usage` block in the
     /// final chunk of a streamed completion.
     pub usage: Option<TokenUsage>,

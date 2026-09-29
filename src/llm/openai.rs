@@ -670,11 +670,17 @@ where
 /// lines) are skipped; a `data:` line whose JSON fails to parse is
 /// skipped too — a single malformed frame must not kill the stream.
 ///
-/// NOTE: `delta.tool_calls` is intentionally NOT accumulated here.
-/// sigil's tool-call flow detects `finish_reason == "tool_calls"` on the
-/// stream and replays the request non-streaming (`chat_complete`) to get
-/// the complete call — streaming deltas are unreliable for that, and the
-/// replay is what produces the real `ToolCall`s.
+/// NOTE: `delta.tool_calls` fragments ARE accumulated since the
+/// streamed-tool-calls optimization: providers that emit them (OpenAI
+/// proper, vLLM/SGLang) let the agent loop skip the non-streaming replay
+/// entirely, halving per-tool-call latency. Providers that suppress the
+/// deltas and only set `finish_reason == "tool_calls"` leave the vec
+/// empty and the legacy replay path runs unchanged.
+///
+/// Fragment format (OpenAI streaming): each `delta.tool_calls[i]` carries
+/// an `index` (which call it belongs to), and the first fragment of a call
+/// has `id` + `function.name`; `function.arguments` arrives split across
+/// many fragments and must be string-concatenated per index.
 fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
     let line = line.trim();
     if line.is_empty() {
@@ -683,11 +689,8 @@ fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload == "[DONE]" {
         return Some(Ok(ChatChunk {
-            delta: String::new(),
-            thinking: false,
             done: true,
-            tool_calls_requested: false,
-            usage: None,
+            ..Default::default()
         }));
     }
     let parsed: Result<Value, _> = serde_json::from_str(payload);
@@ -707,11 +710,13 @@ fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
                 .to_string();
             let finish = v["choices"][0]["finish_reason"].as_str();
             let tool_calls_requested = finish == Some("tool_calls");
+            let streamed_tool_calls = parse_streamed_tool_calls(&v);
             Some(Ok(ChatChunk {
                 delta,
                 thinking: !reasoning.is_empty(),
                 done: finish.is_some(),
                 tool_calls_requested,
+                streamed_tool_calls,
                 usage,
             }))
         }
@@ -719,6 +724,88 @@ fn parse_sse_line(line: &str) -> Option<anyhow::Result<ChatChunk>> {
         // A torn final frame after a disconnect is common and harmless.
         Err(_) => None,
     }
+}
+
+/// Accumulate `delta.tool_calls` fragments from ONE SSE frame into
+/// standalone `ToolCall`s. Each frame's fragments belong to distinct
+/// call indices (never a continuation of a previous frame), so each
+/// parsed fragment becomes its own partial ToolCall; the agent loop's
+/// `merge_tool_call_fragments` stitches them by index/id/name.
+fn parse_streamed_tool_calls(v: &Value) -> Vec<ToolCall> {
+    let mut out = Vec::new();
+    let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() else {
+        return out;
+    };
+    for c in calls {
+        // Only fragments that carry a name start a new call; argument
+        // continuation fragments are emitted by the same frame-set and
+        // merged downstream. A fragment without a name but with arguments
+        // still carries payload — emit it with an empty name so the
+        // merger can concatenate it onto the right call.
+        let id = c["id"].as_str().unwrap_or("").to_string();
+        let name = c["function"]["name"].as_str().unwrap_or("").to_string();
+        let args_str = c["function"]["arguments"].as_str().unwrap_or("");
+        if id.is_empty() && name.is_empty() && args_str.is_empty() {
+            continue;
+        }
+        let arguments: Value = if args_str.is_empty() {
+            Value::Null
+        } else {
+            // Arguments arrive split; this fragment's slice may be an
+            // invalid JSON prefix on its own. Keep the raw string in a
+            // pending buffer instead — see merge_tool_call_fragments.
+            Value::String(args_str.to_string())
+        };
+        out.push(ToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    out
+}
+
+/// Merge per-frame `delta.tool_calls` fragments into complete calls.
+///
+/// OpenAI's streaming contract: the first fragment of call N has
+/// `index == N`, `id`, and `function.name`; subsequent fragments for N
+/// repeat `index == N` with only `function.arguments` string slices to
+/// concatenate. sigil's `parse_streamed_tool_calls` emits one partial
+/// `ToolCall` per fragment; this merger groups them in arrival order:
+/// a fragment with a non-empty `name` starts a new call, and fragments
+/// with empty name/id get their argument string appended to the last
+/// open call. Returns calls whose concatenated arguments parse as valid
+/// JSON — anything else is dropped so the agent loop falls back to the
+/// non-streaming replay (safe degradation, never a wrong tool call).
+pub fn merge_tool_call_fragments(fragments: &[ToolCall]) -> Vec<ToolCall> {
+    let mut merged: Vec<ToolCall> = Vec::new();
+    for f in fragments {
+        if !f.name.is_empty() {
+            merged.push(f.clone());
+        } else if let Some(last) = merged.last_mut() {
+            if let Value::String(s) = &f.arguments {
+                // arguments start as Null for name-bearing fragments;
+                // convert to an accumulating string.
+                let base = match &last.arguments {
+                    Value::String(prev) => prev.clone(),
+                    _ => String::new(),
+                };
+                last.arguments = Value::String(base + s);
+            }
+        }
+    }
+    // Parse the accumulated argument strings into real JSON values.
+    for c in &mut merged {
+        let parsed = match &c.arguments {
+            Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+            other => Some(other.clone()),
+        };
+        match parsed {
+            Some(v) => c.arguments = v,
+            None => return Vec::new(), // malformed -> caller replays
+        }
+    }
+    merged
 }
 
 /// Parse an OpenAI function-calling response into tool calls.
@@ -746,6 +833,104 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use std::io::{Read, Write};
+
+    #[test]
+    fn merge_tool_call_fragments_basic() {
+        // Simulate OpenAI streaming: name-bearing fragment first,
+        // arguments split across continuation fragments.
+        let fragments = vec![
+            crate::llm::provider::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: serde_json::Value::Null,
+            },
+            crate::llm::provider::ToolCall {
+                id: "".into(),
+                name: "".into(),
+                arguments: serde_json::Value::String("{\"cmd\":".into()),
+            },
+            crate::llm::provider::ToolCall {
+                id: "".into(),
+                name: "".into(),
+                arguments: serde_json::Value::String("\"ls\"}".into()),
+            },
+        ];
+        let merged = merge_tool_call_fragments(&fragments);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "bash");
+        assert_eq!(merged[0].id, "call_1");
+        assert_eq!(merged[0].arguments, serde_json::json!({"cmd": "ls"}));
+    }
+
+    #[test]
+    fn merge_tool_call_fragments_multi_call() {
+        let fragments = vec![
+            crate::llm::provider::ToolCall {
+                id: "a".into(),
+                name: "read_file".into(),
+                arguments: serde_json::Value::String("{\"path\":\"/etc/hostname\"}".into()),
+            },
+            crate::llm::provider::ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: serde_json::Value::String("{}".into()),
+            },
+        ];
+        let merged = merge_tool_call_fragments(&fragments);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "read_file");
+        assert_eq!(merged[1].name, "bash");
+    }
+
+    #[test]
+    fn merge_tool_call_fragments_malformed_falls_back_empty() {
+        // Concatenated arguments that never parse as JSON must return
+        // an empty vec so the caller replays non-streaming.
+        let fragments = vec![
+            crate::llm::provider::ToolCall {
+                id: "a".into(),
+                name: "bash".into(),
+                arguments: serde_json::Value::Null,
+            },
+            crate::llm::provider::ToolCall {
+                id: "".into(),
+                name: "".into(),
+                arguments: serde_json::Value::String("{\"cmd\": \"unclosed".into()),
+            },
+        ];
+        assert!(merge_tool_call_fragments(&fragments).is_empty());
+    }
+
+    #[test]
+    fn parse_sse_accumulates_tool_call_fragments() {
+        // One frame with a name-bearing fragment, one continuation,
+        // then the finish_reason frame.
+        let line1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":""}}]}}]}"#;
+        let line2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"pwd\"}"}}]}}]}"#;
+        let line3 = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let mut fragments = Vec::new();
+        let mut requested = false;
+        for line in [line1, line2, line3] {
+            if let Some(Ok(chunk)) = parse_sse_line(line) {
+                requested |= chunk.tool_calls_requested;
+                fragments.extend(chunk.streamed_tool_calls);
+            }
+        }
+        assert!(requested);
+        let merged = merge_tool_call_fragments(&fragments);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "bash");
+        assert_eq!(merged[0].arguments, serde_json::json!({"cmd":"pwd"}));
+    }
+
+    #[test]
+    fn parse_sse_without_tool_call_deltas_stays_empty() {
+        // cc-switch style: finish_reason=tool_calls but NO delta fragments.
+        let line = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert!(chunk.tool_calls_requested);
+        assert!(chunk.streamed_tool_calls.is_empty());
+    }
 
     /// Spin up a tiny HTTP server that answers every POST with the given
     /// status + body. Returns the bound port.

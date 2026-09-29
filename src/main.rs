@@ -461,7 +461,7 @@ async fn main() -> Result<()> {
                     }
                 }));
             }
-            let _result = agent::run_messages(
+            let result = agent::run_messages(
                 provider_arc.as_ref(),
                 &mut tools,
                 &pipe_config,
@@ -472,6 +472,16 @@ async fn main() -> Result<()> {
             .await
             .context("agent turn failed")?;
             println!();
+            // Machine-readable per-run stats on stderr (benchmark drivers
+            // capture stderr; humans never see it in streaming mode).
+            if let Some(u) = &result.tokens {
+                eprintln!(
+                    "[stats] steps={} prompt_tokens={} completion_tokens={} prompt_cache_hit_tokens={}",
+                    result.steps, u.prompt_tokens, u.completion_tokens, u.prompt_cache_hit_tokens
+                );
+            } else {
+                eprintln!("[stats] steps={} tokens=unreported", result.steps);
+            }
             Ok(())
         }
     }

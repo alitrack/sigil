@@ -50,12 +50,16 @@ def setup_seed(seed, out_base):
 # be on the Python subprocess PATH. On Windows npm provides dsh.cmd (batch
 # shim); the bare `dsh` is a POSIX shim CreateProcess cannot launch.
 _cand = shutil.which("dsh")
-if _cand and _cand.lower().endswith(".cmd"):
+if _cand and sys.platform == "win32" and not _cand.lower().endswith(".cmd"):
+    _cand = None  # POSIX shim unusable via CreateProcess on Windows
+if _cand:
     DSH = _cand
-else:
+elif sys.platform == "win32":
     DSH = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "npm", "dsh.cmd")
-if not os.path.exists(DSH):
-    raise SystemExit(f"dsh executable not found (tried {DSH}); install @deepseek-ai/dsh")
+else:
+    DSH = "dsh"  # POSIX: rely on PATH
+if sys.platform != "win32" and shutil.which("dsh") is None:
+    raise SystemExit("dsh executable not found on PATH; install @deepseek-ai/dsh")
 
 def run_task(st, tid, provider, timeout=900):
     import tasks

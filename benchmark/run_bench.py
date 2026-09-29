@@ -19,7 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import tasks
 
-SIGIL = os.path.join(os.path.dirname(HERE), "target", "release", "sigil.exe")
+_EXE = "sigil.exe" if sys.platform == "win32" else "sigil"
+SIGIL = os.path.join(os.path.dirname(HERE), "target", "release", _EXE)
 
 # Per-seed, driver-owned state. Populated by setup_seed() before any task runs.
 S = {}

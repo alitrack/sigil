@@ -25,6 +25,45 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+## Evidence: the harness really does evolve
+
+The core thesis — *an agent that modifies its own harness gets stronger over
+time* — is not a roadmap item. It was tested with a reproducible benchmark
+(2026-08-19, 8 epochs, `benchmark/` + [`evolution-benchmark.md`](evolution-benchmark.md)):
+
+**Setup.** One fixed task pool with machine-checked objective assertions
+(file contents, exit codes — no LLM self-grading). Evolving group: sigil,
+allowed to create tools/skills/hooks across epochs. Control group: dsh with a
+**frozen** capability surface. Same model (Qwen3.8-27B on a local SGLang
+endpoint), same tasks, same assertions.
+
+**Result (per-epoch pass rate).**
+
+| Epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| sigil (evolving, all 3 tasks) | 1/3 | 2/3 | 3/3 | 1/3 | 2/3 | 3/3 | 3/3 | 2/3 |
+| dsh (frozen control, T1 series) | 0/2 | 0/2 | 0/2 | 0/2 | 0/2 | 0/2 | 0/2 | 0/2 |
+
+- The evolving group shows an *invest → ramp → plateau* curve (T1 series
+  6/8 and 4/8 by task family; T2 7/8 with harness path facts recalled across
+  epochs). The frozen control scored **0/16** on the T1 series — same model,
+  same tasks.
+- The capability surface grew monotonically from **7 → 39 assets** across 8
+  epochs. Tools were not just created but *iterated*: the same summing tool
+  went through 3 versions with rollback snapshots; later epochs reused
+  existing tools and ran visibly faster.
+- Zero security warnings on all host-sandboxed (`host.*`) self-built tools —
+  but the run also produced the strongest argument for the safety stack:
+  evolution spontaneously grew an FFI tool wrapping `DeleteFileA`. The
+  review gate / execution ring contained it, which is exactly why they are
+  hard requirements here.
+
+**Honest limits.** Single model, single seed, 8 epochs, no held-out task
+families yet — so this supports the thesis but cannot yet rule out benchmark
+overfitting. Next round: multiple seeds, larger models, held-out tasks, and
+an automated candidate → evaluate → promote → rollback pipeline (the pieces —
+versioned rollback, refinement gate, revertible effects — already exist).
+
 > Status: **Thin-core P-C (v0.2.0)** — the Lua policy layer is live:
 > agent-loop hooks (`on_turn_start` / `on_tool_result` / `on_prompt_build`)
 > run sandboxed Lua from `~/.sigil/hooks/` and reload from disk on every

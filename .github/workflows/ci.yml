@@ -24,11 +24,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      # Default build: LuaJIT FFI enabled (the self-evolution
+      # capability). Containment build (--no-default-features) strips
+      # FFI — the sandbox story for untrusted environments. BOTH modes
+      # must stay clippy-clean and test-green; the FFI-dependent tests
+      # are feature-gated, and a dedicated containment test asserts FFI
+      # is unreachable.
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Clippy (containment build)
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
       - name: Test
         run: cargo test --locked
+
+      - name: Test (containment build)
+        run: cargo test --locked --no-default-features
 
       - name: Build (release)
         run: cargo build --release --locked
@@ -48,6 +60,20 @@ jobs:
       # release time.
       - name: Check (Windows)
         run: cargo check --locked
+
+  bench-syntax:
+    name: Benchmark & tooling syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The evolution bench orchestrators and E2E scripts are part of
+      # the repo; a syntax slip must not wait for a nightly run to
+      # surface.
+      - name: py_compile benchmark + test-tools
+        run: |
+          set -e
+          python3 -m py_compile benchmark/*.py test-tools/*.py
 
   ratchet-check:
     name: Ratchet config & anchor drift check

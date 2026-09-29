@@ -782,16 +782,16 @@ pub fn merge_tool_call_fragments(fragments: &[ToolCall]) -> Vec<ToolCall> {
     for f in fragments {
         if !f.name.is_empty() {
             merged.push(f.clone());
-        } else if let Some(last) = merged.last_mut() {
-            if let Value::String(s) = &f.arguments {
-                // arguments start as Null for name-bearing fragments;
-                // convert to an accumulating string.
-                let base = match &last.arguments {
-                    Value::String(prev) => prev.clone(),
-                    _ => String::new(),
-                };
-                last.arguments = Value::String(base + s);
-            }
+        } else if let Some(last) = merged.last_mut()
+            && let Value::String(s) = &f.arguments
+        {
+            // arguments start as Null for name-bearing fragments;
+            // convert to an accumulating string.
+            let base = match &last.arguments {
+                Value::String(prev) => prev.clone(),
+                _ => String::new(),
+            };
+            last.arguments = Value::String(base + s);
         }
     }
     // Parse the accumulated argument strings into real JSON values.

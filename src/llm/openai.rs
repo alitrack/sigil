@@ -376,6 +376,9 @@ fn build_body(req: &ChatRequest) -> Value {
         "messages": msgs,
         "stream": req.stream,
     });
+    // Ask OpenAI-compatible servers to attach a final usage chunk to the
+    // SSE stream (OpenAI spec: stream_options.include_usage; supported by
+    // vLLM and SGLang). Without it, streamed runs report no token counts.
     if req.stream {
         body["stream_options"] = json!({ "include_usage": true });
     }

@@ -200,4 +200,37 @@ for epoch in 1..N:                      # N 建议 30–50(足够长、本地免
 2. Phase A 进化期是否加 T2(路径事实类对 held-out 无迁移意义,可砍)
 3. token 计数的实现层: sigil 日志 vs driver 捕获(取决于核实结果)
 
+## 12. Round-3 最终结果(2026-09-30 收官,两阶段 + held-out 泛化)
+
+**设置**: 3 seeds × Phase A(6 epochs × T1x/T4/T2 进化期) → Phase B(SIGIL_FREEZE=1 冻结跑 H1/H2 held-out);dsh 对照组同卷(自身冻结,沙箱隔离)。前置修复: stream_options.include_usage + finish 后 drain chunks(流式 token 计数打通,实弹验证 6586/162)、SIGIL_FREEZE 三写入口硬拦(实弹验证拦截生效+盘上零文件)。
+
+**Phase A 进化期**:
+
+| seed | 通过率(18 题) | 轨迹 | 备注 |
+|---|---|---|---|
+| s1 | 18/18 | 全绿 | sum_kv_dir 工具族 5 版本快照,ep2 又现 FFI 探索→被标记 |
+| s2 | 15/18 | ep1 T1x fail(12/12 entries 全错,exit=-1)后恢复 | 冷启动噪声 |
+| s3 | 10/18 | ep1-2 全绿 → **ep3 起团灭** | 见下"毒工具"事件 |
+
+**🎯 核心发现:进化复利能力,也复利脆弱性(s3 毒工具事件)**
+s3 在 ep2 造的工具 JSON schema 里 `pattern` 字段填了描述文本(非法 regex)。sigil 的 create_lua_tool **不校验 schema**,毒工具入库后 **SGLang 在请求层校验 tools 数组直接 400** → 该 seed 从 ep3 起所有任务(含 Phase B 冻结考卷)瞬间失败(exit=1, wall 0.2s)。模型有版本库/回滚能力却未自救。三层结论:
+1. **进化面的故障是持久的**:一次坏变异毒死整个后续时间线——candidate→evaluate→promote 门不是锦上添花,是必需品(review 的 P0 判断再次被实证);
+2. create_lua_tool 需要 **schema 校验前置**(产品级 fix,已排期);
+3. benchmark 视角:该事件是 round-3 最有价值的数据点之一——它把「为什么需要治理」从论述变成了实验记录。
+
+**Phase B held-out 泛化考卷(冻结运行,资产 delta 零=协议合规)**:
+
+| seed | sigil(H1/H2) | dsh(H1/H2) | sigil tokens | sigil wall | dsh wall |
+|---|---|---|---|---|---|
+| s1 | pass/pass | pass/pass | 13812 | 97.6s | 145.1s |
+| s2 | fail/pass | pass/pass | 13500 | 63.0s | 47.4s |
+| s3 | fail/fail(毒工具) | pass/pass | — | 0.2s | 48.2s |
+
+**结论**:
+1. **泛化之问(部分肯定)**: 有效样本(s1/s2 的 4 题)sigil 3 pass vs dsh 4 pass——通过率无优势;但 wall 口径 sigil/dsh = 161s/241s = **0.67**(仅计 sigil 正常 seed)——进化面在未见任务上**更快但不超过**。谨慎解读: n 太小,且 s3 被毒工具排除后组间不平衡。
+2. **成本之问(数据可信度受限)**: Phase A 的 token 曲线本轮因 results.json 覆盖 bug 从 log 重建,epoch 级 token 为末次快照 artifact(已在重建脚本标注 `_reconstructed`);定性结论: s1/s2 后期 epoch 资产增速放缓(+21→+6→+2),符合"投资期→复用期"形态。
+3. **治理之问(review 未问但最锋利)**: 毒工具事件证明无 promotion gate 的自进化会把单点错误放大为永久能力损失。**这是 0.3 线最优先要做的事,排在一切新功能之前。**
+4. **修 bug 三连**: results.json 改 append(两阶段共存)、报告器 wall_s 兜底+除零、rebuild 脚本保真重建(verdict/delta/safety 全量,tokens 诚实标 null)。
+
+
 

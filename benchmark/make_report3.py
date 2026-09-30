@@ -101,8 +101,14 @@ def main():
     dv, dp = cpp("dsh")
     L.append(f"- sigil: {sp_} passes, {sv:.0f} tokens/pass")
     L.append(f"- dsh:   {dp} passes, {dv:.0f} tokens/pass")
-    if dp and sp_ and dv == dv and sv == sv:
-        L.append(f"- 比值 sigil/dsh = {sv/dv:.2f}（<1 = 进化面在未见任务上更省；token 口径 dsh 缺失时以 wall_s 报告）")
+    if dp and sp_ and dv == dv and sv == sv and dv > 0:
+        L.append(f"- 比值 sigil/dsh = {sv/dv:.2f}（<1 = 进化面在未见任务上更省）")
+    else:
+        # dsh reports no tokens: fall back to wall_s for the cross-group ratio.
+        sw = sum(x[2] for x in agg["sigil"]) or float("nan")
+        dw = sum(x[2] for x in agg["dsh"]) or float("nan")
+        L.append(f"- dsh 无 token 口径，wall_s 对比: sigil={sw:.0f}s vs dsh={dw:.0f}s"
+                 f"（比值 {sw/dw:.2f}，<1 = 进化面更快）" if dw == dw and dw > 0 else "- 无可对比口径")
     L.append("")
     out = "\n".join(L)
     os.makedirs(a.base, exist_ok=True)

@@ -178,6 +178,15 @@ def main():
     ids = [x for x in a.tasks.split(",") if x]
     setup_seed(a.seed, a.out)
     results = []
+    # Round 3 two-phase: phase B (held-out) runs in the SAME out dir as phase
+    # A with SIGIL_FREEZE=1, so results.json is APPENDED to, not overwritten —
+    # phase A rows must survive phase B's json.dump.
+    res_path = os.path.join(S["RUNS"], "results.json")
+    if os.path.exists(res_path):
+        try:
+            results = json.load(open(res_path, encoding="utf-8"))
+        except Exception:
+            results = []
     for ep in range(1, a.epochs+1):
         before = snapshot(f"ep{ep}_pre")
         for tid in ids:
@@ -191,7 +200,7 @@ def main():
                   f"~{len(res['delta']['changed'])}C {res['why'][:40]}"
                   + (f"  ⚠SAFETY={res['safety_flags']}" if res['safety_flags'] else ""), flush=True)
             before = after
-    json.dump(results, open(os.path.join(S["RUNS"],"results.json"),"w"), indent=1, ensure_ascii=False)
+    json.dump(results, open(res_path,"w"), indent=1, ensure_ascii=False)
     per = {}
     for r in results:
         per.setdefault(r["task"], []).append(r["pass"])

@@ -77,7 +77,22 @@ def asset_delta(before, after):
     changed = sorted(k for k in set(before)&set(after) if before[k]!=after[k])
     return {"added":added,"removed":removed,"changed":changed}
 
+def parse_stats(out):
+    """Extract the `[stats] ...` line sigil emits on stderr (round 3,
+    cost-per-pass metric). Returns dict with steps/tokens (absent -> None)."""
+    m = re.search(r"\[stats\] steps=(\d+)(?: prompt_tokens=(\d+) completion_tokens=(\d+)"
+                  r"(?: prompt_cache_hit_tokens=(\d+))?)?(?: tokens=unreported)?",
+                  out)
+    if not m:
+        return {"steps": None, "prompt_tokens": None,
+                "completion_tokens": None, "prompt_cache_hit_tokens": None}
+    return {"steps": int(m.group(1)),
+            "prompt_tokens": int(m.group(2)) if m.group(2) else None,
+            "completion_tokens": int(m.group(3)) if m.group(3) else None,
+            "prompt_cache_hit_tokens": int(m.group(4)) if m.group(4) else None}
+
 def run_task(tid, model, base_url, api_key, timeout=300, max_steps=0):
+    t0 = time.time()
     t = tasks.TASKS[tid]
     if t.get("setup"): t["setup"]()
     prompt = t["prompt"]()
@@ -133,8 +148,13 @@ def run_task(tid, model, base_url, api_key, timeout=300, max_steps=0):
                 ok2, why2 = tasks.t1_check_text(out, int(m.group(1)))
                 if ok2:
                     verdict, why = "output-pass", why2
+    stats = parse_stats(out)
     return {"task":tid,"family":t["family"],"exit":code,"pass":ok,"verdict":verdict,
-            "why":why,"safety_flags":safety,"out_len":len(out),"seed":S["SEED"]}
+            "why":why,"safety_flags":safety,"out_len":len(out),"seed":S["SEED"],
+            "steps":stats["steps"],"prompt_tokens":stats["prompt_tokens"],
+            "completion_tokens":stats["completion_tokens"],
+            "prompt_cache_hit_tokens":stats["prompt_cache_hit_tokens"],
+            "wall_s": round(time.time() - t0, 1)}
 
 def main():
     ap = argparse.ArgumentParser()

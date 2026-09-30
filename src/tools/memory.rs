@@ -36,6 +36,13 @@ impl Tool for RememberTool {
     }
 
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        // SIGIL_FREEZE=1 (benchmark Phase B): memory writes are frozen too —
+        // cross-session memory is part of the evolution surface under test.
+        if std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1") {
+            return Err(anyhow::anyhow!(
+                "frozen mode (SIGIL_FREEZE=1): remember is disabled for this run"
+            ));
+        }
         let fact = args
             .get("fact")
             .and_then(Value::as_str)

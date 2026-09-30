@@ -108,6 +108,7 @@ def run_task(st, tid, provider, timeout=900):
     cmd.append(prompt)
     # KEY: cwd = seed data sandbox => sandbox-policy workspaceRoot aligns with
     # where the task files and the SUMMARY.txt answer live.
+    t0 = time.time()
     out, code = "", 0
     for attempt in range(4):  # endpoint queue saturation backoff (par. sigil)
         try:
@@ -139,7 +140,10 @@ def run_task(st, tid, provider, timeout=900):
             if ok2:
                 verdict, why = "output-pass", why2
     return {"task": tid, "exit": code, "pass": ok, "verdict": verdict, "why": why,
-            "out_len": len(out), "seed": st["SEED"]}
+            "out_len": len(out), "seed": st["SEED"],
+            # dsh emits no token stats; wall_s is the cross-group-comparable
+            # cost metric for the control arm (sigil additionally logs tokens).
+            "wall_s": round(time.time() - t0, 1)}
 
 def main():
     ap = argparse.ArgumentParser()

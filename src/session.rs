@@ -633,6 +633,16 @@ pub fn load(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Turn>> {
     Ok(events_to_turns(&load_events(sessions_dir, id)?))
 }
 
+/// Restore resumable context, repairing interrupted tool calls before replay.
+/// All session front ends share this projection so tool history survives switching.
+pub fn resume_messages(
+    sessions_dir: &Path,
+    id: &str,
+) -> std::io::Result<Vec<crate::llm::ChatMessage>> {
+    repair_unpaired_tool_calls(sessions_dir, id)?;
+    Ok(events_to_messages(&load_events(sessions_dir, id)?))
+}
+
 /// Full projection of a session's events into model-visible messages
 /// (Phase A: "Model-visible means logged").
 ///

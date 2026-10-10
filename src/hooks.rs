@@ -158,6 +158,7 @@ impl HookRunner {
         }
         let lua = self.lua.clone();
         let base_json = ctx.to_string();
+        let context = crate::agent::provider::execution_context();
 
         match mode {
             // Observation: run all, keep the non-null results.
@@ -165,8 +166,13 @@ impl HookRunner {
                 let futs = files.iter().map(|p| {
                     let lua = lua.clone();
                     let p = p.clone();
+                    let context = context.clone();
                     let j = base_json.clone();
-                    tokio::task::spawn_blocking(move || Self::run_listener(&lua, &p, &j))
+                    tokio::task::spawn_blocking(move || {
+                        crate::agent::provider::with_sync_execution_context(context, || {
+                            Self::run_listener(&lua, &p, &j)
+                        })
+                    })
                 });
                 let res = futures_util::future::join_all(futs).await;
                 let mut out = Vec::new();
@@ -184,8 +190,13 @@ impl HookRunner {
                 let futs = files.iter().map(|p| {
                     let lua = lua.clone();
                     let p = p.clone();
+                    let context = context.clone();
                     let j = base_json.clone();
-                    tokio::task::spawn_blocking(move || Self::run_listener(&lua, &p, &j))
+                    tokio::task::spawn_blocking(move || {
+                        crate::agent::provider::with_sync_execution_context(context, || {
+                            Self::run_listener(&lua, &p, &j)
+                        })
+                    })
                 });
                 let res = futures_util::future::join_all(futs).await;
                 let mut out = Vec::new();
@@ -205,9 +216,14 @@ impl HookRunner {
                     let j = step.to_string();
                     let lua = lua.clone();
                     let p = p.clone();
-                    let v = tokio::task::spawn_blocking(move || Self::run_listener(&lua, &p, &j))
-                        .await
-                        .context("hook thread")??;
+                    let context = context.clone();
+                    let v = tokio::task::spawn_blocking(move || {
+                        crate::agent::provider::with_sync_execution_context(context, || {
+                            Self::run_listener(&lua, &p, &j)
+                        })
+                    })
+                    .await
+                    .context("hook thread")??;
                     if v.is_null() {
                         continue; // no opinion — keep the running value
                     }
@@ -233,9 +249,14 @@ impl HookRunner {
                     let j = base_json.clone();
                     let lua = lua.clone();
                     let p = p.clone();
-                    let v = tokio::task::spawn_blocking(move || Self::run_listener(&lua, &p, &j))
-                        .await
-                        .context("hook thread")??;
+                    let context = context.clone();
+                    let v = tokio::task::spawn_blocking(move || {
+                        crate::agent::provider::with_sync_execution_context(context, || {
+                            Self::run_listener(&lua, &p, &j)
+                        })
+                    })
+                    .await
+                    .context("hook thread")??;
                     if !v.is_null() {
                         return Ok(DispatchOutput::First(Some(v)));
                     }
@@ -691,5 +712,56 @@ mod tests {
             DispatchOutput::Chained(Some(v)) => assert_eq!(v, Value::String("BASE [tail]".into())),
             other => panic!("sync waterfall should return Chained, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn asynchronous_hook_modes_preserve_session_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-hook-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hooks_dir = dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(dir.join("input.txt"), "session input").unwrap();
+        std::fs::write(
+            hooks_dir.join("context.lua"),
+            "return function() return host.read_file('input.txt') .. ':' .. host.cwd() end",
+        )
+        .unwrap();
+        let runner = HookRunner::new(Arc::new(Mutex::new(LuaRuntime::new().unwrap())), hooks_dir);
+        let context = crate::agent::provider::ExecutionContext {
+            cwd: dir.clone(),
+            session_id: "hook-cwd-test".into(),
+        };
+        let expected = Value::String(format!("session input:{}", dir.display()));
+        for mode in [
+            HookMode::Emit,
+            HookMode::Parallel,
+            HookMode::Waterfall,
+            HookMode::Serial,
+        ] {
+            let result = crate::agent::provider::with_execution_context(
+                Some(context.clone()),
+                runner.dispatch("context", mode, Value::Null),
+            )
+            .await
+            .unwrap();
+            match result {
+                DispatchOutput::All(values) => assert_eq!(values, vec![expected.clone()]),
+                DispatchOutput::Chained(value) | DispatchOutput::First(value) => {
+                    assert_eq!(value, Some(expected.clone()))
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

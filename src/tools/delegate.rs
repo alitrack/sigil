@@ -667,48 +667,52 @@ impl DelegateTool {
         );
         let delegates = self.delegates.clone();
         let spawn_id = id.clone();
-        tokio::spawn(async move {
-            // Sub-agents run their own loop, no approver
-            // (non-interactive: the gate's default rejection
-            // stands). The result lands in the registry.
-            // Use run_messages (not run_turn) so the run metadata —
-            // the step count — is recorded too.
-            let messages = vec![
-                ChatMessage::system(config.system_prompt_for(&task)),
-                ChatMessage::user(task.clone()),
-            ];
-            let outcome = run_messages(
-                provider.as_ref(),
-                &mut sub_tools,
-                &config,
-                &messages,
-                None,
-                None,
-            )
-            .await;
-            match outcome {
-                Ok(res) => {
-                    delegates
-                        .update(&spawn_id, |st| {
-                            st.status = DelegateStatus::Completed;
-                            st.finished_ts = Some(crate::session::chrono_like_timestamp());
-                            st.result = Some(res.output);
-                            st.steps = Some(res.steps as usize);
-                            st.tokens = res.tokens;
-                        })
-                        .await;
+        let context = crate::agent::provider::execution_context();
+        tokio::spawn(crate::agent::provider::with_execution_context(
+            context,
+            async move {
+                // Sub-agents run their own loop, no approver
+                // (non-interactive: the gate's default rejection
+                // stands). The result lands in the registry.
+                // Use run_messages (not run_turn) so the run metadata —
+                // the step count — is recorded too.
+                let messages = vec![
+                    ChatMessage::system(config.system_prompt_for(&task)),
+                    ChatMessage::user(task.clone()),
+                ];
+                let outcome = run_messages(
+                    provider.as_ref(),
+                    &mut sub_tools,
+                    &config,
+                    &messages,
+                    None,
+                    None,
+                )
+                .await;
+                match outcome {
+                    Ok(res) => {
+                        delegates
+                            .update(&spawn_id, |st| {
+                                st.status = DelegateStatus::Completed;
+                                st.finished_ts = Some(crate::session::chrono_like_timestamp());
+                                st.result = Some(res.output);
+                                st.steps = Some(res.steps as usize);
+                                st.tokens = res.tokens;
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        delegates
+                            .update(&spawn_id, |st| {
+                                st.status = DelegateStatus::Failed;
+                                st.finished_ts = Some(crate::session::chrono_like_timestamp());
+                                st.error = Some(e.to_string());
+                            })
+                            .await;
+                    }
                 }
-                Err(e) => {
-                    delegates
-                        .update(&spawn_id, |st| {
-                            st.status = DelegateStatus::Failed;
-                            st.finished_ts = Some(crate::session::chrono_like_timestamp());
-                            st.error = Some(e.to_string());
-                        })
-                        .await;
-                }
-            }
-        });
+            },
+        ));
         Ok(id)
     }
 }

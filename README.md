@@ -250,6 +250,11 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   `-- desc:` / `-- schema:` headers).
 - **Embedded LuaJIT + FFI** — `mlua` with vendored LuaJIT. Scripts can
   `require("ffi")` and call any C library (zlib `crc32` verified end to end).
+- **Lua execution limits** — Lua chunks and exported functions have a 5s
+  deadline and a 10-million-instruction budget. JIT execution is disabled
+  so instruction hooks can stop loops. Blocking host or native FFI calls
+  cannot be preempted by these hooks. `--no-default-features` disables FFI
+  and native library loaders.
 - **Self-evolution** — `create_lua_tool`: the model writes Lua, sigil saves
   and hot-registers it, and it's callable from the next turn — persisted
   across sessions.
@@ -261,7 +266,8 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
 - **Safety (3 layers)** — approval gate (destructive commands rejected in
   non-interactive mode; interactive `y/N` in the REPL), circuit breaker
   (tool tripped after 3 consecutive failures), execution rings
-  (read-only / workspace / harness mutation).
+  (read-only / workspace / harness mutation). Unknown Git subcommands,
+  custom aliases, and external Git helpers require approval too.
 - **Memory** — `remember` / `recall`: persistent cross-session facts the
   model maintains itself.
 - **MCP client** — `[[mcp.servers]]` in config spawns stdio MCP servers;
@@ -276,7 +282,8 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
 - **Interactive REPL** — multi-turn conversation with human approval for
   destructive commands.
 - **True multi-turn context** — the REPL keeps the real message list across
-  turns; `--resume` loads the transcript as actual user/assistant messages
+  turns, including tool calls, results, and compaction summaries;
+  `--resume` restores the transcript from persisted conversation events
   (the model remembers the conversation, not a text blob).
 - **Line editing + history** — rustyline: arrow-key history, inline editing;
   per-session `.history` files persist commands across sessions.
@@ -932,8 +939,8 @@ plus one doc correction:
   `run_with_timeout` (60s budget, `kill_on_drop` so no orphan keeps
   running) and a timeout is reported to the model as a normal tool
   output (`[bash: command timed out after 60s — process killed]`),
-  letting the loop continue. Scripted Lua tools already had a similar
-  timeout; this closes the native-tool gap.
+  letting the loop continue. Lua instruction/deadline limits were added
+  in the 2026-10-10 review fixes; see Capabilities for their scope.
 - **Context compression**. REPL sessions grew the transcript without
   bound — every turn re-sent the whole history. `compact_messages`
   folds the oldest turns into one deterministic summary `system`

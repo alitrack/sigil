@@ -144,6 +144,38 @@ fn parse_sse_messages(body: &str) -> Vec<serde_json::Value> {
     out
 }
 
+/// Consume complete SSE events until this request's response arrives.
+/// The HTTP body may stay open after the result, so EOF is not a deadline.
+async fn read_sse_response(mut response: reqwest::Response, id: u64) -> Result<Value> {
+    let mut pending = Vec::<u8>::new();
+    let mut event = String::new();
+    while let Some(chunk) = response.chunk().await.context("reading MCP SSE body")? {
+        pending.extend_from_slice(&chunk);
+        while let Some(newline) = pending.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<_> = pending.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line[..newline]);
+            let line = line.strip_suffix('\r').unwrap_or(&line);
+            if line.is_empty() {
+                if let Some(message) = parse_sse_messages(&event)
+                    .into_iter()
+                    .find(|message| message.get("id").and_then(Value::as_u64) == Some(id))
+                {
+                    return Ok(message);
+                }
+                event.clear();
+            } else {
+                event.push_str(line);
+                event.push('\n');
+            }
+        }
+    }
+    event.push_str(&String::from_utf8_lossy(&pending));
+    parse_sse_messages(&event)
+        .into_iter()
+        .find(|message| message.get("id").and_then(Value::as_u64) == Some(id))
+        .with_context(|| format!("MCP SSE: stream ended without response for request id {id}"))
+}
+
 /// Preview of a string for error messages (first 200 chars).
 fn preview(s: &str) -> String {
     s.chars().take(200).collect()
@@ -275,9 +307,8 @@ impl McpClient {
             // loopback must never go through http_proxy (P66: proxy hijack)
             .no_proxy()
             // Bound the whole request, body read included: a Streamable
-            // HTTP server that opens an SSE stream and never closes it
-            // would otherwise hang the agent forever on resp.bytes(),
-            // which reads until EOF. 180s is generous for real tool
+            // HTTP server that never returns the requested response
+            // must not hang the agent forever. 180s is generous for real tool
             // calls (which may legitimately take minutes).
             .timeout(std::time::Duration::from_secs(180))
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -408,23 +439,10 @@ impl McpClient {
                     // notifications (progress/logging/ping) BEFORE the
                     // JSON-RPC response, so parse every event and pick
                     // the message whose id matches ours.
-                    let body_bytes = resp.bytes().await.context("reading MCP SSE body")?;
-                    let body_str = String::from_utf8_lossy(&body_bytes);
                     if !status.is_success() {
-                        return Err(anyhow!(
-                            "MCP HTTP {status} for '{method}': {}",
-                            preview(&body_str)
-                        ));
+                        return Err(anyhow!("MCP HTTP {status} for '{method}'"));
                     }
-                    let v = parse_sse_messages(&body_str)
-                        .into_iter()
-                        .find(|m| m.get("id").and_then(Value::as_u64) == Some(id))
-                        .with_context(|| {
-                            format!(
-                                "MCP SSE: no response for request id {id} in stream: {}",
-                                preview(&body_str)
-                            )
-                        })?;
+                    let v = read_sse_response(resp, id).await?;
                     if let Some(err) = v.get("error") {
                         return Err(anyhow!("MCP error: {err}"));
                     }

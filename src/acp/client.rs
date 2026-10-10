@@ -80,6 +80,11 @@ pub async fn connect(cmd: &str, args: &[String]) -> Result<AcpClient> {
             }
         }
     }
+    crate::agent::provider::apply_working_directory(&mut command);
+    let cwd = match crate::agent::provider::execution_context() {
+        Some(context) => context.cwd,
+        None => std::env::current_dir()?,
+    };
     let mut child = command
         .kill_on_drop(true)
         .spawn()
@@ -121,7 +126,7 @@ pub async fn connect(cmd: &str, args: &[String]) -> Result<AcpClient> {
 
     // session/new
     let resp = client
-        .request("agent/session/new", json!({}))
+        .request("agent/session/new", json!({"cwd": cwd}))
         .await
         .context("acp session/new")?;
     client.session_id = resp
@@ -210,6 +215,9 @@ impl AcpClient {
             };
             // Response to our prompt → turn finished.
             if frame.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(error) = frame.get("error") {
+                    anyhow::bail!("acp prompt error: {error}");
+                }
                 let result = frame.get("result").cloned().unwrap_or(Value::Null);
                 let stop = result
                     .get("stopReason")

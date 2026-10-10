@@ -59,14 +59,52 @@ pub fn load(path: &Path) -> Vec<CronJob> {
 
 /// Atomically persist the job list (write temp + rename, like
 /// prime-agent's fsync-then-rename).
+#[cfg(test)]
 pub fn save(path: &Path, jobs: &[CronJob]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::harness::lock::with_dir_lock(parent, || save_unlocked(path, jobs))
+}
+
+fn save_unlocked(path: &Path, jobs: &[CronJob]) -> anyhow::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(jobs)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Mutate the latest persisted schedule under its directory lock.
+pub fn update<T>(
+    path: &Path,
+    f: impl FnOnce(&mut Vec<CronJob>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::harness::lock::with_dir_lock(parent, || {
+        let mut jobs = load(path);
+        let result = f(&mut jobs)?;
+        save_unlocked(path, &jobs)?;
+        Ok(result)
+    })
+}
+
+/// Merge completed execution bookkeeping without resurrecting removed jobs
+/// or overwriting scheduling changes made while the model was running.
+pub fn record_run(path: &Path, job: &CronJob, now: u64) -> anyhow::Result<()> {
+    update(path, |jobs| {
+        if let Some(current) = jobs.iter_mut().find(|j| j.id == job.id) {
+            let schedule_unchanged = current.status == "active"
+                && current.next_run_at == job.next_run_at
+                && current.kind == job.kind
+                && current.interval_secs == job.interval_secs
+                && current.at == job.at;
+            if schedule_unchanged {
+                *current = after_run(current.clone(), now);
+            } else {
+                current.last_run_at = Some(now);
+                current.run_count += 1;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Current unix seconds.
@@ -120,6 +158,65 @@ mod tests {
             last_run_at: None,
             run_count: 0,
         }
+    }
+
+    #[test]
+    fn finishing_run_preserves_schedule_edits() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-cron-merge-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        let path = dir.join("cron.json");
+        let original = job("interval", Some(60), None, "active");
+        let mut paused = original.clone();
+        paused.status = "paused".into();
+        let mut added = original.clone();
+        added.id = "new".into();
+        save(&path, &[paused, added]).unwrap();
+        record_run(&path, &original, 200).unwrap();
+        let current = load(&path);
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].status, "paused");
+        assert_eq!(current[0].run_count, 1);
+        save(&path, &current[1..]).unwrap();
+        record_run(&path, &original, 300).unwrap();
+        assert_eq!(load(&path).len(), 1, "removed job must not return");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_schedule_edits_are_serialized() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-cron-edits-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        let path = dir.join("cron.json");
+        save(&path, &[]).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    update(&path, |jobs| {
+                        let mut new = job("interval", Some(60), None, "active");
+                        new.id = format!("job-{}", jobs.len());
+                        jobs.push(new);
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let jobs = load(&path);
+        assert_eq!(jobs.len(), 8);
+        assert_eq!(
+            jobs.iter()
+                .map(|j| &j.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            8
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

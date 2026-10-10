@@ -53,6 +53,37 @@ struct DaemonState {
     loop_lock: tokio::sync::Mutex<()>,
 }
 
+fn bind_socket(path: &Path) -> Result<UnixListener> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::harness::lock::with_dir_lock(parent, || {
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_socket(),
+                    "refusing to remove non-socket {}",
+                    path.display()
+                );
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => anyhow::bail!("daemon already listening on {}", path.display()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        std::fs::remove_file(path)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(UnixListener::bind(path)?)
+    })
+}
+
 /// Serve the agent loop on `socket_path` until killed.
 pub async fn serve(
     socket_path: &Path,
@@ -81,9 +112,7 @@ pub async fn serve(
     let turns = crate::session::load(sessions_dir, &session_id)?;
     if !turns.is_empty() {
         // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复。
-        let _ = crate::session::repair_unpaired_tool_calls(sessions_dir, &session_id)?;
-        let events = crate::session::load_events(sessions_dir, &session_id)?;
-        let msgs = crate::session::events_to_messages(&events);
+        let msgs = crate::session::resume_messages(sessions_dir, &session_id)?;
         let st = SessionState {
             messages: tokio::sync::Mutex::new(msgs),
         };
@@ -98,9 +127,7 @@ pub async fn serve(
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Remove a stale socket left by a crashed daemon.
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)
+    let listener = bind_socket(socket_path)
         .with_context(|| format!("binding daemon socket {}", socket_path.display()))?;
     eprintln!(
         "sigil daemon: listening on {} (pid {}, session {})",
@@ -130,12 +157,21 @@ pub async fn serve(
             ticker.tick().await;
             let now = crate::cron::now_unix();
             let cron_path = cron_sessions_dir.join("cron.json");
-            let mut jobs = crate::cron::load(&cron_path);
+            let jobs = crate::cron::load(&cron_path);
             let due = crate::cron::due(&jobs, now);
             if due.is_empty() {
                 continue;
             }
             for job in due {
+                let _guard = cron_state.loop_lock.lock().await;
+                // A queued job may have been paused or removed while another turn ran.
+                let Some(job) = crate::cron::load(&cron_path).into_iter().find(|current| {
+                    current.id == job.id
+                        && current.status == "active"
+                        && current.next_run_at <= crate::cron::now_unix()
+                }) else {
+                    continue;
+                };
                 let target = job
                     .session
                     .clone()
@@ -151,7 +187,6 @@ pub async fn serve(
                     truncate_log(&sid, 24),
                     truncate_log(&job.prompt, 40)
                 );
-                let _guard = cron_state.loop_lock.lock().await;
                 let _ = crate::session::append(
                     &cron_sessions_dir,
                     &sid,
@@ -165,13 +200,10 @@ pub async fn serve(
                     let mut messages = session.messages.lock().await;
                     messages.push(ChatMessage::user(job.prompt.clone()));
                 }
-                let mut run_msgs = vec![ChatMessage::system(
+                let run_msgs = crate::agent::messages_for_turn(
+                    &session.messages.lock().await,
                     cron_config.system_prompt_for(&job.prompt),
-                )];
-                {
-                    let messages = session.messages.lock().await;
-                    run_msgs.extend(messages.clone());
-                }
+                );
                 // Phase 63 event-sourced logging: per-job config clone
                 // with a sink pinned to this job's session id (daemon
                 // runs jobs concurrently, so a shared sink would cross
@@ -197,17 +229,16 @@ pub async fn serve(
                 {
                     {
                         let mut messages = session.messages.lock().await;
-                        messages.push(ChatMessage::assistant(result.output.clone()));
+                        *messages = result.messages;
                     }
                     // (assistant turn is logged by the loop's session
                     //  sink — job_config carries the per-job sink above)
                 }
-                for j in jobs.iter_mut() {
-                    if j.id == job.id {
-                        *j = crate::cron::after_run(j.clone(), now);
-                    }
+                if let Err(error) =
+                    crate::cron::record_run(&cron_path, &job, crate::cron::now_unix())
+                {
+                    eprintln!("warning: saving cron run: {error:#}");
                 }
-                let _ = crate::cron::save(&cron_path, &jobs);
             }
         }
     });
@@ -242,11 +273,12 @@ async fn resolve_session(
     requested: Option<&str>,
 ) -> Result<(String, Arc<SessionState>)> {
     let id = requested.unwrap_or(&state.default_session).to_string();
-    let sessions = state.sessions.lock().await;
+    let mut sessions = state.sessions.lock().await;
     if let Some(st) = sessions.get(&id) {
         return Ok((id, st.clone()));
     }
-    drop(sessions);
+    // Keep the map locked through initialization so concurrent first requests
+    // obtain the same session history.
     // Not in memory: adopt an existing on-disk session or start one.
     let turns = crate::session::load(sessions_dir, &id)?;
     let on_disk = sessions_dir.join(format!("{id}.jsonl")).exists();
@@ -257,14 +289,12 @@ async fn resolve_session(
         }
     } else {
         // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复。
-        let _ = crate::session::repair_unpaired_tool_calls(sessions_dir, &id)?;
-        let events = crate::session::load_events(sessions_dir, &id)?;
         SessionState {
-            messages: tokio::sync::Mutex::new(crate::session::events_to_messages(&events)),
+            messages: tokio::sync::Mutex::new(crate::session::resume_messages(sessions_dir, &id)?),
         }
     };
     let st = Arc::new(st);
-    state.sessions.lock().await.insert(id.clone(), st.clone());
+    sessions.insert(id.clone(), st.clone());
     Ok((id, st))
 }
 
@@ -379,13 +409,10 @@ async fn handle_connection(
                 // Run the agent loop over the full conversation:
                 // system prompt (with skills inlined for this user
                 // message) + the accumulated history + the new turn.
-                // NOTE: unlike the REPL (which forgets to send the
-                // system prompt), the daemon always sends it.
-                let mut run_msgs = vec![ChatMessage::system(config.system_prompt_for(&text))];
-                {
-                    let messages = session.messages.lock().await;
-                    run_msgs.extend(messages.clone());
-                }
+                let run_msgs = crate::agent::messages_for_turn(
+                    &session.messages.lock().await,
+                    config.system_prompt_for(&text),
+                );
                 // Event-sourced logging (Phase 63): wire a sink pinned to
                 // this turn's session so ToolCall/ToolResult events land in
                 // the event log. Without it, ordinary daemon turns logged
@@ -431,7 +458,7 @@ async fn handle_connection(
                     Ok(result) => {
                         {
                             let mut messages = session.messages.lock().await;
-                            messages.push(ChatMessage::assistant(result.output.clone()));
+                            *messages = result.messages;
                         }
                         // (assistant turn is logged by the loop's session
                         //  sink on every success exit — see turn_config)
@@ -477,15 +504,17 @@ async fn handle_connection(
                     truncate_log(&text, 40)
                 );
                 let _guard = state.loop_lock.lock().await;
-                let mut sq_msgs = vec![ChatMessage::system(config.system_prompt_for(&text))];
-                {
-                    let messages = session.messages.lock().await;
-                    sq_msgs.extend(messages.clone());
-                }
+                let mut sq_msgs = crate::agent::messages_for_turn(
+                    &session.messages.lock().await,
+                    config.system_prompt_for(&text),
+                );
                 sq_msgs.push(ChatMessage::user(text.clone()));
                 let mut no_tools = ToolRegistry::default();
                 let side_config = AgentConfig {
                     max_steps: 1,
+                    goals: None,
+                    goals_dir: None,
+                    session_sink: None,
                     ..config.clone()
                 };
                 let tx2 = tx.clone();
@@ -526,89 +555,89 @@ async fn handle_connection(
                 // scheduler loop fires due ones into their target session.
                 let action = v["action"].as_str().unwrap_or("");
                 let cron_path = sessions_dir.join("cron.json");
-                let mut jobs = crate::cron::load(&cron_path);
-                let reply = match action {
-                    "add" => {
-                        let prompt = v["prompt"].as_str().unwrap_or("").to_string();
-                        if prompt.trim().is_empty() {
-                            json!({"type": "error", "text": "cron add requires a 'prompt'"})
-                        } else {
-                            let now = crate::cron::now_unix();
-                            let (kind, interval_secs, at, next) = match v["kind"].as_str() {
-                                Some("once") => {
-                                    let at = v["at"].as_u64().unwrap_or(now);
-                                    ("once".to_string(), None, Some(at), at)
-                                }
-                                _ => {
-                                    let iv = v["interval_secs"].as_u64().unwrap_or(60).max(1);
-                                    ("interval".to_string(), Some(iv), None, now + iv)
-                                }
-                            };
-                            let max_suffix = jobs
-                                .iter()
-                                .filter_map(|j| j.id.strip_prefix('c'))
-                                .filter_map(|s| s.parse::<u64>().ok())
-                                .max()
-                                .unwrap_or(0);
-                            let id = format!("c{:05}", max_suffix + 1);
-                            let job = crate::cron::CronJob {
-                                id: id.clone(),
-                                status: "active".into(),
-                                kind,
-                                interval_secs,
-                                at,
-                                prompt,
-                                session: v["session"].as_str().map(|s| s.to_string()),
-                                created_at: now,
-                                next_run_at: next,
-                                last_run_at: None,
-                                run_count: 0,
-                            };
-                            jobs.push(job);
-                            let _ = crate::cron::save(&cron_path, &jobs);
-                            json!({"type": "cron_result", "action": "added", "id": id, "next_run_at": next})
-                        }
-                    }
-                    "list" => json!({
-                        "type": "cron_result",
-                        "action": "list",
-                        "jobs": jobs,
-                    }),
-                    "pause" | "resume" | "remove" => {
-                        let id = v["id"].as_str().unwrap_or("").to_string();
-                        let mut found = false;
-                        for j in jobs.iter_mut() {
-                            if j.id == id {
-                                found = true;
-                                match action {
-                                    "pause" => j.status = "paused".into(),
-                                    "resume" => {
-                                        j.status = "active".into();
-                                        j.next_run_at = if j.kind == "once" {
-                                            j.at.unwrap_or(crate::cron::now_unix())
-                                        } else {
-                                            crate::cron::now_unix() + j.interval_secs.unwrap_or(60)
-                                        };
+                let result = crate::cron::update(&cron_path, |jobs| {
+                    let reply = match action {
+                        "add" => {
+                            let prompt = v["prompt"].as_str().unwrap_or("").to_string();
+                            if prompt.trim().is_empty() {
+                                json!({"type": "error", "text": "cron add requires a 'prompt'"})
+                            } else {
+                                let now = crate::cron::now_unix();
+                                let (kind, interval_secs, at, next) = match v["kind"].as_str() {
+                                    Some("once") => {
+                                        let at = v["at"].as_u64().unwrap_or(now);
+                                        ("once".to_string(), None, Some(at), at)
                                     }
-                                    _ => {}
-                                }
+                                    _ => {
+                                        let iv = v["interval_secs"].as_u64().unwrap_or(60).max(1);
+                                        ("interval".to_string(), Some(iv), None, now + iv)
+                                    }
+                                };
+                                // Never reuse a removed job's id: an in-flight run may
+                                // still merge its completion bookkeeping by that id.
+                                let id = format!("c{}", crate::session::chrono_like_timestamp());
+                                let job = crate::cron::CronJob {
+                                    id: id.clone(),
+                                    status: "active".into(),
+                                    kind,
+                                    interval_secs,
+                                    at,
+                                    prompt,
+                                    session: v["session"].as_str().map(|s| s.to_string()),
+                                    created_at: now,
+                                    next_run_at: next,
+                                    last_run_at: None,
+                                    run_count: 0,
+                                };
+                                jobs.push(job);
+                                json!({"type": "cron_result", "action": "added", "id": id, "next_run_at": next})
                             }
                         }
-                        if action == "remove" {
-                            jobs.retain(|j| j.id != id);
+                        "list" => json!({
+                            "type": "cron_result",
+                            "action": "list",
+                            "jobs": jobs,
+                        }),
+                        "pause" | "resume" | "remove" => {
+                            let id = v["id"].as_str().unwrap_or("").to_string();
+                            let mut found = false;
+                            for j in jobs.iter_mut() {
+                                if j.id == id {
+                                    found = true;
+                                    match action {
+                                        "pause" => j.status = "paused".into(),
+                                        "resume" => {
+                                            j.status = "active".into();
+                                            j.next_run_at = if j.kind == "once" {
+                                                j.at.unwrap_or(crate::cron::now_unix())
+                                            } else {
+                                                crate::cron::now_unix()
+                                                    + j.interval_secs.unwrap_or(60)
+                                            };
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if action == "remove" {
+                                jobs.retain(|j| j.id != id);
+                            }
+                            if found {
+                                json!({"type": "cron_result", "action": action, "id": id})
+                            } else {
+                                json!({"type": "error", "text": format!("no cron job '{id}' (see cron list)")})
+                            }
                         }
-                        if found {
-                            let _ = crate::cron::save(&cron_path, &jobs);
-                            json!({"type": "cron_result", "action": action, "id": id})
-                        } else {
-                            json!({"type": "error", "text": format!("no cron job '{id}' (see cron list)")})
-                        }
-                    }
-                    other => json!({
-                        "type": "error",
-                        "text": format!("unknown cron action '{other}' (expected add|list|pause|resume|remove)")
-                    }),
-                };
+                        other => json!({
+                            "type": "error",
+                            "text": format!("unknown cron action '{other}' (expected add|list|pause|resume|remove)")
+                        }),
+                    };
+                    Ok(reply)
+                });
+                let reply = result.unwrap_or_else(|error| {
+                    json!({"type":"error", "text":format!("saving cron schedule: {error:#}")})
+                });
                 let _ = tx.send(format!("{reply}\n"));
             }
             _ => {}
@@ -757,6 +786,108 @@ fn friendly_connect_error(socket_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn second_daemon_cannot_unlink_live_socket() {
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "sgsock-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(bind_socket(&path).is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_startups_replace_stale_socket_once() {
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "sgstale-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let barrier = std::sync::Barrier::new(2);
+        let handle = tokio::runtime::Handle::current();
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let _entered = handle.enter();
+                barrier.wait();
+                bind_socket(&path)
+            });
+            let second = scope.spawn(|| {
+                let _entered = handle.enter();
+                barrier.wait();
+                bind_socket(&path)
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(UnixStream::connect(&path).await.is_ok());
+        drop(results);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_session_retains_tool_call_and_result() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-resume-tools-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        crate::session::start_with_id(&dir, "saved").unwrap();
+        for event in [
+            crate::session::Event::User {
+                ts: None,
+                text: "read".into(),
+            },
+            crate::session::Event::ToolCall {
+                ts: None,
+                id: "c1".into(),
+                name: "read_file".into(),
+                args: "{}".into(),
+                revert_key: String::new(),
+            },
+            crate::session::Event::ToolResult {
+                ts: None,
+                id: "c1".into(),
+                name: "read_file".into(),
+                ok: true,
+                output: "saved content".into(),
+                revertible: None,
+            },
+            crate::session::Event::Assistant {
+                ts: None,
+                text: "finished".into(),
+            },
+        ] {
+            crate::session::append_event(&dir, "saved", &event).unwrap();
+        }
+        let state = DaemonState {
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            default_session: "saved".into(),
+            loop_lock: tokio::sync::Mutex::new(()),
+        };
+        let (_, restored) = resolve_session(&state, &dir, None).await.unwrap();
+        let messages = restored.messages.lock().await;
+        assert!(messages.iter().any(|m| {
+            m.tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls[0].id == "c1")
+        }));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == crate::llm::Role::Tool && m.content == "saved content")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn turns_to_messages_maps_roles() {

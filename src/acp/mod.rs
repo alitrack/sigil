@@ -104,13 +104,8 @@ struct SessionState {
 #[derive(Default)]
 pub struct AcpState {
     sessions: std::collections::HashMap<String, SessionState>,
-    /// The session most recently created, forked, or prompted. In the
-    /// serial client protocol (one in-flight prompt per client) this
-    /// is the session a mid-turn `ask` notification should be
-    /// attributed to — the background turn executor reads it.
-    /// Shared (Arc<Mutex>) like `pending_inputs`: the background
-    /// executor and callbacks run outside `handle_message`.
-    current_session: Arc<std::sync::Mutex<String>>,
+    /// One running prompt per session; other sessions may run concurrently.
+    active_turns: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// session id → accumulated transcript (see [`TranscriptStore`]).
     transcripts: TranscriptStore,
     /// Mid-turn human-input requests: requestId → responder. The
@@ -136,7 +131,6 @@ impl AcpState {
     pub fn new() -> Self {
         Self {
             transcripts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            current_session: Arc::new(std::sync::Mutex::new(String::new())),
             ..Self::default()
         }
     }
@@ -209,15 +203,31 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            state
-                .sessions
-                .insert(session_id.clone(), SessionState { cwd });
+            let cwd_path = if cwd.is_empty() {
+                std::env::current_dir()?
+            } else {
+                std::path::PathBuf::from(&cwd)
+            };
+            if !cwd_path.is_absolute() || !cwd_path.is_dir() {
+                return Ok(vec![Out::Response {
+                    id: id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(
+                        json!({"code": -32602, "message": "cwd must be an absolute path to an existing directory"}),
+                    ),
+                }]);
+            }
+            state.sessions.insert(
+                session_id.clone(),
+                SessionState {
+                    cwd: cwd_path.to_string_lossy().into_owned(),
+                },
+            );
             state
                 .transcripts
                 .lock()
                 .unwrap()
                 .insert(session_id.clone(), Vec::new());
-            *state.current_session.lock().unwrap() = session_id.clone();
             outs.push(Out::Response {
                 id: id.unwrap_or(Value::Null),
                 result: Some(json!({ "sessionId": session_id })),
@@ -265,7 +275,6 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                         .lock()
                         .unwrap()
                         .insert(session_id.clone(), parent_transcript);
-                    *state.current_session.lock().unwrap() = session_id.clone();
                     outs.push(Out::Response {
                         id: id.unwrap_or(Value::Null),
                         result: Some(json!({ "sessionId": session_id })),
@@ -306,6 +315,35 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 })
                 .unwrap_or_default();
 
+            let cwd = state
+                .sessions
+                .get(&session_id)
+                .map(|session| session.cwd.as_str())
+                .unwrap_or("");
+            let cwd = if cwd.is_empty() {
+                std::env::current_dir()?
+            } else {
+                std::path::PathBuf::from(cwd)
+            };
+            if !state
+                .active_turns
+                .lock()
+                .unwrap()
+                .insert(session_id.clone())
+            {
+                return Ok(vec![Out::Response {
+                    id: id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(
+                        json!({"code": -32000, "message": "session already has an active prompt"}),
+                    ),
+                }]);
+            }
+            let context = crate::agent::provider::ExecutionContext {
+                cwd,
+                session_id: session_id.clone(),
+            };
+            let active_turns = state.active_turns.clone();
             let turn = state.turn.clone();
             let transcript = state
                 .transcripts
@@ -314,14 +352,30 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_default();
-            *state.current_session.lock().unwrap() = session_id.clone();
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let session_id_for_turn = session_id.clone();
             tokio::spawn(async move {
-                let result = match &turn {
-                    Some(t) => (t)(session_id_for_turn, prompt_text, transcript).await,
-                    None => Err(anyhow::anyhow!("no turn executor installed")),
+                struct ActiveTurn {
+                    sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+                    session_id: String,
+                }
+                impl Drop for ActiveTurn {
+                    fn drop(&mut self) {
+                        self.sessions.lock().unwrap().remove(&self.session_id);
+                    }
+                }
+                let guard = ActiveTurn {
+                    sessions: active_turns,
+                    session_id: session_id_for_turn.clone(),
                 };
+                let result = crate::agent::provider::with_execution_context(Some(context), async {
+                    match &turn {
+                        Some(t) => (t)(session_id_for_turn, prompt_text, transcript).await,
+                        None => Err(anyhow::anyhow!("no turn executor installed")),
+                    }
+                })
+                .await;
+                drop(guard);
                 let _ = done_tx.send(result);
             });
             outs.push(Out::Deferred {
@@ -336,6 +390,15 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            if state.active_turns.lock().unwrap().contains(&sid) {
+                return Ok(vec![Out::Response {
+                    id: id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(
+                        json!({"code": -32000, "message": "cannot close a session with an active prompt"}),
+                    ),
+                }]);
+            }
             state.sessions.remove(&sid);
             state.transcripts.lock().unwrap().remove(&sid);
             outs.push(Out::Response {
@@ -402,6 +465,13 @@ pub async fn handle_message(state: &mut AcpState, msg: &Value) -> Result<Vec<Out
     Ok(outs)
 }
 
+fn session_notification(update: Value) -> Out {
+    let session_id = crate::agent::provider::execution_context()
+        .map(|context| context.session_id)
+        .unwrap_or_default();
+    Out::Notification { session_id, update }
+}
+
 /// Run the ACP server loop on stdin/stdout until EOF.
 ///
 /// The loop is concurrent: prompts spawn a background turn and yield
@@ -423,7 +493,6 @@ pub async fn serve(
     let mut stdout = tokio::io::stdout();
 
     let mut state = AcpState::new();
-    let current_session = state.current_session.clone();
 
     // Mid-turn question notifications flow from the background turn
     // executor (AskCb) to the stdio loop over this channel.
@@ -431,16 +500,13 @@ pub async fn serve(
 
     // The AskCb: surface `agent_request_input` to the host and wait
     // for its `agent/request.input` answer. The notification is
-    // attributed to the session the prompt handler marked current
-    // (serial client protocol: one in-flight prompt).
+    // attributed to the turn's task-local session, including delegates.
     {
         let pending_inputs = state.pending_inputs();
         let notif_tx_for_ask = notif_tx.clone();
-        let current_for_ask = current_session.clone();
         let ask_cb: Arc<crate::agent::AskCb> = Arc::new(move |req: crate::agent::AskRequest| {
             let pending_inputs = pending_inputs.clone();
             let notif_tx = notif_tx_for_ask.clone();
-            let current = current_for_ask.clone();
             Box::pin(async move {
                 let request_id = format!(
                     "in-{}",
@@ -454,18 +520,14 @@ pub async fn serve(
                     .lock()
                     .unwrap()
                     .insert(request_id.clone(), tx);
-                let session_id = current.lock().unwrap().clone();
                 notif_tx
-                    .send(Out::Notification {
-                        session_id,
-                        update: json!({
-                            "sessionUpdate": "agent_request_input",
-                            "requestId": request_id,
-                            "question": req.question,
-                            "options": req.options,
-                            "kind": req.kind,
-                        }),
-                    })
+                    .send(session_notification(json!({
+                        "sessionUpdate": "agent_request_input",
+                        "requestId": request_id,
+                        "question": req.question,
+                        "options": req.options,
+                        "kind": req.kind,
+                    })))
                     .map_err(|_| anyhow::anyhow!("host disconnected while asking"))?;
                 let answer = rx
                     .await
@@ -489,24 +551,19 @@ pub async fn serve(
     // notifications — the host can show branches starting/finishing.
     {
         let progress_tx = notif_tx.clone();
-        let current_for_delegate = current_session.clone();
         let provider2 = provider.clone();
         let config2 = agent_config.clone();
         let progress_cb: std::sync::Arc<
             dyn Fn(crate::tools::delegate::DelegateProgress) + Send + Sync,
         > = std::sync::Arc::new(move |p: crate::tools::delegate::DelegateProgress| {
-            let session_id = current_for_delegate.lock().unwrap().clone();
-            let _ = progress_tx.send(Out::Notification {
-                session_id,
-                update: json!({
-                    "sessionUpdate": "agent_delegate_progress",
-                    "id": p.id,
-                    "name": p.name,
-                    "status": p.status,
-                    "step": p.step,
-                    "total": p.total,
-                }),
-            });
+            let _ = progress_tx.send(session_notification(json!({
+                "sessionUpdate": "agent_delegate_progress",
+                "id": p.id,
+                "name": p.name,
+                "status": p.status,
+                "step": p.step,
+                "total": p.total,
+            })));
         });
         tools.register(std::sync::Arc::new(
             crate::tools::delegate::DelegateTool::new(

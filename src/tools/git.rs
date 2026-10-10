@@ -14,6 +14,7 @@ async fn git_with_shell(
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args);
+    crate::agent::provider::apply_working_directory(&mut cmd);
     // Phase B: 执行走 ShellProvider 缝隙（默认 LocalShellProvider）。
     let output = match shell.run(cmd, super::bash::CMD_TIMEOUT).await? {
         Some(o) => o,

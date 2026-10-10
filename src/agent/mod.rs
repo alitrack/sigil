@@ -567,6 +567,19 @@ fn accumulate_usage(tokens: &mut Option<TokenUsage>, u: Option<TokenUsage>) {
     }
 }
 
+/// Refresh the harness prompt while retaining tool history and compaction summaries.
+pub fn messages_for_turn(history: &[ChatMessage], system: String) -> Vec<ChatMessage> {
+    let mut messages = history.to_vec();
+    if messages.first().is_some_and(|m| {
+        m.role == Role::System && !m.content.starts_with("[earlier conversation compressed]")
+    }) {
+        messages[0] = ChatMessage::system(system);
+    } else {
+        messages.insert(0, ChatMessage::system(system));
+    }
+    messages
+}
+
 /// The core agent loop over a pre-built message list
 /// (system prompt + any prior turns + the new user message). The REPL
 /// uses this to keep true multi-turn context across turns and sessions.
@@ -639,18 +652,24 @@ pub async fn run_messages(
         if let Some(goals) = &config.goals
             && let Ok(mut g) = goals.write()
         {
-            // Turn-budget accounting: one LLM call = one turn. Spend a
-            // turn on every active goal, auto-pause the exhausted ones,
-            // and persist (the tool holds the same Arc, so the budget
-            // state stays consistent for `manage_goals list`).
-            let paused =
-                crate::goals::bump_turn_usage(&mut g) + crate::goals::pause_exhausted(&mut g);
-            if paused > 0
-                && let Some(dir) = &config.goals_dir
-            {
-                let _ = crate::goals::save_goals(dir, &g);
-            }
-            if let Some(block) = crate::goals::active_goals_block(&g) {
+            let account = |goals: &mut Vec<crate::goals::GoalState>| {
+                crate::goals::pause_exhausted(goals);
+                let block = crate::goals::active_goals_block(goals);
+                crate::goals::bump_turn_usage(goals);
+                crate::goals::pause_exhausted(goals);
+                Ok(block)
+            };
+            let block = if let Some(dir) = &config.goals_dir {
+                let (block, updated) = crate::goals::update_goals(dir, account)?;
+                *g = updated;
+                block
+            } else {
+                account(&mut g)?
+            };
+            messages.retain(|m| {
+                !(m.role == Role::System && m.content.starts_with(crate::goals::GOALS_MARKER))
+            });
+            if let Some(block) = block {
                 inject_goals_block(&mut messages, &block);
             }
         }
@@ -725,6 +744,7 @@ pub async fn run_messages(
                 });
                 sink(crate::session::Event::TurnEnd { ts: None });
             }
+            messages.push(ChatMessage::assistant(summary.clone()));
             return Ok(RunResult {
                 output: summary,
                 steps: step,
@@ -1008,6 +1028,7 @@ pub async fn run_messages(
                     });
                     sink(crate::session::Event::TurnEnd { ts: None });
                 }
+                messages.push(ChatMessage::assistant(answer.trim()));
                 return Ok(RunResult {
                     output: answer.trim().to_string(),
                     steps: step,
@@ -1289,6 +1310,7 @@ pub async fn run_messages(
             });
             sink(crate::session::Event::TurnEnd { ts: None });
         }
+        messages.push(ChatMessage::assistant(text.trim()));
         return Ok(RunResult {
             output: text.trim().to_string(),
             steps: step,
@@ -2844,6 +2866,269 @@ mod parallel_tests {
             provider.0.load(Ordering::SeqCst),
             2,
             "exactly two streams: empty + retry"
+        );
+    }
+
+    #[derive(Debug)]
+    struct RecordingProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        first_tool: bool,
+    }
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn chat_stream(&self, req: ChatRequest) -> anyhow::Result<ChatStream> {
+            let mut requests = self.requests.lock().unwrap();
+            let tools = self.first_tool && requests.is_empty();
+            requests.push(req.messages);
+            Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                crate::llm::provider::ChatChunk {
+                    delta: if tools {
+                        String::new()
+                    } else {
+                        "answer".into()
+                    },
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: tools,
+                    streamed_tool_calls: if tools {
+                        vec![ToolCall {
+                            id: "echo-1".into(),
+                            name: "echo_tool".into(),
+                            arguments: serde_json::json!({}),
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    usage: None,
+                },
+            )])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> anyhow::Result<ChatComplete> {
+            anyhow::bail!("unexpected replay")
+        }
+    }
+
+    #[tokio::test]
+    async fn next_turn_request_retains_tool_results_and_compaction() {
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+            first_tool: true,
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let config = test_config();
+        let first = run_messages(
+            &provider,
+            &mut tools,
+            &config,
+            &[ChatMessage::user("read")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut next = messages_for_turn(&first.messages, "fresh harness".into());
+        next.push(ChatMessage::user("follow up"));
+        run_messages(&provider, &mut tools, &config, &next, None, None)
+            .await
+            .unwrap();
+        {
+            let requests = provider.requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request[0].content, "fresh harness");
+            assert!(
+                request
+                    .iter()
+                    .any(|m| m.role == Role::Tool && m.content == "OUT")
+            );
+            assert!(
+                request
+                    .iter()
+                    .any(|m| m.role == Role::Assistant && m.content == "answer")
+            );
+        }
+
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+            first_tool: false,
+        };
+        let mut config = test_config();
+        config.max_context_messages = 6;
+        let mut history = vec![ChatMessage::system("old harness")];
+        for index in 0..20 {
+            history.push(ChatMessage::user(format!("old-{index}")));
+            history.push(ChatMessage::assistant("reply"));
+        }
+        let first = run_messages(&provider, &mut tools, &config, &history, None, None)
+            .await
+            .unwrap();
+        assert!(first.messages.len() <= 7);
+        let mut next = messages_for_turn(&first.messages, "fresh harness".into());
+        next.push(ChatMessage::user("continue"));
+        run_messages(&provider, &mut tools, &config, &next, None, None)
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert!(request.len() <= 6);
+        assert!(request.iter().any(|m| m.role == Role::System
+            && m.content.starts_with("[earlier conversation compressed]")));
+        assert_eq!(request[0].content, "fresh harness");
+    }
+
+    #[test]
+    fn prompt_refresh_keeps_multiple_summaries() {
+        let history = vec![
+            ChatMessage::system("old"),
+            ChatMessage::system("[earlier conversation compressed] first"),
+            ChatMessage::system("[earlier conversation compressed] second"),
+            ChatMessage::user("q"),
+        ];
+        let refreshed = messages_for_turn(&history, "new".into());
+        assert_eq!(refreshed.len(), history.len());
+        assert_eq!(refreshed[0].content, "new");
+        assert_eq!(refreshed[1].content, history[1].content);
+        assert_eq!(refreshed[2].content, history[2].content);
+        let refreshed = messages_for_turn(&history[1..], "new".into());
+        assert_eq!(refreshed[1].content, history[1].content);
+    }
+
+    #[tokio::test]
+    async fn goal_budget_is_persisted_and_one_turn_goal_is_visible() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-budget-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        let goals = vec![
+            crate::goals::GoalState::with_turn_budget("one".into(), "finish objective".into(), 1),
+            crate::goals::GoalState::with_turn_budget(
+                "many".into(),
+                "another objective".into(),
+                10,
+            ),
+        ];
+        crate::goals::save_goals(&dir, &goals).unwrap();
+        let mut config = test_config();
+        config.goals = Some(std::sync::Arc::new(std::sync::RwLock::new(goals)));
+        config.goals_dir = Some(dir.clone());
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+            first_tool: false,
+        };
+        let out = run_messages(
+            &provider,
+            &mut ToolRegistry::new(),
+            &config,
+            &[ChatMessage::user("q")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            provider.requests.lock().unwrap()[0]
+                .iter()
+                .any(|m| m.content.contains("finish objective")),
+            "budget-one goal must reach its request"
+        );
+        assert_eq!(crate::goals::load_goals(&dir)[1].turns_used, 1);
+        assert_eq!(
+            out.messages.last().unwrap().content,
+            out.output,
+            "final answer belongs in transcript"
+        );
+        config.goals = Some(Arc::new(std::sync::RwLock::new(crate::goals::load_goals(
+            &dir,
+        ))));
+        run_messages(
+            &provider,
+            &mut ToolRegistry::new(),
+            &config,
+            &[ChatMessage::user("after restart")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(crate::goals::load_goals(&dir)[1].turns_used, 2);
+        assert!(
+            !provider
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .iter()
+                .any(|m| m.content.contains("finish objective"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_budget_usage_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-partial-budget-{}",
+            crate::session::chrono_like_timestamp()
+        ));
+        crate::goals::save_goals(
+            &dir,
+            &[crate::goals::GoalState::with_turn_budget(
+                "g".into(),
+                "finish objective".into(),
+                10,
+            )],
+        )
+        .unwrap();
+        let mut config = test_config();
+        config.goals_dir = Some(dir.clone());
+        for expected in 1..=2 {
+            config.goals = Some(Arc::new(std::sync::RwLock::new(crate::goals::load_goals(
+                &dir,
+            ))));
+            run_messages(
+                &AnswerProvider,
+                &mut ToolRegistry::new(),
+                &config,
+                &[ChatMessage::user("q")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let persisted = crate::goals::load_goals(&dir);
+            assert_eq!(persisted[0].turns_used, expected);
+            assert_eq!(persisted[0].status, crate::goals::GoalStatus::Active);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_goals_remove_prior_injection() {
+        let mut goal = crate::goals::GoalState::new("g".into(), "finish objective".into());
+        goal.status = crate::goals::GoalStatus::Paused;
+        let mut config = test_config();
+        config.goals = Some(std::sync::Arc::new(std::sync::RwLock::new(vec![goal])));
+        let out = run_messages(
+            &AnswerProvider,
+            &mut ToolRegistry::new(),
+            &config,
+            &[
+                ChatMessage::system("base"),
+                ChatMessage::system("## Active goals\nfinish objective"),
+                ChatMessage::user("q"),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.messages
+                .iter()
+                .any(|m| m.content.starts_with(crate::goals::GOALS_MARKER))
         );
     }
 

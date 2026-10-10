@@ -86,6 +86,7 @@ impl Tool for BashTool {
 
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(command);
+        crate::agent::provider::apply_working_directory(&mut cmd);
         // Phase B: 执行走 ShellProvider 缝隙（默认 LocalShellProvider，行为与旧一致）。
         let output = match self.shell.run(cmd, CMD_TIMEOUT).await? {
             Some(o) => o,

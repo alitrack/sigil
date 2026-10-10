@@ -100,20 +100,34 @@ pub fn load_goals(dir: &std::path::Path) -> Vec<GoalState> {
 }
 
 /// Persist goals atomically (tmp + rename) under the directory lock.
+#[cfg(test)]
 pub fn save_goals(dir: &std::path::Path, goals: &[GoalState]) -> anyhow::Result<()> {
+    crate::harness::lock::with_dir_lock(dir, || save_goals_unlocked(dir, goals))
+}
+
+fn save_goals_unlocked(dir: &std::path::Path, goals: &[GoalState]) -> anyhow::Result<()> {
     let path = dir.join("goals.jsonl");
     let tmp = dir.join("goals.jsonl.tmp");
     let mut out = String::new();
-    for g in goals {
-        if let Ok(line) = serde_json::to_string(g) {
-            out.push_str(&line);
-            out.push('\n');
-        }
+    for goal in goals {
+        out.push_str(&serde_json::to_string(goal)?);
+        out.push('\n');
     }
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Reload and mutate persistent goals as one cross-process transaction.
+pub fn update_goals<T>(
+    dir: &std::path::Path,
+    f: impl FnOnce(&mut Vec<GoalState>) -> anyhow::Result<T>,
+) -> anyhow::Result<(T, Vec<GoalState>)> {
     crate::harness::lock::with_dir_lock(dir, || {
-        std::fs::write(&tmp, out.as_bytes())?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        let mut goals = load_goals(dir);
+        let result = f(&mut goals)?;
+        save_goals_unlocked(dir, &goals)?;
+        Ok((result, goals))
     })
 }
 

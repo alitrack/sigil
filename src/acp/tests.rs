@@ -424,7 +424,7 @@ mod acp_tests {
             &mut s,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "agent/session/new",
-                "params": { "cwd": "/work", "mcpServers": [] }
+                "params": { "cwd": std::env::temp_dir(), "mcpServers": [] }
             }),
         )
         .await
@@ -520,4 +520,219 @@ mod acp_tests {
             _ => panic!("expected error response"),
         }
     }
+}
+
+#[tokio::test]
+async fn regression_prompt_uses_session_cwd() {
+    use crate::tools::Tool;
+    let dir = std::env::temp_dir().join(format!(
+        "sigil-acp-cwd-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session-file.txt"), "session contents").unwrap();
+    let original_cwd = std::env::current_dir().unwrap();
+    let mut state = AcpState::new();
+    state.turn = Some(Arc::new(|_, _, history| {
+        Box::pin(async move {
+            let read = crate::tools::files::ReadFileTool::new()
+                .run(&json!({"path":"session-file.txt"}))
+                .await?;
+            let shell = crate::tools::bash::BashTool::new()
+                .run(&json!({"command":"pwd"}))
+                .await?;
+            Ok((format!("{}\n{}", read.text, shell.text), history))
+        })
+    }));
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{"cwd":dir}}),
+    )
+    .await
+    .unwrap();
+    let sid = session_id_of(&out[0]);
+    let out = handle_message(
+        &mut state,
+        &json!({"id":2,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    let (_, _, done) = deferred(out.into_iter().next().unwrap());
+    let (text, _) = done.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        text.contains("session contents"),
+        "relative file escaped session cwd: {text}"
+    );
+    assert!(
+        text.contains(dir.to_str().unwrap()),
+        "shell escaped session cwd: {text}"
+    );
+    assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+}
+
+#[tokio::test]
+async fn regression_overlapping_session_prompts_are_rejected() {
+    let mut state = AcpState::new();
+    state.turn = Some(Arc::new(|_, _, _| Box::pin(std::future::pending())));
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{}}),
+    )
+    .await
+    .unwrap();
+    let sid = session_id_of(&out[0]);
+    let first = handle_message(
+        &mut state,
+        &json!({"id":2,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first[0], Out::Deferred { .. }));
+    let second = handle_message(
+        &mut state,
+        &json!({"id":3,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&second[0], Out::Response { error: Some(_), .. }),
+        "overlapping turn accepted"
+    );
+}
+
+#[tokio::test]
+async fn regression_session_rejects_invalid_cwd() {
+    let mut state = AcpState::new();
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{"cwd":"relative-project"}}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&out[0], Out::Response { error: Some(_), .. }),
+        "relative cwd must be rejected"
+    );
+    let out = handle_message(&mut state, &json!({"id":2,"method":"agent/session/new","params":{"cwd":std::env::temp_dir().join("sigil-nonexistent-session-cwd")}})).await.unwrap();
+    assert!(
+        matches!(&out[0], Out::Response { error: Some(_), .. }),
+        "missing cwd must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn regression_active_session_cannot_close() {
+    let mut state = AcpState::new();
+    state.turn = Some(Arc::new(|_, _, _| Box::pin(std::future::pending())));
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{}}),
+    )
+    .await
+    .unwrap();
+    let sid = session_id_of(&out[0]);
+    let _ = handle_message(
+        &mut state,
+        &json!({"id":2,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    let out = handle_message(
+        &mut state,
+        &json!({"id":3,"method":"agent/session.close","params":{"sessionId":sid}}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&out[0], Out::Response { error: Some(_), .. }),
+        "closing an active session can resurrect its transcript"
+    );
+}
+
+#[tokio::test]
+async fn session_notifications_stay_with_running_turn() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (notifications_tx, mut notifications_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state = AcpState::new();
+    let release_turn = release.clone();
+    state.turn = Some(Arc::new(move |_, _, history| {
+        let started = started.clone();
+        let release = release_turn.clone();
+        let tx = notifications_tx.clone();
+        Box::pin(async move {
+            started.lock().unwrap().take().unwrap().send(()).unwrap();
+            release.notified().await;
+            tx.send(super::session_notification(
+                json!({"sessionUpdate":"agent_request_input"}),
+            ))
+            .unwrap();
+            tx.send(super::session_notification(
+                json!({"sessionUpdate":"agent_delegate_progress"}),
+            ))
+            .unwrap();
+            Ok((String::new(), history))
+        })
+    }));
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{}}),
+    )
+    .await
+    .unwrap();
+    let sid = session_id_of(&out[0]);
+    let out = handle_message(
+        &mut state,
+        &json!({"id":2,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    let (_, _, done) = deferred(out.into_iter().next().unwrap());
+    started_rx.await.unwrap();
+    handle_message(
+        &mut state,
+        &json!({"id":3,"method":"agent/session/new","params":{}}),
+    )
+    .await
+    .unwrap();
+    release.notify_one();
+    done.await.unwrap().unwrap();
+    for _ in 0..2 {
+        match notifications_rx.recv().await.unwrap() {
+            Out::Notification { session_id, .. } => assert_eq!(session_id, sid),
+            _ => panic!("expected session notification"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_turn_releases_session_guard() {
+    let mut state = fake_state();
+    let out = handle_message(
+        &mut state,
+        &json!({"id":1,"method":"agent/session/new","params":{}}),
+    )
+    .await
+    .unwrap();
+    let sid = session_id_of(&out[0]);
+    let out = handle_message(
+        &mut state,
+        &json!({"id":2,"method":"agent/session.prompt","params":{"sessionId":sid,"prompt":[]}}),
+    )
+    .await
+    .unwrap();
+    let (_, _, done) = deferred(out.into_iter().next().unwrap());
+    done.await.unwrap().unwrap();
+    let out = handle_message(
+        &mut state,
+        &json!({"id":3,"method":"agent/session.close","params":{"sessionId":sid}}),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(out[0], Out::Response { error: None, .. }));
 }

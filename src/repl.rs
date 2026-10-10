@@ -106,13 +106,7 @@ pub async fn run(
     // True multi-turn context: the message list accumulates across
     // turns. Resumed sessions load their transcript as real messages
     // (not a text blob), so the model sees the actual conversation.
-    let mut messages: Vec<crate::llm::ChatMessage> = Vec::new();
-    for t in &history {
-        match t.role.as_str() {
-            "assistant" => messages.push(crate::llm::ChatMessage::assistant(&t.text)),
-            _ => messages.push(crate::llm::ChatMessage::user(&t.text)),
-        }
-    }
+    let mut messages = crate::session::resume_messages(sessions_dir, &session_id)?;
 
     // Line editor: created once so history accumulates within the
     // session; saved history is loaded so arrow keys work across
@@ -182,15 +176,7 @@ pub async fn run(
                             *g = session_id.clone();
                         }
                         history = turns.clone();
-                        messages.clear();
-                        for t in &history {
-                            match t.role.as_str() {
-                                "assistant" => {
-                                    messages.push(crate::llm::ChatMessage::assistant(&t.text))
-                                }
-                                _ => messages.push(crate::llm::ChatMessage::user(&t.text)),
-                            }
-                        }
+                        messages = crate::session::resume_messages(sessions_dir, &session_id)?;
                         // Point the line-editor history at the new session.
                         let new_hist = sessions_dir.join(format!("{session_id}.history"));
                         let _ = editor.save_history(&hist_path);
@@ -271,6 +257,7 @@ pub async fn run(
         let _ = editor.save_history(&hist_path);
         // Turn with interactive approval + live streaming output, over
         // the accumulated conversation (multi-turn context).
+        messages = crate::agent::messages_for_turn(&messages, config.system_prompt_for(line));
         messages.push(crate::llm::ChatMessage::user(line));
         let stream_cb = |delta: Option<&str>| {
             match delta {
@@ -312,11 +299,10 @@ pub async fn run(
             );
             eprintln!("\n{msg}");
         }
-        let answer = result.output;
+        messages = result.messages;
         // (assistant turn is logged by the loop's session sink — repl wired
         //  it above; run_messages emits Assistant/TurnEnd on every success
         //  exit. Appending here too would double-log the answer.)
-        messages.push(crate::llm::ChatMessage::assistant(&answer));
         println!();
         let _ = stdout.flush();
     }

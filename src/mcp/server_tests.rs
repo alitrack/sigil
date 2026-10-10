@@ -129,3 +129,74 @@ fn progress_notification_frame_shape() {
     assert_eq!(progress["params"]["progress"], 0.0);
     assert_eq!(progress["params"]["total"], 1.0);
 }
+
+async fn tool_response(
+    registry: &crate::tools::ToolRegistry,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    use tokio::io::AsyncReadExt;
+    let request = json!({"jsonrpc":"2.0", "id":42, "method":"tools/call", "params":{"name":name,"arguments":arguments}}).to_string() + "\n";
+    let (mut reader, writer) = tokio::io::duplex(8192);
+    let run = super::server::serve_io(registry, &[], request.as_bytes(), writer);
+    let read = async {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    };
+    let (result, bytes) = tokio::join!(run, read);
+    result.unwrap();
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == 42)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mcp_rejects_destructive_commands_before_execution() {
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry.register(std::sync::Arc::new(crate::tools::bash::BashTool::new()));
+    // No filesystem effect: only check the prohibited command's response.
+    let response = tool_response(&registry, "bash", json!({"command":"git push --help"})).await;
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("APPROVAL DENIED")
+    );
+}
+
+#[tokio::test]
+async fn mcp_marks_real_tool_errors_without_guessing_from_text() {
+    use crate::tools::{Tool, ToolOutput};
+    struct ResultTool;
+    #[async_trait::async_trait]
+    impl Tool for ResultTool {
+        fn name(&self) -> &str {
+            "result_test"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+        async fn run(&self, args: &serde_json::Value) -> anyhow::Result<ToolOutput> {
+            if args["fail"] == true {
+                anyhow::bail!("tool failure");
+            }
+            Ok(ToolOutput {
+                text: "error: this is successful content".into(),
+            })
+        }
+    }
+    let mut registry = crate::tools::ToolRegistry::new();
+    registry.register(std::sync::Arc::new(ResultTool));
+    let failed = tool_response(&registry, "result_test", json!({"fail":true})).await;
+    assert_eq!(failed["result"]["isError"], true);
+    let success = tool_response(&registry, "result_test", json!({})).await;
+    assert_ne!(success["result"]["isError"], true);
+}

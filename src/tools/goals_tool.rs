@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 
-use crate::goals::{GoalState, GoalStatus, save_goals};
+use crate::goals::{GoalState, GoalStatus, update_goals};
 use crate::tools::{Tool, ToolOutput};
 
 /// Tool that manages persistent goals: add, complete, pause, resume,
@@ -30,8 +30,8 @@ impl ManageGoalsTool {
             .goals
             .write()
             .map_err(|e| anyhow::anyhow!("goals lock poisoned: {e}"))?;
-        let result = f(&mut goals)?;
-        save_goals(&self.goals_dir, &goals)?;
+        let (result, updated) = update_goals(&self.goals_dir, f)?;
+        *goals = updated;
         Ok(result)
     }
 }
@@ -151,10 +151,11 @@ impl Tool for ManageGoalsTool {
                 }
             }
             "list" => {
-                let goals = self
+                let mut goals = self
                     .goals
-                    .read()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("goals lock poisoned: {e}"))?;
+                *goals = crate::goals::load_goals(&self.goals_dir);
                 if goals.is_empty() {
                     return Ok(ToolOutput {
                         text: "no goals yet — use action=add to declare one".to_string(),
@@ -204,6 +205,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (dir.clone(), dir)
+    }
+
+    #[tokio::test]
+    async fn independent_instances_preserve_each_others_goals() {
+        let (dir, _) = fresh_dir("instances");
+        let first = ManageGoalsTool {
+            goals_dir: dir.clone(),
+            goals: Arc::new(RwLock::new(Vec::new())),
+        };
+        let second = ManageGoalsTool {
+            goals_dir: dir.clone(),
+            goals: Arc::new(RwLock::new(Vec::new())),
+        };
+        first
+            .run(&json!({"action":"add","objective":"finish first objective"}))
+            .await
+            .unwrap();
+        second
+            .run(&json!({"action":"add","objective":"finish second objective"}))
+            .await
+            .unwrap();
+        assert_eq!(load_goals(&dir).len(), 2);
+        assert!(
+            first
+                .run(&json!({"action":"list"}))
+                .await
+                .unwrap()
+                .text
+                .contains("second objective")
+        );
     }
 
     #[tokio::test]

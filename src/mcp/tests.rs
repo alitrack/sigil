@@ -168,3 +168,49 @@ mod mcp_tests {
         }
     }
 }
+
+#[tokio::test]
+async fn regression_http_sse_response_returns_before_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0; 8192];
+        let _ = socket.read(&mut buffer).await.unwrap();
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        let event = "data: {\"method\":\"notifications/progress\"}\r\n\r\n: ping\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":1,\"result\":{\"ok\":true,\"text\":\"你好\"}}\r\n\r\n";
+        for part in event.as_bytes().chunks(7) {
+            socket
+                .write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(part).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    let client = McpClient {
+        name: "stream-test".into(),
+        transport: super::McpTransport::Http {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            url,
+            token: None,
+            session: std::sync::Mutex::new(None),
+        },
+        next_id: std::sync::atomic::AtomicU64::new(1),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.request("test", serde_json::json!({})),
+    )
+    .await;
+    server.abort();
+    assert_eq!(
+        result
+            .expect("matching response must return before stream EOF")
+            .unwrap(),
+        serde_json::json!({"ok":true,"text":"你好"})
+    );
+}

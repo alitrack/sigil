@@ -206,6 +206,10 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   `-- desc:` / `-- schema:` 头部注释）。
 - **嵌入式 LuaJIT + FFI** — `mlua` + vendored LuaJIT。脚本可
   `require("ffi")` 调任意 C 库（zlib `crc32` 已端到端验证）。
+- **Lua 执行限制** — Lua 初始化代码和导出函数受 5 秒期限及 1000 万条
+  指令预算限制。禁用 JIT 执行以保证指令钩子能终止循环；钩子无法抢占
+  阻塞的宿主调用或原生 FFI 调用。`--no-default-features` 同时禁用 FFI
+  和原生库加载器。
 - **自进化** — `create_lua_tool`：模型写 Lua → sigil 落盘并热注册 →
   下一轮即可调用，跨会话持久。
 - **Harness 自我改进** — `improve_harness`：模型可编辑自己的
@@ -215,7 +219,8 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   `skills/`；改文件（不改代码）即可改变 agent 行为。
 - **Safety（三层）** — 审批门（破坏性命令非交互模式默认拒绝；REPL 里
   交互 `y/N`）、熔断器（连续失败 3 次熔断）、执行环（只读/工作区/
-  harness 变更）。
+  harness 变更）。未知 Git 子命令、自定义 alias 和外部 Git helper
+  同样需要审批。
 - **Memory** — `remember` / `recall`：模型自己维护的跨会话持久事实。
 - **MCP 客户端** — 配置 `[[mcp.servers]]` 拉起 stdio MCP server，其工具
   变成 `mcp_<server>_<tool>`。
@@ -226,8 +231,9 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
 - **ACP client** — `acp_call` 工具 spawn 外部 ACP server（另一个
   sigil、codex、编辑器 agent）并派发任务——跨进程委托，协议双向。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
-- **真正多轮上下文** — REPL 跨轮维护真实消息列表；`--resume` 把会话记录
-  作为真实 user/assistant 消息载入（模型记得对话，而非文本 blob）。
+- **真正多轮上下文** — REPL 跨轮维护真实消息列表，包括工具调用、结果和
+  压缩摘要；`--resume` 从持久化对话事件恢复上下文（模型记得对话，
+  而非文本 blob）。
 - **行编辑 + 历史** — rustyline：上下键历史、行内编辑；每会话
   `.history` 文件跨会话持久。
 - **流式输出** — 管道与 REPL 模式实时流式显示 assistant 文本
@@ -761,7 +767,8 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
   挂死 agent 循环。两者现在都走 `run_with_timeout`（60s 预算，
   `kill_on_drop` 防孤儿进程），超时作为普通工具输出报告给模型
   （`[bash: command timed out after 60s — process killed]`），循环
-  继续。脚本 Lua 工具本有类似超时；此改动补齐原生工具缺口。
+  继续。Lua 指令预算和执行期限在 2026-10-10 审查修复中加入，适用范围
+  见能力列表。
 - **上下文压缩**。REPL 会话 transcript 无限增长——每轮都重发整个
   历史。`compact_messages` 在 transcript 超过
   `max_context_messages`（默认 40，`0` 禁用）时把最老轮次折叠成

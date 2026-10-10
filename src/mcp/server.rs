@@ -29,9 +29,21 @@ pub struct Resource {
 /// `resources` (harness skills etc.) are exposed via resources/list and
 /// resources/read.
 pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
+    serve_io(tools, resources, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+pub(super) async fn serve_io<R, W>(
+    tools: &ToolRegistry,
+    resources: &[Resource],
+    stdin: R,
+    mut stdout: W,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut registry = tools.clone_shallow();
-    let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = BufReader::new(stdin).lines();
     let mut next_id: u64 = 0;
 
     while let Some(line) = lines.next_line().await? {
@@ -223,7 +235,16 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                 if let Some(frame) = progress(0.0, format!("tool {name} started")) {
                     write_frame(&mut stdout, &frame).await?;
                 }
-                let result = registry.execute(&call).await;
+                let result = if crate::safety::check(&call.name, &call.arguments)
+                    == crate::safety::GateDecision::Reject
+                {
+                    Err(anyhow::anyhow!(crate::safety::reject_message(
+                        &call.name,
+                        &call.arguments
+                    )))
+                } else {
+                    registry.execute_detailed(&call).await
+                };
                 match result {
                     Ok(out) => {
                         if let Some(frame) = progress(1.0, format!("tool {name} finished")) {
@@ -240,8 +261,9 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
                             "result": {
                                 "content": [{
                                     "type": "text",
-                                    "text": out
-                                }]
+                                    "text": out.text
+                                }],
+                                "isError": out.is_error
                             }
                         });
                         write_frame(&mut stdout, &resp).await?;
@@ -292,7 +314,10 @@ pub async fn serve(tools: &ToolRegistry, resources: &[Resource]) -> Result<()> {
     Ok(())
 }
 
-async fn write_frame(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    stdout: &mut W,
+    value: &Value,
+) -> Result<()> {
     let mut line = serde_json::to_string(value).context("serializing MCP frame")?;
     line.push('\n');
     stdout.write_all(line.as_bytes()).await?;

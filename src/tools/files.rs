@@ -71,7 +71,13 @@ impl Tool for ReadFileTool {
             .min(2000);
 
         // Phase B: 文件 IO 走 FsProvider 缝隙（默认 LocalFsProvider）。
-        let content = match self.fs.read_to_string(std::path::Path::new(path)).await {
+        let content = match self
+            .fs
+            .read_to_string(&crate::agent::provider::resolve_path(std::path::Path::new(
+                path,
+            )))
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolOutput {
@@ -158,11 +164,12 @@ impl Tool for WriteFileTool {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("write_file: missing string 'content'"))?;
 
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let resolved = crate::agent::provider::resolve_path(std::path::Path::new(path));
+        if let Some(parent) = resolved.parent() {
             let _ = self.fs.create_dir_all(parent).await;
         }
         // Phase B: 文件 IO 走 FsProvider 缝隙（默认 LocalFsProvider）。
-        match self.fs.write(std::path::Path::new(path), content).await {
+        match self.fs.write(&resolved, content).await {
             Ok(()) => Ok(ToolOutput {
                 text: format!("wrote {} bytes to {path}", content.len()),
             }),

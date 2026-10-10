@@ -5,7 +5,8 @@
 //! load any system C library at runtime, which is the core of sigil's
 //! "evolve by scripting" story.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mlua::{Lua, LuaSerdeExt, Value};
@@ -17,6 +18,23 @@ fn lua_err(e: mlua::Error) -> anyhow::Error {
 
 pub struct LuaRuntime {
     lua: Mutex<Lua>,
+    budget: Arc<Mutex<Option<ExecutionBudget>>>,
+}
+
+struct ExecutionBudget {
+    deadline: Instant,
+    instructions_left: u64,
+}
+
+impl ExecutionBudget {
+    fn check(&self) -> mlua::Result<()> {
+        if self.instructions_left == 0 || Instant::now() >= self.deadline {
+            return Err(mlua::Error::RuntimeError(
+                "Lua execution budget exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl LuaRuntime {
@@ -43,10 +61,52 @@ impl LuaRuntime {
         // SAFETY: mlua's safe `new_with` refuses the `ffi` standard
         // library (it's classified unsafe because Lua scripts could
         // load arbitrary C libraries). sigil *wants* exactly that in
-        // the default build — we are the host; we accept the risk. All
-        // other safety properties of mlua still hold. The containment
-        // build simply omits FFI from the set.
+        // the default build — we are the host; we accept the risk. The
+        // containment build uses the safe constructor, which also disables
+        // package.loadlib and native module searchers.
+        #[cfg(feature = "lua-ffi")]
         let lua = unsafe { Lua::unsafe_new_with(stdlib, mlua::LuaOptions::default()) };
+        #[cfg(not(feature = "lua-ffi"))]
+        let lua = Lua::new_with(stdlib, mlua::LuaOptions::default()).map_err(lua_err)?;
+
+        // Count hooks do not reliably interrupt JIT traces. Disable the engine
+        // and expose only the harmless JIT controls, so scripts cannot turn it
+        // back on. FFI/native calls remain outside this cooperative CPU budget.
+        lua.load(
+            r#"
+            jit.off()
+            jit.flush()
+            jit = {
+                off = jit.off, flush = jit.flush, status = jit.status,
+                version = jit.version, version_num = jit.version_num,
+                os = jit.os, arch = jit.arch,
+            }
+            package.loaded.jit = jit
+            package.preload.jit = nil
+        "#,
+        )
+        .exec()
+        .map_err(lua_err)?;
+        let budget: Arc<Mutex<Option<ExecutionBudget>>> = Arc::new(Mutex::new(None));
+        // Hook errors can be caught by Lua pcall/xpcall. Check the same budget
+        // after protected calls return, outside their protected Lua frame.
+        for name in ["pcall", "xpcall"] {
+            let original: mlua::Function = lua.globals().get(name).map_err(lua_err)?;
+            let state = budget.clone();
+            let wrapped = lua
+                .create_function(move |_, args: mlua::MultiValue| {
+                    if let Some(budget) = state.lock().unwrap().as_ref() {
+                        budget.check()?;
+                    }
+                    let result = original.call::<mlua::MultiValue>(args);
+                    if let Some(budget) = state.lock().unwrap().as_ref() {
+                        budget.check()?;
+                    }
+                    result
+                })
+                .map_err(lua_err)?;
+            lua.globals().set(name, wrapped).map_err(lua_err)?;
+        }
         // Containment build: LuaJIT registers `ffi` in package.preload
         // even when the stdlib flag is absent — strip the loaders so
         // `require("ffi")` cannot reach it (belt and suspenders on top
@@ -101,8 +161,10 @@ impl LuaRuntime {
         host.set(
             "read_file",
             lua.create_function(|_lua, path: String| {
-                std::fs::read_to_string(&path)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("read_file: {e}")))
+                std::fs::read_to_string(crate::agent::provider::resolve_path(std::path::Path::new(
+                    &path,
+                )))
+                .map_err(|e| mlua::Error::RuntimeError(format!("read_file: {e}")))
             })
             .map_err(lua_err)?,
         )
@@ -110,8 +172,11 @@ impl LuaRuntime {
         host.set(
             "write_file",
             lua.create_function(|_lua, (path, content): (String, String)| {
-                std::fs::write(&path, &content)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("write_file: {e}")))?;
+                std::fs::write(
+                    crate::agent::provider::resolve_path(std::path::Path::new(&path)),
+                    &content,
+                )
+                .map_err(|e| mlua::Error::RuntimeError(format!("write_file: {e}")))?;
                 Ok(())
             })
             .map_err(lua_err)?,
@@ -127,8 +192,10 @@ impl LuaRuntime {
             "list_dir",
             lua.create_function(|_lua, dir: String| {
                 let mut names: Vec<String> = Vec::new();
-                let entries = std::fs::read_dir(&dir)
-                    .map_err(|e| mlua::Error::RuntimeError(format!("list_dir: {e}")))?;
+                let entries = std::fs::read_dir(crate::agent::provider::resolve_path(
+                    std::path::Path::new(&dir),
+                ))
+                .map_err(|e| mlua::Error::RuntimeError(format!("list_dir: {e}")))?;
                 for e in entries.flatten() {
                     names.push(e.file_name().to_string_lossy().into_owned());
                 }
@@ -141,7 +208,9 @@ impl LuaRuntime {
         host.set(
             "cwd",
             lua.create_function(|_lua, ()| {
-                Ok(std::env::current_dir()
+                Ok(crate::agent::provider::execution_context()
+                    .map(|context| context.cwd)
+                    .or_else(|| std::env::current_dir().ok())
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default())
             })
@@ -211,7 +280,42 @@ impl LuaRuntime {
 
         Ok(Self {
             lua: Mutex::new(lua),
+            budget,
         })
+    }
+
+    /// Bound both chunk initialization and the exported function. The lock
+    /// serializes state access; the budget starts only after obtaining it.
+    fn execute<T>(&self, lua: &Lua, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        const HOOK_INTERVAL: u64 = 1000;
+        *self.budget.lock().unwrap() = Some(ExecutionBudget {
+            deadline: Instant::now() + Duration::from_secs(5),
+            instructions_left: 10_000_000,
+        });
+        let state = self.budget.clone();
+        let hook = lua
+            .set_global_hook(
+                mlua::HookTriggers::new().every_nth_instruction(HOOK_INTERVAL as u32),
+                move |_, _| {
+                    if let Some(budget) = state.lock().unwrap().as_mut() {
+                        budget.instructions_left =
+                            budget.instructions_left.saturating_sub(HOOK_INTERVAL);
+                        budget.check()?;
+                    }
+                    Ok(mlua::VmState::Continue)
+                },
+            )
+            .map_err(lua_err);
+        let result = hook.and_then(|_| run()).and_then(|value| {
+            if let Some(budget) = self.budget.lock().unwrap().as_ref() {
+                budget.check().map_err(lua_err)?;
+            }
+            Ok(value)
+        });
+        lua.remove_global_hook();
+        lua.remove_hook();
+        *self.budget.lock().unwrap() = None;
+        result
     }
 
     /// Run a Lua chunk, returning its JSON-serialized result.
@@ -223,17 +327,19 @@ impl LuaRuntime {
             .lua
             .lock()
             .map_err(|_| anyhow::anyhow!("lua lock poisoned"))?;
-        let result: Value = lua
-            .load(source)
-            .eval()
-            .map_err(lua_err)
-            .with_context(|| format!("lua eval failed for source: {source}"))?;
-        let json = lua
-            .to_value(&result)
-            .map_err(lua_err)
-            .context("lua value → JSON")?;
-        let text = serde_json::to_string(&json).context("JSON serialize")?;
-        Ok(text)
+        self.execute(&lua, || {
+            let result: Value = lua
+                .load(source)
+                .eval()
+                .map_err(lua_err)
+                .with_context(|| format!("lua eval failed for source: {source}"))?;
+            let json = lua
+                .to_value(&result)
+                .map_err(lua_err)
+                .context("lua value → JSON")?;
+            let text = serde_json::to_string(&json).context("JSON serialize")?;
+            Ok(text)
+        })
     }
 
     /// Load a Lua file, get its exported function, call it with the
@@ -246,21 +352,23 @@ impl LuaRuntime {
             .lua
             .lock()
             .map_err(|_| anyhow::anyhow!("lua lock poisoned"))?;
-        let source = std::fs::read_to_string(path)?;
-        // 1. Evaluate the file → get the exported function.
-        let exported: Value = lua.load(&source).set_name(path).eval().map_err(lua_err)?;
-        let func: mlua::Function = exported
-            .as_function()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("scripted tool {path} must return a function"))?;
-        // 2. Call it with the args table.
-        let args: serde_json::Value =
-            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-        let result: Value = func
-            .call(lua.to_value(&args).map_err(lua_err)?)
-            .map_err(lua_err)?;
-        let json = lua.to_value(&result).map_err(lua_err)?;
-        Ok(serde_json::to_string(&json)?)
+        self.execute(&lua, || {
+            let source = std::fs::read_to_string(path)?;
+            // 1. Evaluate the file → get the exported function.
+            let exported: Value = lua.load(&source).set_name(path).eval().map_err(lua_err)?;
+            let func: mlua::Function = exported
+                .as_function()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("scripted tool {path} must return a function"))?;
+            // 2. Call it with the args table.
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            let result: Value = func
+                .call(lua.to_value(&args).map_err(lua_err)?)
+                .map_err(lua_err)?;
+            let json = lua.to_value(&result).map_err(lua_err)?;
+            Ok(serde_json::to_string(&json)?)
+        })
     }
 
     /// Like `run_file` but returns the hook's return value as a typed
@@ -276,30 +384,127 @@ impl LuaRuntime {
             .lua
             .lock()
             .map_err(|_| anyhow::anyhow!("lua lock poisoned"))?;
-        let source = std::fs::read_to_string(path)?;
-        let exported: Value = lua.load(&source).set_name(path).eval().map_err(lua_err)?;
-        let func: mlua::Function = exported
-            .as_function()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("scripted tool {path} must return a function"))?;
-        let args: serde_json::Value =
-            serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
-        let result: Value = func
-            .call(lua.to_value(&args).map_err(lua_err)?)
-            .map_err(lua_err)?;
-        // Serialize the Lua value to a JSON string, then parse it into a
-        // typed serde value. (Reuses the same serde round-trip the string
-        // variant of run_file relies on, so tables/bools/nil all land as
-        // the corresponding JSON object/bool/null.)
-        let json = lua.to_value(&result).map_err(lua_err)?;
-        let s = serde_json::to_string(&json)?;
-        Ok(serde_json::from_str(&s)?)
+        self.execute(&lua, || {
+            let source = std::fs::read_to_string(path)?;
+            let exported: Value = lua.load(&source).set_name(path).eval().map_err(lua_err)?;
+            let func: mlua::Function = exported
+                .as_function()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("scripted tool {path} must return a function"))?;
+            let args: serde_json::Value =
+                serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
+            let result: Value = func
+                .call(lua.to_value(&args).map_err(lua_err)?)
+                .map_err(lua_err)?;
+            // Serialize the Lua value to a JSON string, then parse it into a
+            // typed serde value. (Reuses the same serde round-trip the string
+            // variant of run_file relies on, so tables/bools/nil all land as
+            // the corresponding JSON object/bool/null.)
+            let json = lua.to_value(&result).map_err(lua_err)?;
+            let s = serde_json::to_string(&json)?;
+            Ok(serde_json::from_str(&s)?)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(feature = "lua-ffi"))]
+    fn containment_disables_native_library_loaders() {
+        let rt = LuaRuntime::new().unwrap();
+        assert_eq!(
+            rt.run("local ok = pcall(package.loadlib, '/not/a/library', '*'); return ok")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(rt.run("local loader = package.loaders[3]; return loader and type(loader('native')) == 'string'").unwrap(), "true");
+    }
+
+    #[test]
+    fn scripts_cannot_enable_jit_and_evade_instruction_hooks() {
+        let rt = LuaRuntime::new().unwrap();
+        assert_eq!(rt.run("local j=require('jit'); local ok=pcall(function() j.on() end); return ok or j.status()").unwrap(), "false");
+        assert_eq!(
+            rt.run("local ok = pcall(function() jit.on() end); return ok or jit.status()")
+                .unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn lua_execution_budget_interrupts_infinite_loop() {
+        const PROBE: &str = "SIGIL_LUA_TIMEOUT_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            let rt = LuaRuntime::new().unwrap();
+            for source in [
+                "while true do end",
+                "local co = coroutine.create(function() while true do end end); coroutine.resume(co)",
+                "while true do pcall(function() while true do end end) end",
+                "while true do xpcall(function() while true do end end, function() return 'caught' end) end",
+            ] {
+                let error = rt.run(source).unwrap_err();
+                assert!(format!("{error:#}").contains("execution budget"));
+                assert_eq!(rt.run("return 42").unwrap(), "42");
+            }
+            let dir = std::env::temp_dir().join(format!("sigil-budget-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("loop.lua");
+            std::fs::write(&path, "return function() while true do end end").unwrap();
+            assert!(
+                format!(
+                    "{:#}",
+                    rt.run_file(path.to_str().unwrap(), "{}").unwrap_err()
+                )
+                .contains("execution budget")
+            );
+            assert!(
+                format!(
+                    "{:#}",
+                    rt.run_file_value(path.to_str().unwrap(), "{}").unwrap_err()
+                )
+                .contains("execution budget")
+            );
+            std::fs::write(
+                &path,
+                "while true do end; return function() return 'never' end",
+            )
+            .unwrap();
+            assert!(
+                format!(
+                    "{:#}",
+                    rt.run_file(path.to_str().unwrap(), "{}").unwrap_err()
+                )
+                .contains("execution budget")
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lua::tests::lua_execution_budget_interrupts_infinite_loop",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "budget probe failed");
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(40) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("Lua infinite loop did not respect execution budget");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn lua_basic_eval() {

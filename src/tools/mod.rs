@@ -40,6 +40,13 @@ pub struct ToolOutput {
     pub text: String,
 }
 
+/// Execution status separate from text so protocol clients need not infer
+/// failure from content that legitimately starts with `error:`.
+pub struct ToolExecution {
+    pub text: String,
+    pub is_error: bool,
+}
+
 /// A callable tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -506,6 +513,14 @@ impl ToolRegistry {
     /// Execute a tool call by name. Errors are returned as tool output so
     /// the model sees them (never fatal to the loop).
     pub async fn execute(&self, call: &crate::llm::ToolCall) -> anyhow::Result<String> {
+        Ok(self.execute_detailed(call).await?.text)
+    }
+
+    /// Preserve the tool's actual failure status for protocol consumers.
+    pub async fn execute_detailed(
+        &self,
+        call: &crate::llm::ToolCall,
+    ) -> anyhow::Result<ToolExecution> {
         let tool = self
             .tools
             .get(&call.name)
@@ -523,15 +538,24 @@ impl ToolRegistry {
             .filter(|d| !self.tools.contains_key(*d))
             .collect();
         if !missing.is_empty() {
-            return Ok(format!(
-                "tool '{}' is not ready — its dependencies are not registered yet: {}. Register (or reconnect) the dependency first; this call was not executed.",
-                call.name,
-                missing.join(", ")
-            ));
+            return Ok(ToolExecution {
+                is_error: true,
+                text: format!(
+                    "tool '{}' is not ready — its dependencies are not registered yet: {}. Register (or reconnect) the dependency first; this call was not executed.",
+                    call.name,
+                    missing.join(", ")
+                ),
+            });
         }
         match tool.run(&call.arguments).await {
-            Ok(out) => Ok(out.text),
-            Err(e) => Ok(format!("error: {e}")),
+            Ok(out) => Ok(ToolExecution {
+                text: out.text,
+                is_error: false,
+            }),
+            Err(e) => Ok(ToolExecution {
+                text: format!("error: {e}"),
+                is_error: true,
+            }),
         }
     }
 }

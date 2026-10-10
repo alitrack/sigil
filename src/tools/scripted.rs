@@ -188,11 +188,14 @@ impl Tool for LuaTool {
         let path = self.path.clone();
         let args = args.clone();
         let name = self.name.clone();
+        let context = crate::agent::provider::execution_context();
         // Run the Lua script on a blocking thread — Lua execution is
         // synchronous and cannot yield back to async.
         let text = tokio::task::spawn_blocking(move || {
-            let lua = lua.blocking_lock();
-            lua.run_file(path.to_str().unwrap_or(&name), &args.to_string())
+            crate::agent::provider::with_sync_execution_context(context, || {
+                let lua = lua.blocking_lock();
+                lua.run_file(path.to_str().unwrap_or(&name), &args.to_string())
+            })
         })
         .await
         .context("lua tool thread")??;
@@ -308,5 +311,46 @@ mod tests {
         let params = tool.parameters();
         assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
         assert!(params.get("properties").is_some());
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lua_tool_preserves_session_directory_in_blocking_worker() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-lua-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.txt"), "session input").unwrap();
+        let path = dir.join("read.lua");
+        std::fs::write(&path, "return function() local text=host.read_file('input.txt'); host.write_file('output.txt', text); return host.cwd() end").unwrap();
+        let tool = LuaTool::new(
+            "read",
+            &path,
+            Arc::new(Mutex::new(LuaRuntime::new().unwrap())),
+        )
+        .unwrap();
+        let context = crate::agent::provider::ExecutionContext {
+            cwd: dir.clone(),
+            session_id: "lua-cwd-test".into(),
+        };
+        let result =
+            crate::agent::provider::with_execution_context(Some(context), tool.run(&json!({})))
+                .await
+                .unwrap();
+        assert_eq!(result.text, dir.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+            "session input"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

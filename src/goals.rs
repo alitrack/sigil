@@ -151,7 +151,9 @@ pub fn active_goals_block(goals: &[GoalState]) -> Option<String> {
     for g in &active {
         out.push_str(&format!("- `{}`: {}", g.id, g.objective));
         if let Some(b) = g.turn_budget {
-            out.push_str(&format!(" (turns {}/{})", g.turns_used, b));
+            // Counters remain in persistent state and manage_goals output.
+            // Keep the early prompt prefix stable until goal semantics change.
+            out.push_str(&format!(" (turn budget {b})"));
         }
         out.push('\n');
     }
@@ -164,6 +166,15 @@ pub fn active_goals_block(goals: &[GoalState]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_accounting_does_not_rewrite_goal_prompt() {
+        let mut goals = vec![GoalState::with_turn_budget("g".into(), "ship".into(), 5)];
+        let before = active_goals_block(&goals);
+        bump_turn_usage(&mut goals);
+        assert_eq!(active_goals_block(&goals), before);
+        assert_eq!(goals[0].turns_used, 1);
+    }
 
     #[test]
     fn active_goals_block_lists_only_active() {
@@ -210,9 +221,9 @@ mod tests {
         assert_eq!(all[2].turns_used, 0, "paused goals don't spend turns");
         assert_eq!(pause_exhausted(&mut all), 0);
 
-        // While active, a budgeted goal's progress shows in the block.
+        // The static budget shows in the block; usage stays in persistent state.
         let block = active_goals_block(&all).unwrap();
-        assert!(block.contains("(turns 1/2)"), "{block}");
+        assert!(block.contains("(turn budget 2)"), "{block}");
         assert!(block.contains("unlimited"));
 
         // Turn 2: g1 exhausts (2/2) → auto-paused; g2 keeps counting.

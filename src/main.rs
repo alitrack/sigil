@@ -180,11 +180,10 @@ async fn main() -> Result<()> {
         // Cross-instance sync: reload the prompt state when another
         // sigil process edits the harness dir.
         sync_dir: cli.harness_dir.as_deref().map(std::path::PathBuf::from),
-        // Context budget: fold old turns into a summary when the
-        // transcript exceeds 40 messages or ~64k tokens (long REPL
-        // sessions; deepseek-v4-flash context is 64k).
-        max_context_messages: 40,
-        max_context_tokens: 64_000,
+        // Default transcript threshold reserves headroom for tools and output.
+        // Message-count compaction is opt-in to preserve short cached histories.
+        max_context_messages: config.max_context_messages,
+        max_context_tokens: config.max_context_tokens,
         goals: Some(goals),
         // Where goals.jsonl lives — the agent loop persists turn-budget
         // auto-pauses there (same dir the manage_goals tool writes).

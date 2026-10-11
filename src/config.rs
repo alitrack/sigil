@@ -17,6 +17,8 @@
 //!
 //! [agent]
 //! max_steps = 10
+//! max_context_messages = 0 # no message-count trigger
+//! max_context_tokens = 48000 # estimated input threshold; 0 disables
 //! system_prompt = "..."   # optional override
 //! ```
 
@@ -57,6 +59,8 @@ pub struct FallbackConfig {
 #[serde(default)]
 struct AgentFileConfig {
     max_steps: Option<u32>,
+    max_context_messages: Option<usize>,
+    max_context_tokens: Option<usize>,
     system_prompt: Option<String>,
 }
 
@@ -98,6 +102,8 @@ pub struct Config {
     #[allow(dead_code)]
     pub system_prompt: String,
     pub max_steps: u32,
+    pub max_context_messages: usize,
+    pub max_context_tokens: usize,
     /// MCP servers to connect at startup.
     pub mcp_servers: Vec<McpServerConfig>,
     /// Fallback LLM endpoints (base_url + api_key), tried in order
@@ -168,6 +174,8 @@ impl Config {
             api_key,
             system_prompt,
             max_steps,
+            max_context_messages: file_cfg.agent.max_context_messages.unwrap_or(0),
+            max_context_tokens: file_cfg.agent.max_context_tokens.unwrap_or(48_000),
             mcp_servers,
             fallbacks,
         })
@@ -212,3 +220,31 @@ You solve the user's task by calling tools. Prefer the dedicated tools
 After a tool result comes back, either call the next tool or give the
 final answer in plain text. Keep answers concise. Do not call tools after
 you have finished the task.";
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn context_policy_defaults_to_tokens_and_accepts_explicit_count_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "sigil-context-config-{}.toml",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "[agent]\n").unwrap();
+        let config = Config::load(path.to_str()).unwrap();
+        assert_eq!(config.max_context_messages, 0);
+        assert_eq!(config.max_context_tokens, 48_000);
+        std::fs::write(
+            &path,
+            "[agent]\nmax_context_messages = 80\nmax_context_tokens = 24000\n",
+        )
+        .unwrap();
+        let config = Config::load(path.to_str()).unwrap();
+        assert_eq!(config.max_context_messages, 80);
+        assert_eq!(config.max_context_tokens, 24_000);
+        std::fs::remove_file(path).unwrap();
+    }
+}

@@ -376,6 +376,9 @@ fn build_body(req: &ChatRequest) -> Value {
         "messages": msgs,
         "stream": req.stream,
     });
+    if req.stream {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if !req.tools.is_empty() {
         body["tools"] = json!(
             req.tools
@@ -442,12 +445,12 @@ pub fn parse_usage(v: &Value) -> Option<TokenUsage> {
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|n| n.as_u64())
-        })
-        .unwrap_or(0);
+        });
     Some(TokenUsage {
         prompt_tokens,
         completion_tokens,
-        prompt_cache_hit_tokens,
+        prompt_cache_hit_tokens: prompt_cache_hit_tokens.unwrap_or(0),
+        cache_reported_prompt_tokens: prompt_cache_hit_tokens.map(|_| prompt_tokens),
     })
 }
 
@@ -1216,6 +1219,29 @@ mod tests {
             assert!(c.done, "both terminal chunks must be done: {c:?}");
         }
         assert_eq!(parsed[0].as_ref().unwrap().delta, "hi");
+    }
+
+    #[test]
+    fn cache_reporting_distinguishes_unknown_from_zero() {
+        let unknown =
+            parse_usage(&json!({"usage":{"prompt_tokens":100,"completion_tokens":5}})).unwrap();
+        let zero = parse_usage(&json!({"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":0}})).unwrap();
+        assert_ne!(
+            serde_json::to_value(unknown).unwrap(),
+            serde_json::to_value(zero).unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_requests_ask_for_usage() {
+        let body = build_body(&ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("task")],
+            tools: vec![],
+            stream: true,
+            temperature: None,
+        });
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[test]

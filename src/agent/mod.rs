@@ -10,6 +10,13 @@
 //!   3. Execute every call, append results as `tool` messages, loop.
 //!   4. Otherwise the streamed text is the final answer.
 
+mod context;
+#[cfg(test)]
+use context::compact_messages;
+pub use context::compact_messages_with_budget;
+#[cfg(test)]
+use context::{estimate_message_tokens, estimate_tokens};
+
 pub mod invariant;
 pub mod provider;
 
@@ -46,11 +53,9 @@ pub struct AgentConfig {
     /// long REPL sessions don't grow the context without bound.
     /// `0` disables compression.
     pub max_context_messages: usize,
-    /// Token budget for the transcript per turn (chars/4 heuristic,
-    /// same shape as the context-window-based budgets used by
-    /// prime-agent's compaction). When the estimated transcript size
-    /// exceeds this, the oldest turns are folded like
-    /// `max_context_messages`. `0` disables the token budget.
+    /// Estimated input-prompt threshold, including tool schemas. Real
+    /// request usage calibrates current estimates; reserve output headroom
+    /// when configuring this. `0` disables the token trigger.
     pub max_context_tokens: usize,
     /// Persistent goals shared with the `manage_goals` tool. Active
     /// goals are injected into the system context each turn until
@@ -154,263 +159,6 @@ impl AgentConfig {
         }
         base
     }
-}
-
-/// Fold the oldest turns of a transcript into one compact summary
-/// message so long sessions don't grow the context without bound.
-///
-/// Deterministic — no LLM call, no sampling variance. Every trimmed
-/// user/assistant/tool message contributes a role-tagged one-line
-/// excerpt (first line, truncated to 120 chars); tool results are
-/// reduced to their first line too. The system prompt (`messages[0]`)
-/// and the most recent `max - 2` messages stay verbatim, so the model
-/// still sees the current task in full fidelity.
-///
-/// Cutting happens only at a "safe" boundary — a `User` message or an
-/// `Assistant` message *without* tool calls — so the kept tail never
-/// starts mid-turn and never orphans a `tool` result from its
-/// `assistant` tool-call message (which OpenAI rejects).
-///
-/// Returns the transcript unchanged when `max == 0` or the length is
-/// already within budget.
-#[cfg(test)]
-pub fn compact_messages(messages: &[ChatMessage], max: usize) -> Vec<ChatMessage> {
-    compact_messages_with_budget(messages, max, 0, None)
-}
-
-/// Rough token estimate for a text (chars/4, conservative).
-pub fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
-}
-
-/// Token estimate for one message, including tool-call payloads.
-pub fn estimate_message_tokens(m: &ChatMessage) -> usize {
-    let mut t = estimate_tokens(&m.content);
-    if let Some(calls) = &m.tool_calls {
-        for c in calls {
-            t += estimate_tokens(&c.name);
-            t += estimate_tokens(&c.arguments.to_string());
-        }
-    }
-    t
-}
-
-/// Extract `read_file` / `write_file` paths from assistant tool calls
-/// in a message slice, deduplicated in order of first use. Kept so the
-/// compaction summary can tell the model which files it touched — the
-/// one thing a naive excerpt fold loses (prime-agent tracks the same
-/// via `CompactionEntry.details`).
-///
-/// Cross-compaction accumulation: system messages that are themselves
-/// previous compaction summaries (they carry the
-/// `[earlier conversation compressed]` header and `Files read:` /
-/// `Files modified:` lines) are also parsed, so a second compaction
-/// merges the file history preserved by the first instead of dropping
-/// it (Pi's `compaction.details` accumulate the same way).
-fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
-    let mut read: Vec<String> = Vec::new();
-    let mut modified: Vec<String> = Vec::new();
-    let mut push_read = |p: String| {
-        if !read.contains(&p) {
-            read.push(p);
-        }
-    };
-    let mut push_modified = |p: String| {
-        if !modified.contains(&p) {
-            modified.push(p);
-        }
-    };
-    for m in messages {
-        // 1) Tool calls carry the authoritative paths.
-        if let Some(calls) = &m.tool_calls {
-            for c in calls {
-                let Some(path) = c.arguments.get("path").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let path = path.to_string();
-                match c.name.as_str() {
-                    "read_file" => push_read(path),
-                    "write_file" => push_modified(path),
-                    _ => {}
-                }
-            }
-        }
-        // 2) Previous compaction summaries already list files — parse
-        //    those lines so the history survives repeated compactions.
-        if m.role == Role::System && m.content.starts_with("[earlier conversation compressed]") {
-            for line in m.content.lines() {
-                if let Some(rest) = line.strip_prefix("Files read: ") {
-                    for p in rest.split(',').map(str::trim) {
-                        if !p.is_empty() {
-                            push_read(p.to_string());
-                        }
-                    }
-                } else if let Some(rest) = line.strip_prefix("Files modified: ") {
-                    for p in rest.split(',').map(str::trim) {
-                        if !p.is_empty() {
-                            push_modified(p.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (read, modified)
-}
-
-/// A message that may start the retained compaction tail: a user turn
-/// or a tool-free assistant message. Assistant messages with pending
-/// tool calls and tool results must never start the tail — strict
-/// OpenAI-compatible APIs reject an assistant `tool_calls` block whose
-/// results were folded away (and a tool result whose call was).
-fn is_safe_tail_start(m: &ChatMessage) -> bool {
-    matches!(m.role, Role::User) || (matches!(m.role, Role::Assistant) && m.tool_calls.is_none())
-}
-
-/// [`compact_messages`] with a token budget: compress when the
-/// estimated transcript size exceeds `max_tokens` OR the message count
-/// exceeds `max_msgs`. Either budget may be `0` to disable that axis.
-///
-/// `recent_prompt_tokens` is the real `prompt_tokens` usage from the
-/// most recent LLM call (prime-agent uses actual `usage.totalTokens`
-/// over the chars/4 heuristic). When present it (a) drives the
-/// over-budget trigger and (b) calibrates the per-message estimate by
-/// the real/estimated ratio while walking the retained tail — the
-/// chars/4 heuristic underestimates CJK-heavy transcripts by ~4x, so
-/// an uncalibrated walk would keep far too little.
-///
-/// The kept tail is chosen by walking backwards from the newest
-/// message, accumulating tokens until the token budget (or message
-/// budget) is met, then extended forward to the nearest safe cut
-/// boundary.
-pub fn compact_messages_with_budget(
-    messages: &[ChatMessage],
-    max_msgs: usize,
-    max_tokens: usize,
-    recent_prompt_tokens: Option<usize>,
-) -> Vec<ChatMessage> {
-    // No budget configured → never compress.
-    if max_msgs == 0 && max_tokens == 0 {
-        return messages.to_vec();
-    }
-    if messages.len() < 3 {
-        return messages.to_vec();
-    }
-    // Already within every configured budget? Real usage from the last
-    // LLM call (≈ current transcript size, since prompts accumulate)
-    // wins over the heuristic when available.
-    let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
-    let effective_total = recent_prompt_tokens.unwrap_or(total_tokens);
-    let within_msgs = max_msgs == 0 || messages.len() <= max_msgs;
-    let within_tokens = max_tokens == 0 || effective_total <= max_tokens;
-    if within_msgs && within_tokens {
-        return messages.to_vec();
-    }
-    // Calibrate the per-message estimate for the tail walk.
-    let ratio: f64 = if total_tokens > 0 {
-        (effective_total as f64 / total_tokens as f64).max(1.0)
-    } else {
-        1.0
-    };
-
-    // Walk backwards, accumulating token estimates, until the token
-    // budget or the message budget (minus the summary slot) is met.
-    // `max_msgs == 0` disables the message-count axis entirely: the walk
-    // is bounded by tokens alone. (A token-only config used to collapse
-    // onto the 2-message floor via `saturating_sub(2).max(2)`, folding
-    // whole sessions into one summary line no matter how large the
-    // token budget was.)
-    let keep_count = if max_msgs > 0 {
-        max_msgs.saturating_sub(2).max(2)
-    } else {
-        usize::MAX
-    };
-    let mut cut = 1usize;
-    let mut acc = 0usize;
-    for i in (1..messages.len()).rev() {
-        acc += (estimate_message_tokens(&messages[i]) as f64 * ratio) as usize;
-        let count_over = messages.len() - i >= keep_count;
-        let tokens_over = max_tokens > 0 && acc > max_tokens;
-        if count_over || tokens_over {
-            cut = i;
-            break;
-        }
-    }
-    if cut <= 1 {
-        // Nothing safe to trim — keep everything.
-        return messages.to_vec();
-    }
-    // Extend forward to the first safe boundary at-or-after `cut`. If the
-    // tail has no safe start at all (a mid-turn tail of tool results),
-    // do NOT run off the end — that would fold the CURRENT turn's
-    // in-flight tool results into one-line excerpts, silently dropping
-    // the output of calls the model just made. Back off to the newest
-    // safe boundary before `cut` instead: over-retention is recoverable
-    // on the next compaction, silent result loss is not.
-    let origin = cut;
-    while cut < messages.len() && !is_safe_tail_start(&messages[cut]) {
-        cut += 1;
-    }
-    if cut >= messages.len() {
-        // No safe boundary at-or-after the cut: walk back instead.
-        cut = origin;
-        while cut > 1 && !is_safe_tail_start(&messages[cut]) {
-            cut -= 1;
-        }
-    }
-    if cut <= 1 {
-        // Nothing safe to trim — keep everything.
-        return messages.to_vec();
-    }
-    while cut < messages.len() {
-        let safe = matches!(messages[cut].role, Role::User)
-            || (matches!(messages[cut].role, Role::Assistant)
-                && messages[cut].tool_calls.is_none());
-        if safe {
-            break;
-        }
-        cut += 1;
-    }
-    if cut <= 1 {
-        // Nothing safe to trim — keep everything.
-        return messages.to_vec();
-    }
-
-    // Build the summary: file operations the model touched (the most
-    // valuable thing to preserve) + role-tagged one-line excerpts.
-    let (files_read, files_modified) = extract_file_ops(&messages[1..cut]);
-    let mut summary = String::from("[earlier conversation compressed]");
-    if !files_read.is_empty() {
-        summary.push_str(&format!("\nFiles read: {}", files_read.join(", ")));
-    }
-    if !files_modified.is_empty() {
-        summary.push_str(&format!("\nFiles modified: {}", files_modified.join(", ")));
-    }
-    let mut excerpts: Vec<String> = Vec::new();
-    for m in &messages[1..cut] {
-        let first = m
-            .content
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(120)
-            .collect::<String>();
-        let tag = match m.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        };
-        excerpts.push(format!("{tag}: {first}"));
-    }
-    summary.push_str(&format!("\n{}", excerpts.join(" | ")));
-
-    let mut out = Vec::with_capacity(messages.len() - cut + 2);
-    out.push(messages[0].clone());
-    out.push(ChatMessage::system(summary));
-    out.extend_from_slice(&messages[cut..]);
-    out
 }
 
 /// Inject (or refresh) the goals block into a message list. The agent
@@ -567,6 +315,66 @@ fn accumulate_usage(tokens: &mut Option<TokenUsage>, u: Option<TokenUsage>) {
     }
 }
 
+/// Some providers send usage after finish_reason, before [DONE]. Read only
+/// that trailer, bounded in time and frame count; never create a new request.
+async fn trailing_usage(
+    stream: &mut crate::llm::provider::ChatStream,
+    initial: Option<TokenUsage>,
+) -> Option<TokenUsage> {
+    let mut latest = initial;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        for _ in 0..32 {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(usage) = chunk.usage {
+                        latest = Some(usage);
+                    }
+                    if chunk.done {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    })
+    .await;
+    latest
+}
+
+fn log_request_usage(config: &AgentConfig, kind: &str, usage: Option<TokenUsage>) {
+    if let Some(sink) = &config.session_sink {
+        sink(crate::session::Event::RequestUsage {
+            ts: None,
+            model: config.model.clone(),
+            request_kind: kind.into(),
+            usage,
+        });
+    }
+    if std::env::var_os("SIGIL_DEBUG_CACHE").is_none() {
+        return;
+    }
+    match usage {
+        Some(u) => match u.cache_reported_prompt_tokens {
+            Some(n) => {
+                let pct = if n > 0 {
+                    u.prompt_cache_hit_tokens as f64 / n as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[cache] {kind}: {} prompt + {} completion; {}/{} prompt tokens cached ({:.0}%)",
+                    u.prompt_tokens, u.completion_tokens, u.prompt_cache_hit_tokens, n, pct
+                );
+            }
+            None => eprintln!(
+                "[cache] {kind}: {} prompt + {} completion; cache telemetry unavailable",
+                u.prompt_tokens, u.completion_tokens
+            ),
+        },
+        None => eprintln!("[cache] {kind}: usage unavailable; no diagnostic request sent"),
+    }
+}
+
 /// Refresh the harness prompt while retaining tool history and compaction summaries.
 pub fn messages_for_turn(history: &[ChatMessage], system: String) -> Vec<ChatMessage> {
     let mut messages = history.to_vec();
@@ -614,9 +422,7 @@ pub async fn run_messages(
     let breaker = safety::CircuitBreaker::new();
     let mut step: u32 = 0;
     let mut tokens: Option<TokenUsage> = None;
-    // Real prompt-token usage of the most recent LLM call — feeds the
-    // compaction trigger/calibration (see compact_messages_with_budget).
-    let mut last_prompt_tokens: Option<usize> = None;
+    let mut prompt_budget = context::PromptBudget::default();
     // Phase A2: turn 事件只写一次（run = 一个 turn，多 step）。
     let mut turn_started = false;
     // One retry after an EMPTY non-tool response (reasoning models can
@@ -630,17 +436,6 @@ pub async fn run_messages(
         // this instance sees the change (cheap fingerprint when idle).
         if let Some(dir) = &config.sync_dir {
             let _ = crate::harness::sync_prompt_state(&config.prompt_state, dir);
-        }
-
-        // Context budget: fold the oldest turns into a compact summary
-        // when the transcript outgrew the window (long REPL sessions).
-        if config.max_context_messages > 0 || config.max_context_tokens > 0 {
-            messages = compact_messages_with_budget(
-                &messages,
-                config.max_context_messages,
-                config.max_context_tokens,
-                last_prompt_tokens,
-            );
         }
 
         // Persistent goals: inject active goals into the system context
@@ -704,7 +499,9 @@ pub async fn run_messages(
             // call asking for a wrap-up summary so the caller always
             // gets a real answer, tagged with StepLimitReached.
             let (summary, summary_tokens) =
-                match provide_final_answer(provider, config, &messages, stream_cb).await {
+                match provide_final_answer(provider, config, &messages, stream_cb, &prompt_budget)
+                    .await
+                {
                     Ok((s, t)) => (s, t),
                     Err(e) => (
                         format!(
@@ -767,6 +564,13 @@ pub async fn run_messages(
         {
             messages.push(ChatMessage::system(text));
         }
+
+        messages = prompt_budget.compact(
+            &messages,
+            &specs,
+            config.max_context_messages,
+            config.max_context_tokens,
+        );
 
         // ── Phase A2: 事件溯源 —— 注入即事件 + 请求前配对不变式 ──
         // 本轮请求的上下文（step/header/注入）先入日志，再进请求；
@@ -860,6 +664,7 @@ pub async fn run_messages(
             Err(e) => return Err(e).context("starting completion"),
         };
 
+        let mut request_usage = None;
         let mut text = String::new();
         let mut tool_calls_requested = false;
         // One bounded mid-stream retry: a transient drop (502/429/reset)
@@ -877,9 +682,15 @@ pub async fn run_messages(
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(chunk) => {
-                        accumulate_usage(&mut tokens, chunk.usage);
+                        if chunk.usage.is_some() {
+                            request_usage = chunk.usage;
+                        }
                         if let Some(u) = chunk.usage {
-                            last_prompt_tokens = Some(u.prompt_tokens as usize);
+                            prompt_budget.observe(
+                                u.prompt_tokens as usize,
+                                &req.messages,
+                                &req.tools,
+                            );
                         }
                         if !chunk.thinking {
                             text.push_str(&chunk.delta);
@@ -890,6 +701,14 @@ pub async fn run_messages(
                         tool_calls_requested |= chunk.tool_calls_requested;
                         streamed_fragments.extend(chunk.streamed_tool_calls);
                         if chunk.done {
+                            if let Some(u) = trailing_usage(&mut stream, request_usage).await {
+                                request_usage = Some(u);
+                                prompt_budget.observe(
+                                    u.prompt_tokens as usize,
+                                    &req.messages,
+                                    &req.tools,
+                                );
+                            }
                             break;
                         }
                     }
@@ -907,6 +726,9 @@ pub async fn run_messages(
                         "  warning: stream died mid-completion ({e:#}); \
                          retrying once from the current transcript"
                     );
+                    accumulate_usage(&mut tokens, request_usage);
+                    log_request_usage(config, "stream retry", request_usage);
+                    request_usage = None;
                     text.clear();
                     tool_calls_requested = false;
                     streamed_fragments.clear();
@@ -917,57 +739,14 @@ pub async fn run_messages(
                         }
                     }
                 }
-                Some(e) => return Err(e).context("reading stream"),
-            }
-        }
-        // Cache-discipline diagnostics (Phase 65): with SIGIL_DEBUG_CACHE
-        // set, log how much of the prompt was served from the provider's
-        // prefix cache. A steady hit-rate drop after a prompt-assembly
-        // change means the prefix stopped being byte-stable. Goes to
-        // stderr (stdout stays pure for pipe mode).
-        //
-        // Provider coverage: OpenAI returns cached_tokens in usage;
-        // vLLM 0.23 does NOT (prompt_tokens_details is null) — but its
-        // /metrics endpoint exposes prefix_cache_hits_total, verified
-        // end-to-end on 10.10.10.115:8011 at 95% hit for stable
-        // prefixes. Ollama also omits cached_tokens. When the provider
-        // reports none, the probe still gives prompt_tokens (useful for
-        // context-budget math) and the true hit figures must be read
-        // from the provider's own metrics endpoint.
-        if std::env::var_os("SIGIL_DEBUG_CACHE").is_some() {
-            // vLLM / Ollama do NOT return usage on streamed responses;
-            // when the stream carried none, probe once non-streamed with
-            // the same prompt to learn the true cache-hit figures.
-            // (The probe re-sends the prompt, which is exactly what a
-            // cache-hit measurement needs — cached tokens only appear
-            // when the prefix matches a previously seen one.)
-            if tokens.is_none() {
-                match provider
-                    .chat_complete(ChatRequest {
-                        model: config.model.clone(),
-                        messages: messages.clone(),
-                        tools: tools.specs(),
-                        stream: false,
-                        temperature: None,
-                    })
-                    .await
-                {
-                    Ok(complete) => tokens = complete.usage,
-                    Err(e) => eprintln!("[cache] usage probe failed: {e:#}"),
+                Some(e) => {
+                    log_request_usage(config, "stream failed", request_usage);
+                    return Err(e).context("reading stream");
                 }
             }
-            if let Some(u) = tokens {
-                let pct = if u.prompt_tokens > 0 {
-                    (u.prompt_cache_hit_tokens as f64 / u.prompt_tokens as f64) * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[cache] {}/{} prompt tokens cached ({:.0}%)",
-                    u.prompt_cache_hit_tokens, u.prompt_tokens, pct
-                );
-            }
         }
+        accumulate_usage(&mut tokens, request_usage);
+        log_request_usage(config, "stream", request_usage);
 
         if tool_calls_requested {
             // Tell the UI the text stream is interrupted by tool calls.
@@ -1005,8 +784,9 @@ pub async fn run_messages(
             }
             if let Some(c) = &complete {
                 accumulate_usage(&mut tokens, c.usage);
+                log_request_usage(config, "tool replay", c.usage);
                 if let Some(u) = c.usage {
-                    last_prompt_tokens = Some(u.prompt_tokens as usize);
+                    prompt_budget.observe(u.prompt_tokens as usize, &req.messages, &req.tools);
                 }
             }
             if tool_calls.is_empty() {
@@ -1331,12 +1111,19 @@ async fn provide_final_answer(
     config: &AgentConfig,
     messages: &[ChatMessage],
     stream_cb: Option<&StreamCb>,
+    prompt_budget: &context::PromptBudget,
 ) -> Result<(String, Option<TokenUsage>)> {
     let mut msgs = messages.to_vec();
     msgs.push(ChatMessage::system(
         "Step budget exhausted. Do not call any tools. \
          Summarize your progress so far and give your best final answer now.",
     ));
+    let msgs = prompt_budget.compact(
+        &msgs,
+        &[],
+        config.max_context_messages,
+        config.max_context_tokens,
+    );
     let req = ChatRequest {
         model: config.model.clone(),
         messages: msgs,
@@ -1349,7 +1136,9 @@ async fn provide_final_answer(
     let mut tokens: Option<TokenUsage> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading final summary")?;
-        accumulate_usage(&mut tokens, chunk.usage);
+        if chunk.usage.is_some() {
+            tokens = chunk.usage;
+        }
         if !chunk.thinking {
             text.push_str(&chunk.delta);
             if let Some(cb) = stream_cb {
@@ -1357,9 +1146,11 @@ async fn provide_final_answer(
             }
         }
         if chunk.done {
+            tokens = trailing_usage(&mut stream, tokens).await;
             break;
         }
     }
+    log_request_usage(config, "final summary", tokens);
     if text.trim().is_empty() {
         anyhow::bail!("final summary came back empty");
     }
@@ -1555,6 +1346,301 @@ mod parallel_tests {
                 usage: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn missing_usage_trailer_cannot_hold_open_a_completed_answer() {
+        let mut stream: crate::llm::provider::ChatStream =
+            Box::new(futures_util::stream::pending());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            trailing_usage(&mut stream, None),
+        )
+        .await
+        .expect("completed answers must not wait indefinitely for usage");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn usage_trailer_timeout_preserves_last_observed_snapshot() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 5,
+            prompt_cache_hit_tokens: 80,
+            cache_reported_prompt_tokens: Some(100),
+        };
+        let mut stream: crate::llm::provider::ChatStream = Box::new(
+            futures_util::stream::iter(vec![Ok(crate::llm::provider::ChatChunk {
+                delta: String::new(),
+                thinking: false,
+                done: false,
+                tool_calls_requested: false,
+                streamed_tool_calls: Vec::new(),
+                usage: Some(usage),
+            })])
+            .chain(futures_util::stream::pending()),
+        );
+        let result = trailing_usage(&mut stream, None).await;
+        assert_eq!(result.unwrap().completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn usage_after_finish_reason_is_collected_once() {
+        #[derive(Debug)]
+        struct TrailingUsageProvider;
+        #[async_trait]
+        impl LlmProvider for TrailingUsageProvider {
+            fn name(&self) -> &str {
+                "trailing-usage"
+            }
+            async fn chat_stream(
+                &self,
+                _: ChatRequest,
+            ) -> Result<crate::llm::provider::ChatStream> {
+                let usage = crate::llm::openai::parse_usage(&serde_json::json!({"usage": {
+                    "prompt_tokens":100, "completion_tokens":5, "prompt_cache_hit_tokens":80
+                }}))
+                .unwrap();
+                Ok(Box::new(futures_util::stream::iter(vec![
+                    Ok(crate::llm::provider::ChatChunk {
+                        usage: Some(TokenUsage {
+                            completion_tokens: 1,
+                            ..usage
+                        }),
+                        ..Default::default()
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        delta: "done".into(),
+                        done: true,
+                        usage: Some(TokenUsage {
+                            completion_tokens: 2,
+                            ..usage
+                        }),
+                        ..Default::default()
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        usage: Some(TokenUsage {
+                            completion_tokens: 3,
+                            ..usage
+                        }),
+                        ..Default::default()
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        usage: Some(usage),
+                        ..Default::default()
+                    }),
+                    Ok(crate::llm::provider::ChatChunk {
+                        done: true,
+                        ..Default::default()
+                    }),
+                ])))
+            }
+            async fn chat_complete(&self, _: ChatRequest) -> Result<ChatComplete> {
+                panic!("no replay needed")
+            }
+        }
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut config = test_config();
+        config.session_sink = Some(std::sync::Arc::new(move |event| {
+            captured.lock().unwrap().push(event)
+        }));
+        let output = run_messages(
+            &TrailingUsageProvider,
+            &mut ToolRegistry::new(),
+            &config,
+            &[ChatMessage::system("base"), ChatMessage::user("task")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let usage = output
+            .tokens
+            .expect("usage-only trailer must survive finish_reason");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.prompt_cache_hit_tokens, 80);
+        let captured = events.lock().unwrap();
+        let observed = captured
+            .iter()
+            .filter(|event| matches!(event, crate::session::Event::RequestUsage { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed.len(),
+            1,
+            "one actual request gets one metadata event"
+        );
+        let json = serde_json::to_value(observed[0]).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn cache_diagnostics_never_generate_an_extra_completion() {
+        #[derive(Debug)]
+        struct NoUsageProvider;
+        #[async_trait]
+        impl LlmProvider for NoUsageProvider {
+            fn name(&self) -> &str {
+                "no-usage"
+            }
+            async fn chat_stream(
+                &self,
+                _req: ChatRequest,
+            ) -> Result<crate::llm::provider::ChatStream> {
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: "done".into(),
+                        thinking: false,
+                        done: true,
+                        tool_calls_requested: false,
+                        streamed_tool_calls: vec![],
+                        usage: None,
+                    },
+                )])))
+            }
+            async fn chat_complete(&self, _req: ChatRequest) -> Result<ChatComplete> {
+                panic!("diagnostics must not generate a second completion");
+            }
+        }
+        let output = run_messages(
+            &NoUsageProvider,
+            &mut ToolRegistry::new(),
+            &test_config(),
+            &[ChatMessage::system("base"), ChatMessage::user("task")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.tokens.is_none());
+    }
+
+    #[test]
+    fn compaction_preserves_multiline_user_constraints_and_previous_summary() {
+        let msgs = |n| {
+            (0..n)
+                .flat_map(|_| [ChatMessage::user("next"), ChatMessage::assistant("done")])
+                .collect::<Vec<_>>()
+        };
+        let constraint = "Task: fix parser\nConstraint: do not change public API\nAcceptance: containment tests must pass";
+        let mut history = vec![
+            ChatMessage::system("base"),
+            ChatMessage::user(constraint),
+            ChatMessage::assistant("Decision: retain native replay\nValidated: unit tests passed"),
+        ];
+        history.extend(msgs(8).into_iter().skip(1));
+        let first = compact_messages(&history, 6);
+        assert!(
+            first[1]
+                .content
+                .contains("Constraint: do not change public API")
+        );
+        assert!(first[1].content.contains("Validated: unit tests passed"));
+        let mut next = first;
+        next.extend(msgs(8).into_iter().skip(1));
+        let second = compact_messages(&next, 6);
+        assert!(
+            second[1]
+                .content
+                .contains("Constraint: do not change public API")
+        );
+    }
+
+    #[tokio::test]
+    async fn appended_tool_output_is_budgeted_after_reported_usage() {
+        #[derive(Debug)]
+        struct GrowingPrompt(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl LlmProvider for GrowingPrompt {
+            fn name(&self) -> &str {
+                "growing-prompt"
+            }
+            async fn chat_stream(
+                &self,
+                req: ChatRequest,
+            ) -> Result<crate::llm::provider::ChatStream> {
+                let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                if !first {
+                    assert!(
+                        req.messages
+                            .iter()
+                            .any(|m| m.content.starts_with("[earlier conversation compressed]")),
+                        "new tool output must not hide behind the previous request's small usage"
+                    );
+                    assert!(
+                        req.messages
+                            .iter()
+                            .any(|m| m.tool_call_id.as_deref() == Some("big-call")),
+                        "the current tool result must remain verbatim"
+                    );
+                }
+                let usage = crate::llm::openai::parse_usage(&serde_json::json!({"usage": {
+                    "prompt_tokens":400, "completion_tokens":5
+                }}));
+                Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                    crate::llm::provider::ChatChunk {
+                        delta: if first { String::new() } else { "done".into() },
+                        done: true,
+                        tool_calls_requested: first,
+                        usage,
+                        streamed_tool_calls: if first {
+                            vec![ToolCall {
+                                id: "big-call".into(),
+                                name: "big-output".into(),
+                                arguments: serde_json::json!({}),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                )])))
+            }
+            async fn chat_complete(&self, _: ChatRequest) -> Result<ChatComplete> {
+                panic!("native calls need no replay")
+            }
+        }
+        struct BigOutput;
+        #[async_trait]
+        impl crate::tools::Tool for BigOutput {
+            fn name(&self) -> &str {
+                "big-output"
+            }
+            fn description(&self) -> &str {
+                "large output"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn run(&self, _: &serde_json::Value) -> Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput {
+                    text: "x".repeat(10_000),
+                })
+            }
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(std::sync::Arc::new(BigOutput));
+        let mut history = vec![ChatMessage::system("base")];
+        for _ in 0..20 {
+            history.extend([
+                ChatMessage::user("previous task"),
+                ChatMessage::assistant("previous result"),
+            ]);
+        }
+        history.push(ChatMessage::user("current task"));
+        let mut config = test_config();
+        config.max_context_tokens = 1000;
+        run_messages(
+            &GrowingPrompt(std::sync::atomic::AtomicUsize::new(0)),
+            &mut tools,
+            &config,
+            &history,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     /// Minimal AgentConfig for tests (no goals, no compression).

@@ -25,6 +25,35 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
+### Context budgeting and cache diagnostics
+
+Active-goal prompts show the objective and static turn budget. The changing turns-used counter stays in persistent state and `manage_goals` output, so accounting alone does not rewrite the prompt prefix. Goal additions, completion, pauses, and budget changes still refresh the context.
+
+The default compaction trigger is an estimated 48,000 input-prompt tokens, with no message-count trigger. Configure it for your model under `[agent]`:
+
+```toml
+[agent]
+max_context_tokens = 48000
+max_context_messages = 0
+```
+
+Each zero disables that trigger; setting both to zero disables proactive compaction. The estimate includes message framing and tool schemas. Real usage calibrates the current request rather than reusing a previous absolute token count, so new tool outputs and history shrinkage are reflected. Cold estimates allow roughly two tokens per non-ASCII character and one per four ASCII characters; this is a heuristic, not a model tokenizer. The threshold is not a hard request-size limit: pinned instructions, summary overhead, and an indivisible current tool turn can exceed it. Configure it below your model context window to reserve output capacity. Provider context errors still allow one reactive compaction retry.
+
+Compaction pins leading system instructions and live goal blocks outside the historical summary, uses bounded multiline excerpts, carries previous summary content forward, and preserves tool-call/result pairing. It remains lossy: excerpts retain at most 2,000 user characters, 1,000 assistant characters, 500 tool characters, or 8,000 previous-summary characters; the combined summary is capped at 16,000 characters plus a truncation notice. Consult the original session log when details are omitted. It does not generate an LLM summary request.
+
+`SIGIL_DEBUG_CACHE=1` observes actual stream, tool replay, and final-summary requests without sending diagnostic completions. Streaming requests ask for usage; a usage-only trailer after `finish_reason` is read for at most 250 ms (32 frames). Missing usage/cache fields remain unavailable rather than becoming a reported zero hit rate. Session event sinks record `request_usage` metadata, including the request kind, model, and observed usage. Aggregate cache metrics retain the number of prompt tokens with reported cache coverage; old logs without this field remain readable but have unknown coverage. Multiple usage snapshots within one request are counted once, using the latest observed snapshot even if the bounded trailer read times out. Token-only compaction retains the original history when its summary would not reduce the input estimate. This is token telemetry, not a complete bill: unreported usage, cache-write rates, provider-internal retries, and pricing are not inferred. Compression can invalidate the changed prefix and increase first-request cost; fewer tokens alone do not demonstrate savings. Compare successful-task cost and quality on your actual provider.
+
+
+Report explicit session logs offline (Python standard library only):
+
+```bash
+python3 test-tools/usage_report.py path/to/session.jsonl
+python3 test-tools/usage_report.py --json path/to/session.jsonl
+```
+
+The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
+
+
 ## Evidence: the harness really does evolve
 
 The core thesis — *an agent that modifies its own harness gets stronger over

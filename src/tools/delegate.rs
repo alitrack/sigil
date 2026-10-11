@@ -1912,6 +1912,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 prompt_cache_hit_tokens: 0,
+                cache_reported_prompt_tokens: None,
             }),
         })
         .await;
@@ -2014,6 +2015,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 30,
                 prompt_cache_hit_tokens: 0,
+                cache_reported_prompt_tokens: None,
             }),
         })
         .await;
@@ -2035,6 +2037,7 @@ mod tests {
                 prompt_tokens: 200,
                 completion_tokens: 40,
                 prompt_cache_hit_tokens: 0,
+                cache_reported_prompt_tokens: None,
             }),
         })
         .await;

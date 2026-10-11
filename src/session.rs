@@ -131,6 +131,15 @@ pub enum Event {
         #[serde(default)]
         tools_fingerprint: Option<String>,
     },
+    /// Observed usage for one actual model request. Missing telemetry is
+    /// explicit; this metadata is never projected into model context.
+    RequestUsage {
+        #[serde(default)]
+        ts: Option<String>,
+        model: String,
+        request_kind: String,
+        usage: Option<crate::llm::provider::TokenUsage>,
+    },
     /// Injected request context (pinned workflow path, session binding,
     /// goal, ...). Order-preserving key/value pairs. "注入即事件":
     /// any session-external state entering a request is logged here.
@@ -189,6 +198,7 @@ impl Event {
             Event::StepStart { .. } => "step_start",
             Event::StepEnd { .. } => "step_end",
             Event::RequestHeader { .. } => "request_header",
+            Event::RequestUsage { .. } => "request_usage",
             Event::RequestContext { .. } => "request_context",
             Event::Approval { .. } => "approval",
             Event::Policy { .. } => "policy",
@@ -209,6 +219,7 @@ impl Event {
             | Event::StepStart { ts, .. }
             | Event::StepEnd { ts, .. }
             | Event::RequestHeader { ts, .. }
+            | Event::RequestUsage { ts, .. }
             | Event::RequestContext { ts, .. }
             | Event::Approval { ts, .. }
             | Event::Policy { ts, .. }
@@ -245,6 +256,18 @@ impl Event {
             Event::RequestHeader { model, .. } => {
                 format!("request_header: model={model}")
             }
+            Event::RequestUsage {
+                model,
+                request_kind,
+                usage,
+                ..
+            } => match usage {
+                Some(u) => format!(
+                    "request_usage: {request_kind} model={model} {} prompt + {} completion",
+                    u.prompt_tokens, u.completion_tokens
+                ),
+                None => format!("request_usage: {request_kind} model={model} unavailable"),
+            },
             Event::RequestContext { values, .. } => {
                 let keys: Vec<&str> = values.iter().map(|(k, _)| k.as_str()).collect();
                 format!("request_context: {}", keys.join(","))
@@ -507,6 +530,17 @@ fn stamp_event(ev: &Event) -> Event {
             temperature: *temperature,
             max_tokens: *max_tokens,
             tools_fingerprint: tools_fingerprint.clone(),
+        },
+        Event::RequestUsage {
+            model,
+            request_kind,
+            usage,
+            ..
+        } => Event::RequestUsage {
+            ts: Some(ts),
+            model: model.clone(),
+            request_kind: request_kind.clone(),
+            usage: *usage,
         },
         Event::RequestContext { values, .. } => Event::RequestContext {
             ts: Some(ts),
@@ -900,6 +934,22 @@ pub fn import_session(sessions_dir: &Path, in_path: &Path) -> std::io::Result<St
         append(sessions_dir, &id, turn)?;
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod usage_event_tests {
+    use super::*;
+    #[test]
+    fn request_usage_roundtrips_without_becoming_model_context() {
+        let raw = serde_json::json!({"e":"request_usage", "model":"m", "request_kind":"stream",
+            "usage":{"prompt_tokens":100, "completion_tokens":5,
+            "prompt_cache_hit_tokens":0,"cache_reported_prompt_tokens":100}});
+        let event: Event = serde_json::from_value(raw.clone()).expect("usage is session metadata");
+        assert_eq!(event.kind(), "request_usage");
+        assert!(events_to_messages(std::slice::from_ref(&event)).is_empty());
+        assert!(events_to_turns(std::slice::from_ref(&event)).is_empty());
+        assert_eq!(serde_json::to_value(&event).unwrap()["usage"], raw["usage"]);
+    }
 }
 
 #[cfg(test)]

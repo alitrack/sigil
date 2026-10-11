@@ -162,14 +162,15 @@ pub struct ChatChunk {
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Prompt tokens served from the provider's prefix cache
-    /// (vLLM `prompt_cache_hit_tokens`; OpenAI-compatible providers
-    /// expose it as `prompt_tokens_details.cached_tokens`). `0` when
-    /// the provider did not report it. Cache-discipline diagnostics
-    /// (Phase 65): DEBUG logging prints hit/total so a change in
-    /// prompt assembly shows up as a measurable hit-rate drop.
+    /// Reported cache hits; consult `cache_reported_prompt_tokens` to
+    /// distinguish an explicit zero from missing provider telemetry.
     #[serde(default)]
     pub prompt_cache_hit_tokens: u64,
+    /// Prompt tokens covered by reported cache telemetry. `None` means
+    /// unavailable (also for old serialized records); sums retain partial
+    /// coverage rather than treating unknown requests as cache misses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_reported_prompt_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -186,7 +187,23 @@ impl std::ops::Add for TokenUsage {
         TokenUsage {
             prompt_tokens: self.prompt_tokens + rhs.prompt_tokens,
             completion_tokens: self.completion_tokens + rhs.completion_tokens,
-            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens + rhs.prompt_cache_hit_tokens,
+            prompt_cache_hit_tokens: if self.cache_reported_prompt_tokens.is_some() {
+                self.prompt_cache_hit_tokens
+            } else {
+                0
+            } + if rhs.cache_reported_prompt_tokens.is_some() {
+                rhs.prompt_cache_hit_tokens
+            } else {
+                0
+            },
+            cache_reported_prompt_tokens: match (
+                self.cache_reported_prompt_tokens,
+                rhs.cache_reported_prompt_tokens,
+            ) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(n), None) | (None, Some(n)) => Some(n),
+                (None, None) => None,
+            },
         }
     }
 }
@@ -223,3 +240,33 @@ pub trait LlmProvider: Send + Sync + Debug {
 /// Boxed stream of chunks.
 pub type ChatStream =
     Box<dyn futures_util::Stream<Item = anyhow::Result<ChatChunk>> + Send + Unpin>;
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn cache_aggregation_retains_only_reported_coverage() {
+        let reported = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 5,
+            prompt_cache_hit_tokens: 80,
+            cache_reported_prompt_tokens: Some(100),
+        };
+        let unknown = TokenUsage {
+            prompt_tokens: 200,
+            completion_tokens: 10,
+            prompt_cache_hit_tokens: 0,
+            cache_reported_prompt_tokens: None,
+        };
+        let total = reported + unknown;
+        assert_eq!(total.prompt_tokens, 300);
+        assert_eq!(total.prompt_cache_hit_tokens, 80);
+        assert_eq!(total.cache_reported_prompt_tokens, Some(100));
+        let old: TokenUsage = serde_json::from_str(
+            r#"{"prompt_tokens":200,"completion_tokens":10,"prompt_cache_hit_tokens":90}"#,
+        )
+        .unwrap();
+        assert_eq!(old.cache_reported_prompt_tokens, None);
+        assert_eq!((reported + old).prompt_cache_hit_tokens, 80);
+    }
+}

@@ -94,6 +94,47 @@ Without prices, this prints the observed token difference and a symbolic charge 
 The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
 
 
+## DREAM exploration and replay
+
+`test-tools/dream.py` provides an opt-in discovery → historical replay → policy
+selection → next-round deployment loop around the unchanged sigil binary.
+
+```bash
+# Preview concrete tasks and bounded execution; no model calls.
+python3 test-tools/dream.py run --output ./dream-run --rounds 2 --decision-rounds 3 --attempts 3 --model MODEL --base-url http://127.0.0.1:3001/v1
+# Collect new worlds and redeploy the selected policy into the next round.
+python3 test-tools/dream.py run --execute --output ./dream-run --rounds 2 --decision-rounds 3 --attempts 3 --model MODEL --base-url http://127.0.0.1:3001/v1
+# Compare policies again using stored outcomes only; no agent/evaluator execution.
+python3 test-tools/dream.py replay --world ./dream-run/round-1/world.json --world ./dream-run/round-2/world.json --policy ./dream-run/selected-policy.json --output ./dream-replay
+```
+
+Online output directories must be new. Authentication uses `SIGIL_API_KEY` in
+the environment. Each attempt has separate artifact and agent-state directories;
+these prevent state contamination and are not an OS sandbox. The first task
+family edits JSON with machine-checked types, preserved fields, protected files
+and read-before-write workflow. Failures remain in the tree. A safe, fingerprinted
+parent snapshot is restored for each continuation.
+
+Policies are bounded JSON parameters controlling branch width, observed-score or
+depth ranking, stagnation, success stopping and attempt limits. A fixed interpreter
+and parameter sweep implement this initial family; this is not unrestricted
+model-written policy-code evolution. Use `--candidate policy.json` to include an
+additional validated configuration. Online execution uses one worker; `replay
+--workers N` supports historical batching. The objective is best normalized
+quality minus `--beta1` times represented attempts plus `--beta2` times attempts
+per decision round. The incumbent participates and wins ties; improvement is
+guaranteed only on the recorded pool, not on unseen tasks. Replay cannot invent
+unrecorded branches and never starts online execution to fill missing outcomes.
+
+`run.json`, per-round `world.json`/`replay.json`, and policy files retain deployment
+and rollback evidence. Reuse a round's `incumbent-policy.json` with `--policy` to
+start a new experiment from that prior policy. Replay without `--output` prints
+its report only. Mark fake providers with `--source simulated`; simulated and
+online worlds cannot share a selection pool. Run deterministic tests with
+`python3 -m unittest discover -s test-tools -p 'test_dream*.py'`; set
+`SIGIL_DREAM_E2E=1` for the actual-binary local fake-provider test. This fixture
+validates orchestration, not general coding improvements or the paper's benchmarks.
+
 ## Evidence: the harness really does evolve
 
 The core thesis — *an agent that modifies its own harness gets stronger over

@@ -1,0 +1,191 @@
+{
+  "source": "online-discovery",
+  "fixture": "json-edit-v1",
+  "model": "z-ai/glm-5.3-flash",
+  "endpoint": "http://127.0.0.1:3001/v1",
+  "binary_sha256": "07ea5e571c8f1426830f8f944d6d73718bf74a76ed77776835e4adc1445cc653",
+  "harness_sha256": "d1ffe037923e933a4aee374f36c530d1826a17aab4e308a7fb01a12b3474b69e",
+  "online_workers": 1,
+  "objective": {
+    "beta1": 0.01,
+    "beta2": 0
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "executed_policy": {
+        "version": 1,
+        "name": "baseline",
+        "branch_width": 2,
+        "ranking": "score",
+        "stagnation": 0,
+        "stop_score": null,
+        "max_attempts": 2
+      },
+      "selected_policy": {
+        "version": 1,
+        "name": "score-w1-s0-qNone",
+        "branch_width": 1,
+        "ranking": "score",
+        "stagnation": 0,
+        "stop_score": null,
+        "max_attempts": 2
+      },
+      "incumbent_replay_score": 0.98,
+      "selected_replay_score": 0.99,
+      "online_stop_reason": "attempts_limit",
+      "attempts": 2,
+      "nodes": [
+        {
+          "id": "n1",
+          "parent": "root",
+          "score": 1.0,
+          "passed": true,
+          "resumable": true,
+          "process_status": "completed",
+          "diagnostics": [
+            "artifact_correct"
+          ],
+          "snapshot_sha256": "d51c8fce8ae4adbda84e9bac443d87ec57370b530205d9ab5b2d4dc51dd0e859",
+          "usage_requests": 3
+        },
+        {
+          "id": "n2",
+          "parent": "root",
+          "score": 1.0,
+          "passed": true,
+          "resumable": true,
+          "process_status": "completed",
+          "diagnostics": [
+            "artifact_correct"
+          ],
+          "snapshot_sha256": "d51c8fce8ae4adbda84e9bac443d87ec57370b530205d9ab5b2d4dc51dd0e859",
+          "usage_requests": 3
+        }
+      ],
+      "selected_policy_on_this_world": {
+        "reached_nodes": [
+          "root",
+          "n1"
+        ],
+        "batches": [
+          [
+            "root"
+          ]
+        ],
+        "best_quality": 1.0,
+        "represented_attempts": 1,
+        "decision_rounds": 1,
+        "objective": 0.99,
+        "stop_reason": "support_exhausted",
+        "workers": 1,
+        "max_rounds": 2,
+        "beta1": 0.01,
+        "beta2": 0
+      }
+    },
+    {
+      "round": 2,
+      "executed_policy": {
+        "version": 1,
+        "name": "score-w1-s0-qNone",
+        "branch_width": 1,
+        "ranking": "score",
+        "stagnation": 0,
+        "stop_score": null,
+        "max_attempts": 2
+      },
+      "selected_policy": {
+        "version": 1,
+        "name": "score-w1-s0-q1",
+        "branch_width": 1,
+        "ranking": "score",
+        "stagnation": 0,
+        "stop_score": 1,
+        "max_attempts": 2
+      },
+      "incumbent_replay_score": 0.985,
+      "selected_replay_score": 0.99,
+      "online_stop_reason": "attempts_limit",
+      "attempts": 2,
+      "nodes": [
+        {
+          "id": "n1",
+          "parent": "root",
+          "score": 1.0,
+          "passed": true,
+          "resumable": true,
+          "process_status": "completed",
+          "diagnostics": [
+            "artifact_correct"
+          ],
+          "snapshot_sha256": "d8cf625424b697227bd7ede0e2c82b8089fa3093fcf9822b33cec062625ca5c8",
+          "usage_requests": 4
+        },
+        {
+          "id": "n2",
+          "parent": "n1",
+          "score": 1.0,
+          "passed": true,
+          "resumable": true,
+          "process_status": "completed",
+          "diagnostics": [
+            "artifact_correct"
+          ],
+          "snapshot_sha256": "d8cf625424b697227bd7ede0e2c82b8089fa3093fcf9822b33cec062625ca5c8",
+          "usage_requests": 3
+        }
+      ],
+      "selected_policy_on_this_world": {
+        "reached_nodes": [
+          "root",
+          "n1"
+        ],
+        "batches": [
+          [
+            "root"
+          ]
+        ],
+        "best_quality": 1.0,
+        "represented_attempts": 1,
+        "decision_rounds": 1,
+        "objective": 0.99,
+        "stop_reason": "policy_stop",
+        "workers": 1,
+        "max_rounds": 2,
+        "beta1": 0.01,
+        "beta2": 0
+      }
+    }
+  ],
+  "successful_attempts": 4,
+  "total_attempts": 4,
+  "failed_transport_check": {
+    "authentication": "unavailable",
+    "excluded_from_successful_smoke": true,
+    "retained_nodes": [
+      {
+        "process_status": "process_error",
+        "score": 0,
+        "passed": false
+      },
+      {
+        "process_status": "process_error",
+        "score": 0,
+        "passed": false
+      },
+      {
+        "process_status": "process_error",
+        "score": 0,
+        "passed": false
+      }
+    ]
+  },
+  "limitations": [
+    "One synthetic JSON task family, two recursive rounds.",
+    "Replay scores apply only to recorded support; no general coding improvement is established.",
+    "Initial width-one policy relied on missing historical leaf support and did not reduce second-round online attempts.",
+    "Policies are bounded declarative parameters; no unrestricted model-written policy code.",
+    "Replay stop reasons were recomputed offline after the support-exhaustion classification fix."
+  ]
+}

@@ -92,6 +92,41 @@ python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repe
 JSON 输出按模型和请求类型分组。缓存命中率只使用已报告缓存覆盖的输入 token 作分母；`cache_coverage_rate` 表示报告缓存数据的请求比例。缺失观测不计入 token 总和，通过请求计数和 `usage_complete` 明确显示；没有 `request_usage` 的旧日志无法还原用量。同一路径重复传入只统计一次，但重叠副本或分叉会话中重复的历史必须手动排除。无效记录以文件和行号报错，不打印记录内容。比较压缩策略时，应使用相同固定任务、模型、工具定义和输出限制，另行验证任务成功率，并同时比较服务商账单和观测 token。冷缓存与热缓存实验应分别统计。该脚本不发送模型请求，也不推断任务成功或金额。
 
 
+## DREAM 探索与重放
+
+`test-tools/dream.py` 在现有 sigil 二进制之外提供按需开启的闭环：
+真实探索 → 历史重放 → 策略择优 → 下一轮部署。
+
+```bash
+# 预览具体任务与执行上限，不调用模型。
+python3 test-tools/dream.py run --output ./dream-run --rounds 2 --decision-rounds 3 --attempts 3 --model MODEL --base-url http://127.0.0.1:3001/v1
+# 收集新探索树，把胜出策略用于下一轮。
+python3 test-tools/dream.py run --execute --output ./dream-run --rounds 2 --decision-rounds 3 --attempts 3 --model MODEL --base-url http://127.0.0.1:3001/v1
+# 只使用已记录结果比较策略，不执行 agent 或评估器。
+python3 test-tools/dream.py replay --world ./dream-run/round-1/world.json --world ./dream-run/round-2/world.json --policy ./dream-run/selected-policy.json --output ./dream-replay
+```
+
+在线输出目录必须是新目录，认证从环境变量 `SIGIL_API_KEY` 读取。每次尝试
+使用独立的任务和 agent 状态目录，防止状态串扰；这些目录不是操作系统沙箱。
+首个任务族是 JSON 文件编辑，用机器检查值和类型、无关字段、受保护文件以及
+先读后写的工具流程。失败尝试保留在树中，每次接续都恢复经过指纹校验的父快照。
+
+首版策略是受限 JSON 参数，由固定解释器和参数搜索控制分支宽度、已观测评分
+或深度排序、停滞截止、成功停止和尝试上限；尚不支持模型自由编写策略代码。
+`--candidate policy.json` 可以加入额外的有效配置。在线执行使用单 worker，
+`replay --workers N` 支持历史批次重放。目标函数是最佳归一化质量减去
+`--beta1` 乘以尝试数，再加上 `--beta2` 乘以每个决策轮的尝试数。
+现有策略始终参与比较，同分保留现有策略；不退步只针对已记录池中的重放评分，
+不保证未见任务的效果。重放不能虚构未探索分支，也不会在线补跑缺失结果。
+
+`run.json`、每轮的 `world.json`/`replay.json` 和策略文件保存部署与回滚证据。
+通过 `--policy` 指定某轮的 `incumbent-policy.json`，可从旧策略开始新实验。
+不带 `--output` 的 replay 仅打印报告。模拟接口必须标记 `--source simulated`，
+模拟世界与在线世界不能混入同一个择优池。确定性测试：
+`python3 -m unittest discover -s test-tools -p 'test_dream*.py'`；设置
+`SIGIL_DREAM_E2E=1` 可运行真实二进制与本地模拟接口的闭环测试。
+此任务验证编排正确性，不代表通用编码能力提升，也不是论文基准复现。
+
 ## 证据：harness 真的在进化
 
 核心命题——*能修改自己 harness 的 agent 会随时间变强*——不是路线图上的

@@ -417,3 +417,39 @@ fn load_with_local_local_skills_shadow_global_same_name() {
     let _ = std::fs::remove_dir_all(&g);
     let _ = std::fs::remove_dir_all(&l);
 }
+
+#[test]
+fn selected_skill_set_has_stable_order_when_relevance_changes() {
+    use crate::harness::{Skill, inline_skills_for};
+    let skills = vec![
+        Skill {
+            name: "alpha".into(),
+            description: "common apple".into(),
+            body: "alpha body".into(),
+            path: "alpha.md".into(),
+            depends_on: vec![],
+        },
+        Skill {
+            name: "beta".into(),
+            description: "common banana".into(),
+            body: "beta body".into(),
+            path: "beta.md".into(),
+            depends_on: vec![],
+        },
+    ];
+    assert_eq!(
+        inline_skills_for("common apple", &skills, 2),
+        inline_skills_for("common banana", &skills, 2)
+    );
+    let mut reversed = skills.clone();
+    reversed.reverse();
+    assert_eq!(
+        inline_skills_for("common", &skills, 1),
+        inline_skills_for("common", &reversed, 1)
+    );
+    // Genuine selection changes still replace the selected content.
+    assert_ne!(
+        inline_skills_for("apple", &skills, 1),
+        inline_skills_for("banana", &skills, 1)
+    );
+}

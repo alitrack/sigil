@@ -15,7 +15,7 @@ Architecture: extract context budgeting into `src/agent/context.rs`, retain the 
 
 Validation: default 329/329; containment 327/327; `cargo fmt -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked --release`, and `git diff --check` passed. Socket-dependent tests required running outside the filesystem/network sandbox. The cache regression was also run with `SIGIL_DEBUG_CACHE=1`. No live-model ratchet or billing comparison was run.
 
-Remaining scope: stable skill/hook prompt composition, model-specific tokenization and output reservation, semantic task-state extraction, real-provider billing A/B measurement, exploration-tree replay. These remain outside the implementation scope.
+Remaining scope: dynamic hook prompt composition, model-specific tokenization and output reservation, semantic task-state extraction, real-provider billing A/B measurement, exploration-tree replay. These remain outside the implementation scope.
 
 ## Follow-up: stable goals and observed request usage
 
@@ -58,3 +58,10 @@ Keep evaluation outside the Rust core: a dependency-free Python reader accepts e
 - [x] Verify Python regressions and independent review; check whitespace.
 
 Validation: all 8 Python regressions passed, plus a synthetic CLI report and whitespace/formatting checks. Independent review identified missing UTF-8 error locations and Rust-compatible default cache hit counters; both were reproduced and fixed. No live model calls or personal session logs were used.
+
+
+## Follow-up: stable selected skill ordering (2026-10-12)
+
+Reproduced identical selected skill bodies being reordered when relevance scores change. Preserve relevance-based membership and dependency closure, but break score ties by name and serialize the final selected set by name. Dynamic hooks still intentionally control their own output; append behavior already preserves the preceding base prompt unless the explicit replacement escape hatch is used.
+
+Validation: the regression failed before the fix and passed after it; 344 default tests and 342 containment tests passed, along with fmt, warnings-denied clippy, release build, and whitespace checks. Independent read-only review found no concrete correctness issue. No live billing or tokenizer equivalence claim is made.

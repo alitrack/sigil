@@ -221,7 +221,9 @@ pub fn inline_skills_for(prompt: &str, skills: &[Skill], max_inline: usize) -> S
         .map(|s| (s, overlap_score(&prompt_tokens, s)))
         .filter(|(_, score)| *score > 0)
         .collect();
-    ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+    ranked.sort_by(|(a, a_score), (b, b_score)| {
+        b_score.cmp(a_score).then_with(|| a.name.cmp(&b.name))
+    });
 
     // Dependency closure: BFS from the ranked hits, pulling in
     // `depends_on` transitively. Visited set makes it cycle-safe.
@@ -245,6 +247,9 @@ pub fn inline_skills_for(prompt: &str, skills: &[Skill], max_inline: usize) -> S
         }
     }
 
+    // Relevance determines membership, not prompt serialization order.
+    // An unchanged skill set should retain its cached prefix across turns.
+    included.sort_by(|a, b| a.name.cmp(&b.name));
     let mut out = String::new();
     for s in included {
         out.push_str(&format!(

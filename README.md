@@ -46,6 +46,15 @@ Compaction pins leading system instructions and live goal blocks outside the his
 `SIGIL_DEBUG_CACHE=1` observes actual stream, tool replay, and final-summary requests without sending diagnostic completions. Streaming requests ask for usage; a usage-only trailer after `finish_reason` is read for at most 250 ms (32 frames). Missing usage/cache fields remain unavailable rather than becoming a reported zero hit rate. Session event sinks record `request_usage` metadata, including the request kind, model, and observed usage. Aggregate cache metrics retain the number of prompt tokens with reported cache coverage; old logs without this field remain readable but have unknown coverage. Multiple usage snapshots within one request are counted once, using the latest observed snapshot even if the bounded trailer read times out. Token-only compaction retains the original history when its summary would not reduce the input estimate. This is token telemetry, not a complete bill: unreported usage, cache-write rates, provider-internal retries, and pricing are not inferred. Compression can invalidate the changed prefix and increase first-request cost; fewer tokens alone do not demonstrate savings. Compare successful-task cost and quality on your actual provider.
 
 
+Record pipe turns for subsequent comparison:
+
+```bash
+sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
+sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
+```
+
+Explicit `--sessions-dir` records pipe history and request usage; `--resume` appends new events to the resumed session. Ordinary pipe runs without either option remain ephemeral. The session ID is printed on stderr; pipe IDs must be plain filenames. Session logs contain conversation and tool content, so keep evaluation artifacts in an appropriate local directory.
+
 Report explicit session logs offline (Python standard library only):
 
 ```bash

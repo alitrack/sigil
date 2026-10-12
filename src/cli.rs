@@ -56,11 +56,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub memory: Option<String>,
 
-    /// Resume an interactive session by id (see ~/.sigil/sessions/).
+    /// Resume a saved session by id or latest (see ~/.sigil/sessions/).
     #[arg(long, global = true)]
     pub resume: Option<String>,
 
-    /// Sessions directory for REPL history (default: ~/.sigil/sessions/).
+    /// Sessions directory for history; explicitly setting it also records pipe turns.
+    /// Default: ~/.sigil/sessions/.
     #[arg(long, global = true)]
     pub sessions_dir: Option<String>,
 

@@ -44,6 +44,15 @@ max_context_messages = 0
 `SIGIL_DEBUG_CACHE=1` 观察实际流式请求、工具重放和最终总结请求，不发送诊断生成请求。流式请求主动要求 usage；在 `finish_reason` 后最多等待 250 毫秒、读取 32 个尾帧以收集 usage。缺失 usage 或缓存字段时明确报告不可用，不当成零命中。会话事件 sink 保存 `request_usage` 元数据，记录请求类别、模型和观测到的 usage。聚合缓存指标单独保留已报告缓存数据的 prompt token 数；旧记录仍可读取，但其覆盖范围视为未知。同一请求的多个 usage 快照只计一次，采用最后观测到的快照，尾帧读取超时也保留已取得的数据。仅按 token 触发压缩时，若摘要无法降低输入估算，则保留原历史。这是 token 观测，不是完整账单：未报告的 usage、缓存写入费率、提供方内部重试及价格都不会被推算。压缩可能使变化位置之后的缓存失效，增加首次请求费用；token 更少不能证明省钱，应在实际提供方上比较成功任务的总费用与质量。
 
 
+记录管道回合，供后续比较：
+
+```bash
+sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
+sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
+```
+
+显式指定 `--sessions-dir` 时，管道模式保存历史和请求 usage；使用 `--resume` 时，新事件追加到被续接的会话。不使用这两个选项的普通管道运行仍不保存会话。会话 ID 输出到 stderr；管道 ID 必须是普通文件名。日志包含对话和工具内容，应将实验数据保存在合适的本地目录。
+
 离线汇总指定会话日志（仅依赖 Python 标准库）：
 
 ```bash

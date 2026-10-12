@@ -445,38 +445,26 @@ async fn main() -> Result<()> {
             // `--resume <id>` (or `latest`) continues an existing
             // session: load its transcript as the conversation context
             // and append this prompt, exactly like the REPL/daemon.
-            let run_msgs = match cli.resume.as_deref() {
-                Some(r) => {
-                    let id = if r == "latest" {
-                        match session::latest(&sessions_dir)? {
-                            Some(id) => id,
-                            None => {
-                                eprintln!("  no sessions yet — starting a new one");
-                                session::start(&sessions_dir)?
-                            }
-                        }
-                    } else {
-                        r.to_string()
-                    };
-                    let turns = session::load(&sessions_dir, &id)?;
-                    eprintln!("  (resumed session {id} — {} turns)", turns.len());
-                    // Phase A2: 完整派生（含工具历史）+ 崩溃残留修复 ——
-                    // 模型 resume 后能看到之前的工具调用/结果，而不是文本摘要。
-                    let repaired = session::repair_unpaired_tool_calls(&sessions_dir, &id)?;
-                    if repaired > 0 {
-                        eprintln!("  (repaired {repaired} unpaired tool call(s))");
+            let (run_msgs, session_id) = prepare_pipe_turn(
+                &sessions_dir,
+                cli.resume.as_deref(),
+                cli.sessions_dir.is_some(),
+                &prompt,
+            )?;
+            let mut pipe_config = agent_config.clone();
+            if let Some(id) = session_id {
+                eprintln!("  (session {id})");
+                let sink_dir = sessions_dir.clone();
+                pipe_config.session_sink = Some(std::sync::Arc::new(move |event| {
+                    if let Err(error) = session::append_event(&sink_dir, &id, &event) {
+                        eprintln!("warning: failed to persist session event: {error}");
                     }
-                    let events = session::load_events(&sessions_dir, &id)?;
-                    let mut msgs = session::events_to_messages(&events);
-                    msgs.push(crate::llm::ChatMessage::user(prompt));
-                    msgs
-                }
-                None => vec![crate::llm::ChatMessage::user(prompt)],
-            };
+                }));
+            }
             let _result = agent::run_messages(
                 provider_arc.as_ref(),
                 &mut tools,
-                &agent_config,
+                &pipe_config,
                 &run_msgs,
                 None,
                 Some(&stream_cb),
@@ -486,5 +474,126 @@ async fn main() -> Result<()> {
             println!();
             Ok(())
         }
+    }
+}
+
+fn prepare_pipe_turn(
+    sessions_dir: &std::path::Path,
+    resume: Option<&str>,
+    record: bool,
+    prompt: &str,
+) -> Result<(Vec<llm::ChatMessage>, Option<String>)> {
+    if let Some(id) = resume {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id != "."
+                && id != ".."
+                && id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+            "invalid session id: expected a filename without path components"
+        );
+    }
+    let id = match resume {
+        Some("latest") => Some(match session::latest(sessions_dir)? {
+            Some(id) => id,
+            None => session::start(sessions_dir)?,
+        }),
+        Some(id) => Some(id.to_string()),
+        None if record => Some(session::start(sessions_dir)?),
+        None => None,
+    };
+    let mut messages = if let Some(id) = &id {
+        session::repair_unpaired_tool_calls(sessions_dir, id)?;
+        session::events_to_messages(&session::load_events(sessions_dir, id)?)
+    } else {
+        Vec::new()
+    };
+    if let Some(id) = &id {
+        session::append_event(
+            sessions_dir,
+            id,
+            &session::Event::User {
+                ts: None,
+                text: prompt.to_string(),
+            },
+        )?;
+    }
+    messages.push(llm::ChatMessage::user(prompt));
+    Ok((messages, id))
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_pipe_turns_resume_without_losing_new_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-pipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (first, id) = prepare_pipe_turn(&dir, None, true, "first").unwrap();
+        assert_eq!(first.last().unwrap().content, "first");
+        let id = id.unwrap();
+        session::append_event(
+            &dir,
+            &id,
+            &session::Event::Assistant {
+                ts: None,
+                text: "answer".into(),
+            },
+        )
+        .unwrap();
+        let (next, resumed) = prepare_pipe_turn(&dir, Some(&id), false, "second").unwrap();
+        assert_eq!(resumed.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            next.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["first", "answer", "second"]
+        );
+        assert_eq!(
+            session::load(&dir, &id).unwrap().last().unwrap().text,
+            "second"
+        );
+        let (third, latest) = prepare_pipe_turn(&dir, Some("latest"), false, "third").unwrap();
+        assert_eq!(latest, Some(id));
+        assert_eq!(third.last().unwrap().content, "third");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pipe_resume_rejects_paths_outside_session_directory() {
+        for id in [
+            "../outside",
+            "/tmp/outside",
+            "..",
+            "",
+            "folder\\outside",
+            "C:outside",
+        ] {
+            assert!(
+                prepare_pipe_turn(
+                    std::path::Path::new("/tmp/sigil-pipe-invalid-id-must-not-be-created"),
+                    Some(id),
+                    false,
+                    "hello"
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pipe_turn_does_not_create_a_session() {
+        let dir =
+            std::env::temp_dir().join(format!("sigil-pipe-unrecorded-{}", std::process::id()));
+        let (messages, id) = prepare_pipe_turn(&dir, None, false, "hello").unwrap();
+        assert!(id.is_none());
+        assert_eq!(messages.len(), 1);
+        assert!(!dir.exists());
     }
 }

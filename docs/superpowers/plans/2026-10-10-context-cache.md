@@ -65,3 +65,10 @@ Validation: all 8 Python regressions passed, plus a synthetic CLI report and whi
 Reproduced identical selected skill bodies being reordered when relevance scores change. Preserve relevance-based membership and dependency closure, but break score ties by name and serialize the final selected set by name. Dynamic hooks still intentionally control their own output; append behavior already preserves the preceding base prompt unless the explicit replacement escape hatch is used.
 
 Validation: the regression failed before the fix and passed after it; 344 default tests and 342 containment tests passed, along with fmt, warnings-denied clippy, release build, and whitespace checks. Independent read-only review found no concrete correctness issue. No live billing or tokenizer equivalence claim is made.
+
+
+## Follow-up: pipe session observation (2026-10-12)
+
+Found that pipe --resume loaded earlier history but did not append the new user, assistant/tool events, or request usage. Prepare resumed history through pairing repair, persist the new user once, and wire the existing event sink into the pipe configuration. Explicit --sessions-dir also enables a fresh recorded pipe session; ordinary pipe runs stay ephemeral. Validate pipe session IDs before any filesystem access to prevent path components in a writable resumed ID. This enables offline observation of fixed pipe tasks without enlarging the provider or agent interfaces.
+
+Validation: history persistence and invalid-ID tests reproduced failures before the fix. All 347 default and 345 containment Rust tests passed, as did fmt, warnings-denied clippy, release build, 8 offline report tests, and the 12-task ratchet schema check. A real CLI end-to-end test against a local fake LLM passed: two recorded runs retained history and usage, a third ordinary run stayed ephemeral, and exactly three requests were sent. Independent read-only review found no concrete regression. No paid endpoint or personal logs were used.

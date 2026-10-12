@@ -81,6 +81,14 @@ python3 test-tools/context_eval.py --case json-edit --execute --repetitions 1 --
 
 This case requires the model to read and modify `settings.json` according to earlier instructions. Success requires correct field values/types, unchanged unrelated nested/Unicode fields, an unchanged protected file, successful process exit, and a recorded `read_file` before `write_file`. Other tools, other paths, or unexpected workspace changes fail the case; evaluator session logs and runtime goal accounting are excluded from the workspace check. JSON parsing is bounded and rejects duplicate keys, symlinks and non-regular files. Generated code is never executed by the checker. This adds a small tool-use/artifact check, not a representative coding benchmark. A single repetition does not balance policy order or establish quality/cost non-inferiority.
 
+Analyze an existing paired report without any model calls:
+
+```bash
+python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repeat.json
+```
+
+Without prices, this prints the observed token difference and a symbolic charge relation. Monetary fields remain null. To estimate, supply all of `--uncached-input-rate`, `--cached-input-rate`, `--output-rate` (currency units per million tokens), and `--currency`. Rates must match the actual billed model/route; the tool never looks them up. They must be finite and nonnegative (at most 1e12, 28 decimal digits, exponents -36 to 12). Incomplete usage or unknown cache splits prevent a full estimate; identical cached/uncached rates are the exception because the split then does not affect cost. Failed attempts remain in spend, and cost per success is null at zero successes. Duplicate/unpaired records, mismatched fixture versions and mixed-model flat pricing are rejected. Estimates exclude unreported requests, cache-write fees and other invoice charges. A cache-loss regression demonstrates that fewer input tokens can cost more under explicitly hypothetical prices; this is not a current provider quote.
+
 The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
 
 

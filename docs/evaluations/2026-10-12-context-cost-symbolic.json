@@ -1,0 +1,39 @@
+{
+  "currency": null,
+  "rates_per_million": null,
+  "models": [
+    "z-ai/glm-5.3-flash"
+  ],
+  "policies": {
+    "off": {
+      "tasks": 2,
+      "successful_tasks": 2,
+      "requests": 7,
+      "usage_complete": true,
+      "cache_split_known": true,
+      "estimate_status": "rates_required",
+      "estimated_cost": null,
+      "estimated_cost_per_success": null
+    },
+    "on": {
+      "tasks": 2,
+      "successful_tasks": 2,
+      "requests": 6,
+      "usage_complete": true,
+      "cache_split_known": true,
+      "estimate_status": "rates_required",
+      "estimated_cost": null,
+      "estimated_cost_per_success": null
+    }
+  },
+  "token_delta": {
+    "prompt": -40752,
+    "completion": 352,
+    "cached_input": -19200,
+    "uncached_input": -21552,
+    "observed_only": false
+  },
+  "estimated_on_minus_off": null,
+  "charge_relation": "(-21552 * Ru + -19200 * Rc + 352 * Ro) / 1000000",
+  "billing": "unmeasured; estimates exclude unreported and non-token charges"
+}

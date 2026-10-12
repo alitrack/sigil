@@ -22,3 +22,5 @@ Total input was 48.61% lower and observed input+output was 48.57% lower for the 
 Under hypothetical constant per-million rates Ru (uncached input), Rc (cached input), and Ro (output), compacted-minus-uncompacted token charge would be `(-16105 * Ru - 9600 * Rc - 331 * Ro) / 1000000`. These observed token counts would favor compaction for positive rates in this one run, but actual invoices, gateway/upstream retry charges and cache-write charges were not measured. No guaranteed monetary saving is claimed.
 
 Validation: 349 default Rust tests, 347 containment tests, 15 evaluation tests (including streamed object-write real CLI simulation), 8 usage-report tests, fmt, warnings-denied clippy and release build passed. Independent read-only review found no concrete regression. Raw sessions remain at `/private/tmp/sigil-context-json-compatible-lb0cwy20/run/`; authentication was transient and no credential or raw log is committed.
+
+A subsequent [two-pair alternating-order replication](2026-10-12-context-json-repeat.md) passed all four tasks on this same binary. Its observations remain separate from the one-pair totals above.

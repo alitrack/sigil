@@ -2,6 +2,8 @@
 
 use crate::llm::provider::{ChatMessage, Role, ToolSpec};
 
+const SUMMARY_CHARS: usize = 16_000;
+
 /// Fold the oldest turns of a transcript into one compact summary
 /// message so long sessions don't grow the context without bound.
 ///
@@ -163,7 +165,19 @@ fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
         //    those lines so the history survives repeated compactions.
         if m.role == Role::System && m.content.starts_with("[earlier conversation compressed]") {
             for line in m.content.lines() {
-                if let Some(rest) = line.strip_prefix("Files read: ") {
+                if let Some(rest) = line.strip_prefix("Files read (JSON): ") {
+                    if let Ok(paths) = serde_json::from_str::<Vec<String>>(rest) {
+                        for path in paths {
+                            push_read(path);
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("Files modified (JSON): ") {
+                    if let Ok(paths) = serde_json::from_str::<Vec<String>>(rest) {
+                        for path in paths {
+                            push_modified(path);
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("Files read: ") {
                     for p in rest.split(',').map(str::trim) {
                         if !p.is_empty() {
                             push_read(p.to_string());
@@ -180,6 +194,48 @@ fn extract_file_ops(messages: &[ChatMessage]) -> (Vec<String>, Vec<String>) {
         }
     }
     (read, modified)
+}
+
+/// Keep ordinary histories readable while escaping delimiter-sensitive paths.
+fn append_file_history(summary: &mut String, label: &str, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let plain = format!("\n{label}: {}", paths.join(", "));
+    let available = SUMMARY_CHARS.saturating_sub(summary.chars().count());
+    if paths
+        .iter()
+        .any(|path| path.contains([',', '\n', '\r']) || path.trim() != path || path.is_empty())
+        || plain.chars().count() > available
+    {
+        const OMITTED: &str =
+            "\n[file history truncated; consult original session log for omitted paths]";
+        let mut line = format!("\n{label} (JSON): [");
+        let mut used = line.chars().count() + 1 + OMITTED.chars().count();
+        let mut kept = 0;
+        for path in paths {
+            let encoded = serde_json::to_string(path).expect("file paths are serializable");
+            let required = encoded.chars().count() + usize::from(kept > 0);
+            if used + required > available {
+                break;
+            }
+            if kept > 0 {
+                line.push(',');
+            }
+            line.push_str(&encoded);
+            used += required;
+            kept += 1;
+        }
+        line.push(']');
+        if kept < paths.len() {
+            line.push_str(OMITTED);
+        }
+        if line.chars().count() <= available {
+            summary.push_str(&line);
+        }
+    } else {
+        summary.push_str(&plain);
+    }
 }
 
 /// A message that may start the retained compaction tail: a user turn
@@ -312,17 +368,12 @@ pub fn compact_messages_with_budget(
     // valuable thing to preserve) + role-tagged multiline excerpts.
     let (files_read, files_modified) = extract_file_ops(&messages[prefix_len..cut]);
     let mut summary = String::from("[earlier conversation compressed]");
-    if !files_read.is_empty() {
-        summary.push_str(&format!("\nFiles read: {}", files_read.join(", ")));
-    }
-    if !files_modified.is_empty() {
-        summary.push_str(&format!("\nFiles modified: {}", files_modified.join(", ")));
-    }
+    append_file_history(&mut summary, "Files read", &files_read);
+    append_file_history(&mut summary, "Files modified", &files_modified);
     // Preserve multiline instructions and outcomes; retain earlier summaries
     // verbatim within a bounded record instead of summarizing their header.
     // This is still lossy extraction, not a semantic summary. The full event
     // log remains the source of truth for details omitted here.
-    const SUMMARY_CHARS: usize = 16_000;
     for m in &messages[prefix_len..cut] {
         let (tag, limit) = match m.role {
             Role::System => ("system", 8_000),
@@ -369,6 +420,92 @@ pub fn compact_messages_with_budget(
 #[cfg(test)]
 mod estimate_tests {
     use super::*;
+    #[test]
+    fn repeated_compaction_preserves_exact_file_paths() {
+        let paths = [
+            "data/a,b.json",
+            " padded.json ",
+            "line\nbreak.json",
+            "carriage\rreturn.json",
+            "quote\"and\\slash.json",
+            "[notes].json",
+            "正常.json",
+        ];
+        let mut history = vec![ChatMessage::system("base"), ChatMessage::user("edit files")];
+        for (i, path) in paths.iter().enumerate() {
+            let id = format!("call-{i}");
+            for name in ["read_file", "write_file"] {
+                let id = format!("{id}-{name}");
+                history.push(ChatMessage::assistant_with_tools(
+                    "",
+                    vec![crate::llm::provider::ToolCall {
+                        id: id.clone(),
+                        name: name.into(),
+                        arguments: serde_json::json!({"path": path}),
+                    }],
+                ));
+                history.push(ChatMessage::tool_result("ok", id));
+            }
+        }
+        history.push(ChatMessage::user("next"));
+        for _ in 0..3 {
+            history = compact_messages_with_budget(&history, 0, 5, None);
+            let (read, modified) = extract_file_ops(&history);
+            assert_eq!(read, paths);
+            assert_eq!(modified, paths);
+            history.push(ChatMessage::assistant("done"));
+            history.push(ChatMessage::user("continue"));
+        }
+    }
+
+    #[test]
+    fn legacy_file_history_still_accumulates() {
+        let history = vec![ChatMessage::system(
+            "[earlier conversation compressed]\nFiles read: src/main.rs, src/config.rs\nFiles modified: [notes].json",
+        )];
+        assert_eq!(
+            extract_file_ops(&history),
+            (
+                vec!["src/main.rs".into(), "src/config.rs".into()],
+                vec!["[notes].json".into()]
+            )
+        );
+    }
+
+    #[test]
+    fn oversized_file_history_retains_complete_paths() {
+        let paths: Vec<String> = (0..80)
+            .map(|i| format!("{i},{}.json", "x".repeat(300)))
+            .collect();
+        let mut history = vec![ChatMessage::system("base"), ChatMessage::user("edit")];
+        for (i, path) in paths.iter().enumerate() {
+            let id = format!("c{i}");
+            history.push(ChatMessage::assistant_with_tools(
+                "",
+                vec![crate::llm::provider::ToolCall {
+                    id: id.clone(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": path}),
+                }],
+            ));
+            history.push(ChatMessage::tool_result("ok", id));
+        }
+        history.push(ChatMessage::user("next"));
+        let first = compact_messages_with_budget(&history, 0, 5, None);
+        let (_, retained) = extract_file_ops(&first);
+        assert!(
+            !retained.is_empty(),
+            "truncation must preserve complete earlier paths"
+        );
+        assert_eq!(retained, paths[..retained.len()]);
+        assert!(first[1].content.contains("file history truncated"));
+        let mut second = first;
+        second.push(ChatMessage::assistant("done"));
+        second.push(ChatMessage::user("continue"));
+        let second = compact_messages_with_budget(&second, 0, 5, None);
+        assert_eq!(extract_file_ops(&second).1, retained);
+    }
+
     #[test]
     fn live_goals_are_pinned_outside_compaction_summary() {
         let goal = "## Active goals\n- g: preserve API";

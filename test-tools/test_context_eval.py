@@ -37,6 +37,96 @@ class ContextEvaluation(unittest.TestCase):
             self.assertNotIn('api_key', on['config'].read_text())
             self.assertIn('marker-1', off['session'].read_text())
 
+    def test_json_edit_fixture_is_identical_and_only_expected_fields_change(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            off = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            on = evaluator.prepare_trial(Path(temp), 'on', 8000, 'fixture-key', case='json-edit')
+            self.assertEqual(off['session'].read_bytes(), on['session'].read_bytes())
+            original = json.loads((off['work'] / 'settings.json').read_text())
+            self.assertEqual(original, json.loads((on['work'] / 'settings.json').read_text()))
+            self.assertFalse(evaluator.artifact_correct(off))
+            desired = dict(original, service=dict(original['service'], retries=4,
+                           enabled=True, port=off['expected_json']['service']['port']))
+            (off['work'] / 'settings.json').write_text(json.dumps(desired))
+            self.assertTrue(evaluator.artifact_correct(off))
+            desired['banner'] = 'lost Unicode constraint'
+            (off['work'] / 'settings.json').write_text(json.dumps(desired))
+            self.assertFalse(evaluator.artifact_correct(off))
+
+    def test_json_edit_does_not_accept_prose_or_failed_process(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            trial = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            def run(command, **kwargs):
+                return subprocess.CompletedProcess(command, 0, 'Done perfectly', '')
+            self.assertFalse(evaluator.execute_trial(Path('/fake/sigil'), trial, 2, {}, runner=run)['passed'])
+            def failed(command, **kwargs):
+                (trial['work'] / 'settings.json').write_text(json.dumps(trial['expected_json']))
+                return subprocess.CompletedProcess(command, 1, 'Done', '')
+            self.assertFalse(evaluator.execute_trial(Path('/fake/sigil'), trial, 2, {}, runner=failed)['passed'])
+            def successful(command, **kwargs):
+                with trial['session'].open('a') as file:
+                    for name in ('read_file', 'write_file'):
+                        file.write(json.dumps({'e': 'tool_call', 'name': name,
+                                              'args': json.dumps({'path': 'settings.json'})}) + '\n')
+                return subprocess.CompletedProcess(command, 0, 'Done', '')
+            self.assertTrue(evaluator.execute_trial(Path('/fake/sigil'), trial, 2, {}, runner=successful)['passed'])
+
+    def test_json_artifact_rejects_duplicate_keys_large_files_and_symlinks(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            trial = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            target = trial['work'] / 'settings.json'
+            for text in ['{broken', '{"service": {}, "service": {}}', ' ' * 65537]:
+                target.write_text(text)
+                self.assertFalse(evaluator.artifact_correct(trial))
+            target.unlink()
+            target.symlink_to(trial['work'] / 'protected.txt')
+            self.assertFalse(evaluator.artifact_correct(trial))
+
+    def test_json_artifact_checks_types_and_protected_file(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            trial = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            desired = json.loads(json.dumps(trial['expected_json']))
+            desired['service']['enabled'] = 1
+            target = trial['work'] / 'settings.json'
+            target.write_text(json.dumps(desired))
+            self.assertFalse(evaluator.artifact_correct(trial))
+            target.write_text(json.dumps(trial['expected_json']))
+            (trial['work'] / 'protected.txt').write_text('changed')
+            self.assertFalse(evaluator.artifact_correct(trial))
+            if hasattr(os, 'mkfifo'):
+                target.unlink()
+                os.mkfifo(target)
+                self.assertFalse(evaluator.artifact_correct(trial))
+
+    def test_json_artifact_rejects_unrequested_workspace_changes(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            trial = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            (trial['work'] / 'settings.json').write_text(json.dumps(trial['expected_json']))
+            self.assertTrue(evaluator.artifact_correct(trial))
+            (trial['work'] / 'unrequested.txt').write_text('changed')
+            self.assertFalse(evaluator.artifact_correct(trial))
+
+    def test_json_success_requires_logged_file_tool_workflow(self):
+        evaluator = module()
+        with tempfile.TemporaryDirectory() as temp:
+            trial = evaluator.prepare_trial(Path(temp), 'off', 0, 'fixture-key', case='json-edit')
+            def run(command, **kwargs):
+                (trial['work'] / 'settings.json').write_text(json.dumps(trial['expected_json']))
+                return subprocess.CompletedProcess(command, 0, 'Done', '')
+            result = evaluator.execute_trial(Path('/fake/sigil'), trial, 2, {}, runner=run)
+            self.assertFalse(result['passed'])
+            allowed = [{'e': 'tool_call', 'name': name, 'args': json.dumps({'path': 'settings.json'})}
+                       for name in ('read_file', 'write_file')]
+            self.assertTrue(evaluator.workflow_correct(trial, allowed))
+            self.assertFalse(evaluator.workflow_correct(trial, allowed +
+                             [{'e': 'tool_call', 'name': 'bash', 'args': '{}'}]))
+            self.assertFalse(evaluator.workflow_correct(trial, list(reversed(allowed))))
+
     def test_success_requires_exact_answer_and_successful_process(self):
         evaluator = module()
         self.assertTrue(evaluator.correct('fixture-key\n', 'fixture-key', 0))
@@ -137,6 +227,24 @@ class ContextEvaluation(unittest.TestCase):
                           {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
                           {'choices': [], 'usage': {'prompt_tokens': len(text)//4, 'completion_tokens': 10,
                                                    'prompt_tokens_details': {'cached_tokens': 0}}}]
+                if 'Apply the earlier constraints to settings.json' in text:
+                    tools = [m for m in request['messages'] if m['role'] == 'tool']
+                    call = None
+                    if not tools:
+                        call = ('read_file', {'path': 'settings.json'})
+                    elif len(tools) == 1:
+                        original = json.loads(tools[0]['content'].split('|', 1)[1])
+                        original['service'].update(retries=4, enabled=True,
+                            port=int(re.search(r'service.port to (\d+)', text).group(1)))
+                        call = ('write_file', {'path': 'settings.json', 'content': json.dumps(original)})
+                    if call:
+                        name, arguments = call
+                        chunks[0]['choices'][0]['delta'] = {'tool_calls': [
+                            {'index': 0, 'id': 'call-' + name, 'type': 'function',
+                             'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
+                        chunks[1]['choices'][0]['finish_reason'] = 'tool_calls'
+                    else:
+                        chunks[0]['choices'][0]['delta'] = {'content': 'Done'}
                 for chunk in chunks:
                     self.wfile.write(('data: ' + json.dumps(chunk) + '\n\n').encode())
                 self.wfile.write(b'data: [DONE]\n\n')
@@ -160,6 +268,18 @@ class ContextEvaluation(unittest.TestCase):
                 self.assertIn('[earlier conversation compressed]', observed[1])
                 self.assertLess(len(observed[1]), len(observed[0]))
                 self.assertNotIn('fixture', (output / 'pair-1' / 'on' / 'config.toml').read_text())
+                json_output = Path(temp) / 'json-results'
+                result = subprocess.run([sys.executable, str(SCRIPT), '--execute', '--case', 'json-edit',
+                                         '--repetitions', '1', '--output', str(json_output), '--model', 'fixture',
+                                         '--base-url', f'http://127.0.0.1:{server.server_port}/v1'],
+                                        capture_output=True, text=True, env=env, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                report = json.loads((json_output / 'report.json').read_text())
+                self.assertTrue(all(r['passed'] for r in report['results']))
+                self.assertTrue(all(r['case'] == 'json-edit' for r in report['results']))
+                self.assertEqual(len(observed), 10)
+                self.assertTrue(all(r['usage']['total']['requests'] == 3 for r in report['results']))
+
             finally:
                 server.shutdown()
                 server.server_close()

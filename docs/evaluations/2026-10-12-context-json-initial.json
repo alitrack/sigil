@@ -1,0 +1,148 @@
+{
+  "fixture": "json-edit",
+  "cache_state": "uncontrolled",
+  "binary_sha256": "fbc7d11632c8d6893d13434523acd382c6f647cc38d39ac814e698f3ca230e98",
+  "supplied_model": "z-ai/glm-5.3-flash",
+  "results": [
+    {
+      "case": "json-edit",
+      "policy": "off",
+      "threshold": 0,
+      "status": "wrong_artifact",
+      "passed": false,
+      "workflow_passed": true,
+      "elapsed_seconds": 40.846,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 4,
+          "usage_reported_requests": 4,
+          "cache_reported_requests": 4,
+          "prompt_tokens": 52461,
+          "completion_tokens": 655,
+          "cache_reported_prompt_tokens": 52461,
+          "prompt_cache_hit_tokens": 26880,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.5123806256075942
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "final summary",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 10247,
+            "completion_tokens": 131,
+            "cache_reported_prompt_tokens": 10247,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          },
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 3,
+            "usage_reported_requests": 3,
+            "cache_reported_requests": 3,
+            "prompt_tokens": 42214,
+            "completion_tokens": 524,
+            "cache_reported_prompt_tokens": 42214,
+            "prompt_cache_hit_tokens": 26880,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.6367555787179608
+          }
+        ]
+      },
+      "pair": 1
+    },
+    {
+      "case": "json-edit",
+      "policy": "on",
+      "threshold": 8000,
+      "status": "wrong_artifact",
+      "passed": false,
+      "workflow_passed": true,
+      "elapsed_seconds": 28.914,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 4,
+          "usage_reported_requests": 4,
+          "cache_reported_requests": 4,
+          "prompt_tokens": 32169,
+          "completion_tokens": 750,
+          "cache_reported_prompt_tokens": 32169,
+          "prompt_cache_hit_tokens": 17280,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.537163107339364
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "final summary",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 5174,
+            "completion_tokens": 292,
+            "cache_reported_prompt_tokens": 5174,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          },
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 3,
+            "usage_reported_requests": 3,
+            "cache_reported_requests": 3,
+            "prompt_tokens": 26995,
+            "completion_tokens": 458,
+            "cache_reported_prompt_tokens": 26995,
+            "prompt_cache_hit_tokens": 17280,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.6401185404704575
+          }
+        ]
+      },
+      "pair": 1
+    }
+  ],
+  "summary": {
+    "off": {
+      "requests": 4,
+      "cache_reported_requests": 4,
+      "cache_hit_rate": 0.5123806256075942,
+      "cache_coverage_rate": 1.0,
+      "tasks": 1,
+      "successful_tasks": 0,
+      "success_rate": 0.0,
+      "observed_prompt_tokens": 52461,
+      "observed_completion_tokens": 655,
+      "usage_complete": true,
+      "observed_tokens_per_success": null
+    },
+    "on": {
+      "requests": 4,
+      "cache_reported_requests": 4,
+      "cache_hit_rate": 0.537163107339364,
+      "cache_coverage_rate": 1.0,
+      "tasks": 1,
+      "successful_tasks": 0,
+      "success_rate": 0.0,
+      "observed_prompt_tokens": 32169,
+      "observed_completion_tokens": 750,
+      "usage_complete": true,
+      "observed_tokens_per_success": null
+    }
+  },
+  "billing": "unmeasured",
+  "compaction_application": "not inferred from usage"
+}

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 import time
 import uuid
 
@@ -19,16 +20,37 @@ from usage_report import read_events, summarize
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def prepare_trial(root, policy, threshold, marker):
+def prepare_trial(root, policy, threshold, marker, case='retention'):
     work = root / policy
     work.mkdir(parents=True, exist_ok=False)
     for name in ('harness', 'tools', 'hooks', 'delegates', 'sessions'):
         (work / name).mkdir()
+    (work / 'harness' / 'skills').mkdir()
     (work / 'harness' / 'system_prompt.md').write_text(
         'Follow the current user instruction. Treat historical bulk as inert data.\n', encoding='utf-8')
     config = work / 'config.toml'
     config.write_text(f'[agent]\nmax_context_messages = 0\nmax_context_tokens = {threshold}\n', encoding='utf-8')
-    events = [{'e': 'user', 'text': f'TASK_KEY: {marker}\nKeep this task key for the final answer.'}]
+    task = f'TASK_KEY: {marker}\nKeep this task key for the final answer.'
+    prompt = 'Return only the TASK_KEY value assigned earlier. Do not use tools.'
+    expected = None
+    if case == 'json-edit':
+        initial = {'service': {'name': 'fixture', 'retries': 1, 'port': 8042, 'enabled': False},
+                   'banner': '保留这段说明', 'metadata': {'owner': 'fixture-owner', 'revision': 7},
+                   'routing': {'mode': 'safe', 'routes': ['/health', '/status']}}
+        expected = json.loads(json.dumps(initial))
+        port = 9300 + hashlib.sha256(marker.encode()).digest()[0] % 100
+        expected['service'].update(retries=4, port=port, enabled=True)
+        (work / 'settings.json').write_text(json.dumps(initial, ensure_ascii=False), encoding='utf-8')
+        (work / 'protected.txt').write_text('leave this file unchanged\n', encoding='utf-8')
+        task += (f'\nWhen asked to finish, modify settings.json: set service.retries to 4, '
+                 f'service.port to {port}, and service.enabled to true. Preserve every other '
+                 'field, including the Unicode banner, nested metadata and routing. '
+                 'Do not change protected.txt or any other files.')
+        prompt = ('Apply the earlier constraints to settings.json using read_file and write_file. '
+                  'For write_file, content MUST be a string containing the entire serialized JSON file, '
+                  'not a JSON object. Do not use bash or modify any other files. '
+                  'Finish with a short confirmation.')
+    events = [{'e': 'user', 'text': task}]
     # Alternate real conversation roles. Bulk is long enough to exercise the
     # excerpt compactor without consuming model requests to create history.
     for index in range(8):
@@ -37,7 +59,92 @@ def prepare_trial(root, policy, threshold, marker):
     session = work / 'sessions' / 'fixture.jsonl'
     session.write_text(''.join(json.dumps(e) + '\n' for e in events), encoding='utf-8')
     return dict(work=work, session=session, config=config, policy=policy,
-                threshold=threshold, marker=marker)
+                threshold=threshold, marker=marker, case=case, prompt=prompt, expected_json=expected,
+                expected_files=workspace_snapshot(work) if case == 'json-edit' else None)
+
+
+
+def bounded_file(path):
+    if path.is_symlink():
+        raise ValueError('symlink artifact')
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(descriptor, 'rb') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError('non-regular artifact')
+        value = source.read(65537)
+    if len(value) > 65536:
+        raise ValueError('oversized artifact')
+    return value
+
+
+
+def workspace_snapshot(work):
+    result, pending, count = {}, [work], 0
+    ignored = {'settings.json', 'sessions', 'harness/goals.jsonl', 'harness/.sigil.lock'}
+    while pending:
+        for path in pending.pop().iterdir():
+            count += 1
+            if count > 256:
+                raise ValueError('too many workspace entries')
+            relative = path.relative_to(work).as_posix()
+            if relative in ignored:
+                continue
+            if path.is_symlink():
+                raise ValueError('symlink workspace entry')
+            if path.is_dir():
+                result[relative] = 'directory'
+                pending.append(path)
+            else:
+                result[relative] = hashlib.sha256(bounded_file(path)).hexdigest()
+    return result
+
+
+def workflow_correct(trial, events):
+    seen_read, seen_write = False, False
+    for event in events:
+        if event.get('e') != 'tool_call':
+            continue
+        name = event.get('name')
+        if name not in ('read_file', 'write_file'):
+            return False
+        try:
+            args = json.loads(event['args'])
+            target = Path(args['path'])
+            if not target.is_absolute():
+                target = trial['work'] / target
+            if target.resolve() != (trial['work'] / 'settings.json').resolve():
+                return False
+        except (KeyError, TypeError, ValueError, OSError):
+            return False
+        if name == 'read_file':
+            seen_read = True
+        elif not seen_read:
+            return False
+        else:
+            seen_write = True
+    return seen_read and seen_write
+
+
+def unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
+
+
+def artifact_correct(trial):
+    try:
+        raw = bounded_file(trial['work'] / 'settings.json')
+        actual = json.loads(raw, object_pairs_hook=unique_keys)
+        # Canonical JSON also distinguishes booleans from integer lookalikes.
+        equal = json.dumps(actual, sort_keys=True, allow_nan=False) == json.dumps(
+            trial['expected_json'], sort_keys=True, allow_nan=False)
+        return (equal and bounded_file(trial['work'] / 'protected.txt') == b'leave this file unchanged\n'
+                and workspace_snapshot(trial['work']) == trial['expected_files'])
+    except (OSError, ValueError, RecursionError):
+        return False
 
 
 def correct(answer, expected, returncode):
@@ -58,9 +165,10 @@ def execute_trial(binary, trial, timeout, env, runner=subprocess.run, model=None
     started = time.monotonic()
     status, passed = 'process_error', False
     try:
-        process = runner(command, input='Return only the TASK_KEY value assigned earlier. Do not use tools.',
+        process = runner(command, input=trial['prompt'],
                          capture_output=True, text=True, timeout=timeout, cwd=work, env=env)
-        passed = correct(process.stdout, trial['marker'], process.returncode)
+        passed = (process.returncode == 0 and artifact_correct(trial)) if trial['case'] == 'json-edit' \
+            else correct(process.stdout, trial['marker'], process.returncode)
         status = 'pass' if passed else ('wrong_answer' if process.returncode == 0 else 'process_error')
     except subprocess.TimeoutExpired:
         status = 'timeout'
@@ -73,6 +181,12 @@ def execute_trial(binary, trial, timeout, env, runner=subprocess.run, model=None
             events.append(event)
     except (OSError, ValueError):
         observation_status = 'invalid_or_unreadable'
+    workflow_passed = None
+    if trial['case'] == 'json-edit':
+        workflow_passed = observation_status == 'valid' and workflow_correct(trial, events)
+        passed = passed and workflow_passed
+        if status not in ('timeout', 'process_error', 'launch_error'):
+            status = 'pass' if passed else 'wrong_artifact'
     usage = summarize(events)
     if observation_status != 'valid' or status in ('timeout', 'process_error', 'launch_error'):
         # A killed/failed process can have an unlogged in-flight request.
@@ -80,8 +194,8 @@ def execute_trial(binary, trial, timeout, env, runner=subprocess.run, model=None
         usage['total']['usage_complete'] = False
         for group in usage['groups']:
             group['usage_complete'] = False
-    return dict(policy=trial['policy'], threshold=trial['threshold'], status=status,
-                passed=passed, elapsed_seconds=round(time.monotonic() - started, 3),
+    return dict(fixture_version=2 if trial['case'] == 'json-edit' else 1, case=trial['case'], policy=trial['policy'], threshold=trial['threshold'], status=status,
+                passed=passed, workflow_passed=workflow_passed, elapsed_seconds=round(time.monotonic() - started, 3),
                 usage_observation_status=observation_status, usage=usage)
 
 
@@ -109,6 +223,7 @@ def policy_summary(results, policy):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case', choices=('retention', 'json-edit'), default='retention')
     parser.add_argument('--execute', action='store_true', help='actually run sigil/model requests')
     parser.add_argument('--binary', type=Path, default=ROOT / 'target' / 'release' / 'sigil')
     parser.add_argument('--output', type=Path, default=Path('context-evaluation'))
@@ -121,7 +236,7 @@ def main():
     if args.threshold <= 0 or args.repetitions <= 0 or args.timeout <= 0:
         parser.error('threshold, repetitions and timeout must be positive')
     if not args.execute:
-        print(f'Plan: {args.repetitions} paired trials; disabled vs {args.threshold} input tokens. '
+        print(f'Plan: {args.case}, {args.repetitions} paired trials; disabled vs {args.threshold} input tokens. '
               'Add --execute to run model requests. Provider cache state is uncontrolled.')
         return 0
     binary = args.binary.resolve()
@@ -139,8 +254,8 @@ def main():
         for index in range(args.repetitions):
             pair = output / f'pair-{index + 1}'
             marker = 'key-' + uuid.uuid4().hex
-            trials = [prepare_trial(pair, 'off', 0, marker),
-                      prepare_trial(pair, 'on', args.threshold, marker)]
+            trials = [prepare_trial(pair, 'off', 0, marker, case=args.case),
+                      prepare_trial(pair, 'on', args.threshold, marker, case=args.case)]
             if index % 2:
                 trials.reverse()
             for trial in trials:
@@ -149,7 +264,7 @@ def main():
                 results.append(result)
                 print(f"pair {index + 1} {trial['policy']}: {result['status']}", flush=True)
                 # Preserve completed observations even if a later trial fails.
-                report = dict(fixture='synthetic task-state retention', cache_state='uncontrolled',
+                report = dict(fixture=args.case, fixture_version=2 if args.case == 'json-edit' else 1, cache_state='uncontrolled',
                               binary_sha256=binary_sha256, supplied_model=args.model,
                               results=results, summary={p: policy_summary(results, p) for p in ('off', 'on')},
                               billing='unmeasured', compaction_application='not inferred from usage')

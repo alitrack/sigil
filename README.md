@@ -62,6 +62,15 @@ python3 test-tools/usage_report.py path/to/session.jsonl
 python3 test-tools/usage_report.py --json path/to/session.jsonl
 ```
 
+Run a paired synthetic task-state retention experiment (Python 3.11+):
+
+```bash
+python3 test-tools/context_eval.py
+python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+The first command only prints a plan. The second uses an already configured `SIGIL_API_KEY`; generated configuration and summary reports do not contain credentials. The output directory must be new. Both policies receive identical seeded histories; one disables proactive compaction and the other defaults to an 8,000-token trigger (`--threshold` overrides it). Two repetitions alternate policy order. `report.json` includes exact-answer success, request counts, observed tokens, cache coverage, per-policy totals, and the binary SHA-256. Failed attempts remain in the denominator, and interrupted/invalid observations keep accounting incomplete. The fixture measures one key-retention task, not general coding quality. Provider cache state is uncontrolled, and these runs do not establish cold-cache/warm-cache cost or monetary savings. Three tool steps and `--timeout` bound execution, not token billing; the model's output limit remains provider-controlled. Sessions contain synthetic histories plus actual model/tool output; keep them local. Compare provider bills separately before drawing cost conclusions.
+
 The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
 
 

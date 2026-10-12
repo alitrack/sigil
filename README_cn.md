@@ -60,6 +60,15 @@ python3 test-tools/usage_report.py path/to/session.jsonl
 python3 test-tools/usage_report.py --json path/to/session.jsonl
 ```
 
+运行成对的合成任务状态保留实验（Python 3.11+）：
+
+```bash
+python3 test-tools/context_eval.py
+python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+第一条命令只显示计划。第二条使用已在本机配置的 `SIGIL_API_KEY`；生成配置和汇总报告不包含密钥。输出目录必须是新目录。两种策略使用相同种子历史：一组关闭主动压缩，另一组默认以 8,000-token 阈值触发（可用 `--threshold` 调整）。默认两组重复实验交替执行顺序。`report.json` 包含严格答案正确率、请求数、观测 token、缓存覆盖率、策略汇总及二进制 SHA-256。失败尝试仍计入分母，中断或损坏观测保留用量不完整状态。该样本只测试一个任务键的保留能力，不代表通用编码质量。服务端缓存状态不可控，不能据此判定冷/热缓存成本或金额节省。三步工具上限和 `--timeout` 限制执行，不是计费 token 上限；输出限制仍由模型服务控制。会话包含合成历史及真实模型/工具输出，应保存在本机。费用结论仍需核对服务商账单。
+
 JSON 输出按模型和请求类型分组。缓存命中率只使用已报告缓存覆盖的输入 token 作分母；`cache_coverage_rate` 表示报告缓存数据的请求比例。缺失观测不计入 token 总和，通过请求计数和 `usage_complete` 明确显示；没有 `request_usage` 的旧日志无法还原用量。同一路径重复传入只统计一次，但重叠副本或分叉会话中重复的历史必须手动排除。无效记录以文件和行号报错，不打印记录内容。比较压缩策略时，应使用相同固定任务、模型、工具定义和输出限制，另行验证任务成功率，并同时比较服务商账单和观测 token。冷缓存与热缓存实验应分别统计。该脚本不发送模型请求，也不推断任务成功或金额。
 
 

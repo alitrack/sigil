@@ -71,6 +71,8 @@ python3 test-tools/context_eval.py --execute --output ./context-eval-run --model
 
 The first command only prints a plan. The second uses an already configured `SIGIL_API_KEY`; generated configuration and summary reports do not contain credentials. The output directory must be new. Both policies receive identical seeded histories; one disables proactive compaction and the other defaults to an 8,000-token trigger (`--threshold` overrides it). Two repetitions alternate policy order. `report.json` includes exact-answer success, request counts, observed tokens, cache coverage, per-policy totals, and the binary SHA-256. Failed attempts remain in the denominator, and interrupted/invalid observations keep accounting incomplete. The default fixture measures one key-retention task, not general coding quality. Provider cache state is uncontrolled, and these runs do not establish cold-cache/warm-cache cost or monetary savings. Three tool steps and `--timeout` bound execution, not token billing; the model's output limit remains provider-controlled. Sessions contain synthetic histories plus actual model/tool output; keep them local. Compare provider bills separately before drawing cost conclusions.
 
+`write_file` accepts text strings verbatim for any target. For `.json` targets (case-insensitive), it also accepts JSON objects or arrays and serializes them as formatted JSON. Structured content for other file types, null, and numeric/boolean values are rejected before any filesystem mutation.
+
 Use `--case json-edit` for a file-edit fixture instead of exact-answer retention:
 
 ```bash

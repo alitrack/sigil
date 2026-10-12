@@ -236,7 +236,7 @@ class ContextEvaluation(unittest.TestCase):
                         original = json.loads(tools[0]['content'].split('|', 1)[1])
                         original['service'].update(retries=4, enabled=True,
                             port=int(re.search(r'service.port to (\d+)', text).group(1)))
-                        call = ('write_file', {'path': 'settings.json', 'content': json.dumps(original)})
+                        call = ('write_file', {'path': 'settings.json', 'content': original})
                     if call:
                         name, arguments = call
                         chunks[0]['choices'][0]['delta'] = {'tool_calls': [

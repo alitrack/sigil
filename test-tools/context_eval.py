@@ -47,8 +47,8 @@ def prepare_trial(root, policy, threshold, marker, case='retention'):
                  'field, including the Unicode banner, nested metadata and routing. '
                  'Do not change protected.txt or any other files.')
         prompt = ('Apply the earlier constraints to settings.json using read_file and write_file. '
-                  'For write_file, content MUST be a string containing the entire serialized JSON file, '
-                  'not a JSON object. Do not use bash or modify any other files. '
+                  'For write_file on this .json target, content may be the complete JSON object or a serialized JSON string. '
+                  'Do not use bash or modify any other files. '
                   'Finish with a short confirmation.')
     events = [{'e': 'user', 'text': task}]
     # Alternate real conversation roles. Bulk is long enough to exercise the
@@ -194,7 +194,7 @@ def execute_trial(binary, trial, timeout, env, runner=subprocess.run, model=None
         usage['total']['usage_complete'] = False
         for group in usage['groups']:
             group['usage_complete'] = False
-    return dict(fixture_version=2 if trial['case'] == 'json-edit' else 1, case=trial['case'], policy=trial['policy'], threshold=trial['threshold'], status=status,
+    return dict(fixture_version=3 if trial['case'] == 'json-edit' else 1, case=trial['case'], policy=trial['policy'], threshold=trial['threshold'], status=status,
                 passed=passed, workflow_passed=workflow_passed, elapsed_seconds=round(time.monotonic() - started, 3),
                 usage_observation_status=observation_status, usage=usage)
 
@@ -264,7 +264,7 @@ def main():
                 results.append(result)
                 print(f"pair {index + 1} {trial['policy']}: {result['status']}", flush=True)
                 # Preserve completed observations even if a later trial fails.
-                report = dict(fixture=args.case, fixture_version=2 if args.case == 'json-edit' else 1, cache_state='uncontrolled',
+                report = dict(fixture=args.case, fixture_version=3 if args.case == 'json-edit' else 1, cache_state='uncontrolled',
                               binary_sha256=binary_sha256, supplied_model=args.model,
                               results=results, summary={p: policy_summary(results, p) for p in ('off', 'on')},
                               billing='unmeasured', compaction_application='not inferred from usage')

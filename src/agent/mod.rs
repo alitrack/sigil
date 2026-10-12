@@ -411,11 +411,13 @@ pub async fn run_messages(
         .iter()
         .any(|m| matches!(m.role, crate::llm::provider::Role::System))
     {
-        let first_user = messages.iter().find_map(|m| match m.role {
+        // Resumed event histories contain earlier user turns but no harness
+        // system message. Relevance and prompt hooks must use the current turn.
+        let latest_user = messages.iter().rev().find_map(|m| match m.role {
             crate::llm::provider::Role::User => Some(m.content.clone()),
             _ => None,
         });
-        let system = config.system_prompt_for(first_user.as_deref().unwrap_or(""));
+        let system = config.system_prompt_for(latest_user.as_deref().unwrap_or(""));
         messages.insert(0, ChatMessage::system(system));
     }
 

@@ -29,6 +29,8 @@ no recompile needed.
 
 Skill relevance selects which bodies are inlined; score ties and the final selected set use name ordering. Changes in relevance scores alone therefore do not reorder an unchanged set of skill bodies. Skill membership, content edits, and dynamic hook output can still change the prompt.
 
+When rebuilding a system prompt from an event-sourced history, skill relevance and `on_prompt_build` use the latest user message. A resumed pipe turn can therefore select skills for its current task instead of the first task in the session.
+
 Active-goal prompts show the objective and static turn budget. The changing turns-used counter stays in persistent state and `manage_goals` output, so accounting alone does not rewrite the prompt prefix. Goal additions, completion, pauses, and budget changes still refresh the context.
 
 The default compaction trigger is an estimated 48,000 input-prompt tokens, with no message-count trigger. Configure it for your model under `[agent]`:

@@ -44,6 +44,15 @@ class PipeSessions(unittest.TestCase):
             root = Path(tmp)
             config = root / 'config.toml'
             config.write_text('[llm]\nmodel = "fixture"\n')
+            hooks = root / 'hooks'
+            hooks.mkdir()
+            (hooks / 'on_prompt_build.lua').write_text(
+                "return function(ctx) return 'CURRENT_PROMPT:' .. ctx.user_prompt end")
+            skills = root / 'harness' / 'skills'
+            skills.mkdir(parents=True)
+            (skills / 'old-task.md').write_text('> first task\n\nOld skill body marker')
+            (skills / 'new-task.md').write_text('> second task\n\nNew skill body marker')
+
             server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -78,6 +87,11 @@ class PipeSessions(unittest.TestCase):
                 self.assertIn('first', contents)
                 self.assertIn('fixture answer', contents)
                 self.assertIn('second', contents)
+                system = requests[1]['messages'][0]['content']
+                self.assertIn('CURRENT_PROMPT:second', system)
+                self.assertIn('<skill name="new-task">', system)
+                self.assertNotIn('<skill name="old-task">', system)
+
                 run('unrecorded')
                 self.assertFalse((root / '.sigil' / 'sessions').exists())
                 self.assertEqual(len(requests), 3, 'telemetry must not issue extra requests')

@@ -1,0 +1,194 @@
+{
+  "fixture": "synthetic task-state retention",
+  "cache_state": "uncontrolled",
+  "binary_sha256": "fbc7d11632c8d6893d13434523acd382c6f647cc38d39ac814e698f3ca230e98",
+  "supplied_model": "z-ai/glm-5.3-flash",
+  "results": [
+    {
+      "policy": "off",
+      "threshold": 0,
+      "status": "wrong_answer",
+      "passed": false,
+      "elapsed_seconds": 5.105,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 1,
+          "usage_reported_requests": 1,
+          "cache_reported_requests": 1,
+          "prompt_tokens": 13901,
+          "completion_tokens": 75,
+          "cache_reported_prompt_tokens": 13901,
+          "prompt_cache_hit_tokens": 0,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.0
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 13901,
+            "completion_tokens": 75,
+            "cache_reported_prompt_tokens": 13901,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          }
+        ]
+      },
+      "pair": 1
+    },
+    {
+      "policy": "on",
+      "threshold": 8000,
+      "status": "wrong_answer",
+      "passed": false,
+      "elapsed_seconds": 3.3,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 1,
+          "usage_reported_requests": 1,
+          "cache_reported_requests": 1,
+          "prompt_tokens": 8828,
+          "completion_tokens": 76,
+          "cache_reported_prompt_tokens": 8828,
+          "prompt_cache_hit_tokens": 0,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.0
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 8828,
+            "completion_tokens": 76,
+            "cache_reported_prompt_tokens": 8828,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          }
+        ]
+      },
+      "pair": 1
+    },
+    {
+      "policy": "on",
+      "threshold": 8000,
+      "status": "pass",
+      "passed": true,
+      "elapsed_seconds": 4.099,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 1,
+          "usage_reported_requests": 1,
+          "cache_reported_requests": 1,
+          "prompt_tokens": 8824,
+          "completion_tokens": 65,
+          "cache_reported_prompt_tokens": 8824,
+          "prompt_cache_hit_tokens": 0,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.0
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 8824,
+            "completion_tokens": 65,
+            "cache_reported_prompt_tokens": 8824,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          }
+        ]
+      },
+      "pair": 2
+    },
+    {
+      "policy": "off",
+      "threshold": 0,
+      "status": "pass",
+      "passed": true,
+      "elapsed_seconds": 2.592,
+      "usage_observation_status": "valid",
+      "usage": {
+        "total": {
+          "requests": 1,
+          "usage_reported_requests": 1,
+          "cache_reported_requests": 1,
+          "prompt_tokens": 13897,
+          "completion_tokens": 31,
+          "cache_reported_prompt_tokens": 13897,
+          "prompt_cache_hit_tokens": 0,
+          "usage_complete": true,
+          "cache_coverage_rate": 1.0,
+          "cache_hit_rate": 0.0
+        },
+        "groups": [
+          {
+            "model": "z-ai/glm-5.3-flash",
+            "request_kind": "stream",
+            "requests": 1,
+            "usage_reported_requests": 1,
+            "cache_reported_requests": 1,
+            "prompt_tokens": 13897,
+            "completion_tokens": 31,
+            "cache_reported_prompt_tokens": 13897,
+            "prompt_cache_hit_tokens": 0,
+            "usage_complete": true,
+            "cache_coverage_rate": 1.0,
+            "cache_hit_rate": 0.0
+          }
+        ]
+      },
+      "pair": 2
+    }
+  ],
+  "summary": {
+    "off": {
+      "requests": 2,
+      "cache_reported_requests": 2,
+      "cache_hit_rate": 0.0,
+      "cache_coverage_rate": 1.0,
+      "tasks": 2,
+      "successful_tasks": 1,
+      "success_rate": 0.5,
+      "observed_prompt_tokens": 27798,
+      "observed_completion_tokens": 106,
+      "usage_complete": true,
+      "observed_tokens_per_success": 27904.0
+    },
+    "on": {
+      "requests": 2,
+      "cache_reported_requests": 2,
+      "cache_hit_rate": 0.0,
+      "cache_coverage_rate": 1.0,
+      "tasks": 2,
+      "successful_tasks": 1,
+      "success_rate": 0.5,
+      "observed_prompt_tokens": 17652,
+      "observed_completion_tokens": 141,
+      "usage_complete": true,
+      "observed_tokens_per_success": 17793.0
+    }
+  },
+  "billing": "unmeasured",
+  "compaction_application": "not inferred from usage"
+}

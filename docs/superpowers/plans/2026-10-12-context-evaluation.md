@@ -20,3 +20,8 @@
 Validation: 9 evaluation tests including local simulated-LLM E2E passed; 8 existing usage-report tests passed. The local service verifies identical off/on history, alternating order, actual compaction in on requests, exact-answer success, four requests with no telemetry probes, and shorter compacted input. Independent review found interrupted-request completeness and corrupt-log sample loss; both were reproduced and fixed. Summaries retain observed counters but mark interrupted accounting incomplete. Valid observations preceding corrupt lines are retained; reports are replaced atomically and fingerprint the binary.
 
 Real endpoint status: 127.0.0.1:15722 is unavailable outside the sandbox. The user selected 127.0.0.1:3001; its models endpoint is reachable but requires an access key. SIGIL_API_KEY/OPENAI_API_KEY/GPT_LOAD_API_KEY are absent from the execution environment. No real-model generation or billing comparison has run yet; model name, authenticated runtime and any required group path are pending.
+
+
+## Real endpoint follow-through
+
+The user selected localhost:3001 and supplied authentication. Used the credential only in transient process environment; generated configurations, summaries and committed artifacts contain no credential. The first listed DeepSeek model failed with provider HTTP 410. Switched to listed GLM 5.3 Flash and completed four requests: off/on strict success 1/2 each, off/on prompt totals 27,798/17,652, completion totals 106/141, zero reported cache hits, full reported usage coverage. The token observation and limitations are saved under docs/evaluations/2026-10-12-context-ab.md and .json. Currency billing and broader quality validation remain unmeasured.

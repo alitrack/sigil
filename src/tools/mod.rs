@@ -17,6 +17,7 @@ pub mod acp;
 pub mod ask;
 pub mod bash;
 pub mod delegate;
+pub mod edg;
 pub mod evolve;
 pub mod files;
 pub mod git;
@@ -95,6 +96,12 @@ pub struct ToolRegistry {
     /// introspection tool (which holds a clone of this same Arc) without
     /// needing the registry that registered it.
     deps: Arc<RwLock<DependencyState>>,
+    /// EDG bank (HarnessMM PoC): shared between `declare_edg` (write
+    /// side) and the agent loop's callback-substitution controller
+    /// (read/execute side). Always created so receipts are observed
+    /// even when substitution is off (facts are facts); the SIGIL_EDG
+    /// env gates substitution only.
+    edg_bank: Arc<crate::tools::edg::EdgBank>,
 }
 
 /// Cordis P2 (reactive coeffects): the dependency graph and per-tool
@@ -125,6 +132,14 @@ impl DependencyState {
             .collect();
         out.sort();
         out
+    }
+}
+
+impl ToolRegistry {
+    /// Shared EDG bank (HarnessMM PoC). The agent loop reads this for
+    /// guarded decision reuse; `declare_edg` writes through it.
+    pub fn edg_bank(&self) -> Arc<crate::tools::edg::EdgBank> {
+        self.edg_bank.clone()
     }
 }
 
@@ -355,6 +370,11 @@ impl ToolRegistry {
         hooks_dir: Option<&Path>,
     ) -> Self {
         let mut registry = Self::new();
+        // EDG bank: shared Arc between the declare_edg tool and the
+        // agent loop's controller (substitution gated by SIGIL_EDG).
+        registry.register(Arc::new(edg::DeclareEdgTool {
+            bank: registry.edg_bank.clone(),
+        }));
         registry.register(Arc::new(bash::BashTool::new()));
         registry.register(Arc::new(files::ReadFileTool::new()));
         registry.register(Arc::new(files::WriteFileTool::new()));

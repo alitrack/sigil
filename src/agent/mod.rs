@@ -1121,10 +1121,7 @@ pub async fn run_messages(
                         format!("[edg reuse: {}]", node.label),
                         vec![call.clone()],
                     ));
-                    messages.push(ChatMessage::tool_result(
-                        result,
-                        call.id.clone(),
-                    ));
+                    messages.push(ChatMessage::tool_result(result, call.id.clone()));
                     // CCS ledger line: the certificate binds the literal
                     // action to the omitted model call.
                     eprintln!(

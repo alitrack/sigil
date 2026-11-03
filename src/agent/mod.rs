@@ -836,6 +836,14 @@ pub async fn run_messages(
                 Some(c) if !c.text.trim().is_empty() => c.text.clone(),
                 _ => text,
             };
+            // EDG v2 (inline authoring): a ```edg fenced block in the
+            // assistant text registers a bank with NO extra tool-call
+            // round-trip — the token cost is the block itself, not a
+            // declare_edg call. Same validation as the tool path.
+            if let Some(nodes) = crate::tools::edg::parse_inline(&assistant_text) {
+                let n = tools.edg_bank().replace(nodes);
+                eprintln!("[edg] inline bank registered: {n} node(s)");
+            }
             if let Some(sink) = &config.session_sink {
                 sink(crate::session::Event::Assistant {
                     ts: None,

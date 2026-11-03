@@ -222,49 +222,7 @@ pub struct DeclareEdgTool {
 
 impl DeclareEdgTool {
     fn validate(&self, nodes: &[Value]) -> anyhow::Result<Vec<EdgNode>> {
-        let mut out = Vec::with_capacity(nodes.len());
-        for (i, raw) in nodes.iter().enumerate() {
-            let label = raw
-                .get("label")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("node {i}: missing label"))?
-                .to_string();
-            let tool = raw
-                .get("tool")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("node {i}: missing tool"))?
-                .to_string();
-            let args = raw
-                .get("args")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("node {i}: missing args"))?;
-            let pred = raw
-                .get("pred")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let guard = raw
-                .get("guard")
-                .and_then(Value::as_str)
-                .unwrap_or("last_ok")
-                .to_string();
-            let node = EdgNode {
-                label,
-                tool,
-                args,
-                pred,
-                guard,
-            };
-            if !node.closed() {
-                anyhow::bail!(
-                    "node {} ('{}'): args contain a placeholder — literal closure violated",
-                    i,
-                    node.label
-                );
-            }
-            out.push(node);
-        }
-        Ok(out)
+        validate_nodes(nodes)
     }
 }
 
@@ -325,6 +283,90 @@ impl Tool for DeclareEdgTool {
             ),
         })
     }
+}
+
+/// Parse an inline ```edg fenced block from assistant text (v2: the
+/// model declares the bank in its message instead of spending a tool
+/// call round-trip on declare_edg). The block body is the same JSON
+/// nodes array as declare_edg's `nodes` parameter. Returns the parsed
+/// nodes, or None when no block is present.
+pub fn parse_inline(text: &str) -> Option<Vec<EdgNode>> {
+    let mut in_block = false;
+    let mut body = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !in_block {
+            if t == "```edg" {
+                in_block = true;
+            }
+            continue;
+        }
+        if t == "```" {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if !in_block {
+        return None;
+    }
+    let v: Value = serde_json::from_str(body.trim()).ok()?;
+    let arr = match v {
+        Value::Array(a) => a,
+        _ => return None,
+    };
+    let nodes = validate_nodes(&arr).ok()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    Some(nodes)
+}
+
+/// Standalone node validation (shared by the tool and parse_inline).
+fn validate_nodes(nodes: &[Value]) -> anyhow::Result<Vec<EdgNode>> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for (i, raw) in nodes.iter().enumerate() {
+        let label = raw
+            .get("label")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("node {i}: missing label"))?
+            .to_string();
+        let tool = raw
+            .get("tool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("node {i}: missing tool"))?
+            .to_string();
+        let args = raw
+            .get("args")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("node {i}: missing args"))?;
+        let pred = raw
+            .get("pred")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let guard = raw
+            .get("guard")
+            .and_then(Value::as_str)
+            .unwrap_or("last_ok")
+            .to_string();
+        let node = EdgNode {
+            label,
+            tool,
+            args,
+            pred,
+            guard,
+        };
+        if !node.closed() {
+            anyhow::bail!(
+                "node {} ('{}'): args contain a placeholder — literal closure violated",
+                i,
+                node.label
+            );
+        }
+        out.push(node);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -453,5 +495,24 @@ mod tests {
         }]);
         bank.observe("bash", true, "ok");
         assert!(bank.next_eligible(None).is_none());
+    }
+
+    #[test]
+    fn inline_parse_extracts_and_validates() {
+        let text = "I'll write the module now.\n\
+                    ```edg\n\
+                    [{\"label\":\"run\",\"tool\":\"bash\",\"args\":{\"command\":\"python3 test_fib.py\"},\"pred\":\"\",\"guard\":\"last_ok\"}]\n\
+                    ```\n\
+                    Then report.";
+        let nodes = parse_inline(text).expect("block should parse");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tool, "bash");
+        // Placeholder args rejected inline too.
+        let bad = "```edg\n\
+                   [{\"label\":\"r\",\"tool\":\"bash\",\"args\":{\"command\":\"${cmd}\"}}]\n\
+                   ```";
+        assert!(parse_inline(bad).is_none());
+        // No block → None.
+        assert!(parse_inline("plain answer, no block").is_none());
     }
 }

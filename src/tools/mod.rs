@@ -24,6 +24,7 @@ pub mod git;
 pub mod goals_tool;
 pub mod mcp;
 pub mod memory;
+pub mod plan_pool;
 pub mod scripted;
 pub mod subagent;
 pub mod versions;

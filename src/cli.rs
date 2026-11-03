@@ -138,6 +138,14 @@ pub enum Command {
     /// memory, sessions, git. Exit 0 ok / 1 warnings / 2 failures.
     Doctor,
 
+    /// Check / price / run a dynamic-workflow plan (LuaJIT sandbox).
+    /// `sigil plan check <file>` — static gate only.
+    /// `sigil plan price <file>` — static gate + blind dry-run estimate + approval verdict.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+
     /// Generate shell completions (bash, zsh, fish, elvish, powershell).
     Completions {
         /// Shell to generate completions for.
@@ -160,6 +168,28 @@ pub enum Command {
         /// mergeRefinementHistory pattern).
         #[arg(long)]
         merged: bool,
+    },
+}
+
+/// Actions for `sigil plan`.
+#[derive(Subcommand, Debug)]
+pub enum PlanAction {
+    /// Run the static gate on a plan file; print problems or OK.
+    Check {
+        /// Path to the plan (.lua source).
+        file: String,
+    },
+    /// Static gate + blind dry-run price estimate + approval verdict.
+    /// Budget seen by the stand-in = the budget the real run would see.
+    Price {
+        /// Path to the plan (.lua source).
+        file: String,
+        /// Budget cap in credits (default 150).
+        #[arg(long, default_value_t = 150.0)]
+        budget: f64,
+        /// Price per scan call in credits (default 0.2).
+        #[arg(long, default_value_t = 0.2)]
+        price: f64,
     },
 }
 

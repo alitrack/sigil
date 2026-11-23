@@ -12,6 +12,7 @@
 //!    is flagged to the model as "harness mutation".
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::tools::ToolOutput;
@@ -55,6 +56,118 @@ pub fn check(call_name: &str, arguments: &serde_json::Value) -> GateDecision {
         "bash" => check_bash(arguments),
         _ => GateDecision::Allow,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Freeze and write-scope — the two chokepoints every write surface shares.
+// ---------------------------------------------------------------------------
+
+/// True when this run is frozen (`SIGIL_FREEZE=1`): every write to the
+/// evolution surface (memory, scripted tools, harness, hooks) must be refused
+/// so a benchmark's held-out phase measures transfer rather than further
+/// mutation. Single source of truth — every write-capable tool calls this, so
+/// a new write surface cannot silently skip the freeze.
+pub fn is_frozen() -> bool {
+    std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1")
+}
+
+/// Roots a model-directed write may land in: the workspace, the OS temp dir
+/// and sigil's own state directory. `SIGIL_WRITE_ROOTS` (split on the platform
+/// path separator) extends the list for hosts that genuinely need it.
+pub fn write_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    roots.push(std::env::temp_dir());
+    if let Some(config) = dirs::config_dir() {
+        roots.push(config.join("sigil"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".sigil"));
+    }
+    if let Some(extra) = std::env::var_os("SIGIL_WRITE_ROOTS") {
+        for piece in std::env::split_paths(&extra) {
+            if !piece.as_os_str().is_empty() {
+                roots.push(piece);
+            }
+        }
+    }
+    roots
+}
+
+/// Canonicalize when the path exists; otherwise canonicalize the nearest
+/// existing ancestor and re-attach the remaining components lexically. Keeps
+/// symlinked roots (`/var` -> `/private/var`) comparable without requiring the
+/// target file to exist yet.
+fn canonical_or_lexical(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    while let Some(name) = cursor.file_name() {
+        tail.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cursor = parent;
+    }
+    lexical_normalize(path)
+}
+
+/// Resolve `.` and pop on `..` without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Authorize a model-directed write against an explicit set of roots.
+///
+/// Split out from [`authorize_write`] so tests can exercise the policy without
+/// mutating process-global state (env vars / cwd), which parallel tests cannot
+/// do safely.
+pub fn authorize_write_in(path: &Path, roots: &[PathBuf]) -> anyhow::Result<PathBuf> {
+    let resolved = crate::agent::provider::resolve_path(path);
+    let target = canonical_or_lexical(&resolved);
+    for root in roots {
+        let root = canonical_or_lexical(root);
+        if target == root || target.starts_with(&root) {
+            return Ok(resolved);
+        }
+    }
+    let allowed = roots
+        .iter()
+        .map(|r| canonical_or_lexical(r).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "write refused: {} is outside the writable roots ({allowed}). \
+         Writes are limited to the workspace, the temp dir and sigil's state \
+         dir; set SIGIL_WRITE_ROOTS to extend.",
+        target.display()
+    )
+}
+
+/// Authorize a model-directed write path (workspace / temp / sigil state).
+pub fn authorize_write(path: &Path) -> anyhow::Result<PathBuf> {
+    authorize_write_in(path, &write_roots())
 }
 
 /// Bash commands that must never auto-run without a human present.

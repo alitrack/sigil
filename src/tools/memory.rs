@@ -38,7 +38,7 @@ impl Tool for RememberTool {
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
         // SIGIL_FREEZE=1 (benchmark Phase B): memory writes are frozen too —
         // cross-session memory is part of the evolution surface under test.
-        if std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1") {
+        if crate::safety::is_frozen() {
             return Err(anyhow::anyhow!(
                 "frozen mode (SIGIL_FREEZE=1): remember is disabled for this run"
             ));
@@ -134,6 +134,15 @@ impl Tool for MemoryDeleteTool {
     }
 
     async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
+        // SIGIL_FREEZE=1: deletion is a write to the evolution surface. This
+        // was missed when the other three write entry points were frozen, so a
+        // model could still strip long-term memory during a frozen run and
+        // quietly falsify a held-out baseline.
+        if crate::safety::is_frozen() {
+            return Err(anyhow::anyhow!(
+                "frozen mode (SIGIL_FREEZE=1): memory_delete is disabled for this run"
+            ));
+        }
         let index = args
             .get("index")
             .and_then(Value::as_u64)

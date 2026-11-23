@@ -180,7 +180,13 @@ impl Tool for WriteFileTool {
             ),
         };
 
-        let resolved = crate::agent::provider::resolve_path(std::path::Path::new(path));
+        // Write-scope policy: a model-directed write may not leave the
+        // workspace / temp / sigil-state roots. Without this, `write_file`
+        // (which the approval gate allows unconditionally) is an arbitrary
+        // absolute-path write with the user's privileges — the shortest path
+        // from a prompt injection to a persistent shell.
+        let resolved = crate::safety::authorize_write(std::path::Path::new(path))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(parent) = resolved.parent() {
             let _ = self.fs.create_dir_all(parent).await;
         }

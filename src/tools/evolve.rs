@@ -95,7 +95,7 @@ impl Tool for CreateLuaToolTool {
         // SIGIL_FREEZE=1 (benchmark Phase B): evolution writes are disabled —
         // the capability surface must stay byte-identical to its Phase-A end
         // state so held-out scores measure transfer, not further evolution.
-        if std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1") {
+        if crate::safety::is_frozen() {
             return Err(anyhow::anyhow!(
                 "frozen mode (SIGIL_FREEZE=1): create_lua_tool writes are disabled for this run; use existing tools only"
             ));
@@ -455,7 +455,7 @@ impl Tool for ImproveHarnessTool {
         };
         // SIGIL_FREEZE=1 (benchmark Phase B): harness writes are disabled.
         // Read-only actions (list_skills / show) stay available below.
-        let frozen = std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1");
+        let frozen = crate::safety::is_frozen();
         if frozen && !matches!(action, "list_skills" | "list_hooks") {
             return Err(anyhow::anyhow!(
                 "frozen mode (SIGIL_FREEZE=1): improve_harness writes are disabled for this run; list_skills/show remain available"

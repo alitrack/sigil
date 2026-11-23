@@ -1,6 +1,6 @@
 //! Safety unit tests: gate decisions, rings, circuit breaker.
 
-use crate::safety::{CircuitBreaker, GateDecision, Ring, check, ring_of};
+use crate::safety::{CircuitBreaker, GateDecision, Ring, authorize_write_in, check, ring_of};
 use serde_json::json;
 
 #[cfg(test)]
@@ -210,4 +210,67 @@ fn git_aliases_and_unknown_helpers_require_approval() {
             "{command}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Write-scope policy: a model-directed write must stay inside an allowed root.
+// Roots are passed explicitly (never via env) so these run safely in parallel.
+// ---------------------------------------------------------------------------
+
+fn root(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sigil-write-scope-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn write_inside_allowed_root_is_accepted() {
+    let base = root("inside");
+    let roots = vec![base.clone()];
+    let target = base.join("sub/file.txt");
+    let ok = authorize_write_in(&target, &roots);
+    assert!(ok.is_ok(), "{ok:?}");
+}
+
+#[test]
+fn write_with_parent_escape_is_refused() {
+    let base = root("escape");
+    let roots = vec![base.clone()];
+    let sneaky = base.join("sub/../../etc/passwd");
+    let err = authorize_write_in(&sneaky, &roots).unwrap_err().to_string();
+    assert!(err.contains("write refused"), "{err}");
+}
+
+#[test]
+fn write_to_absolute_path_outside_roots_is_refused() {
+    let base = root("absolute");
+    let roots = vec![base];
+    let err = authorize_write_in(std::path::Path::new("/etc/passwd"), &roots)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("write refused"), "{err}");
+}
+
+#[test]
+fn write_roots_can_be_extended_explicitly() {
+    let base = root("extend-a");
+    let extra = root("extend-b");
+    let target = extra.join("notes.md");
+    assert!(authorize_write_in(&target, std::slice::from_ref(&base)).is_err());
+    assert!(authorize_write_in(&target, &[base, extra]).is_ok());
+}
+
+#[test]
+fn sibling_prefix_is_not_treated_as_inside() {
+    // /tmp/x-evil must not pass just because /tmp/x is a root.
+    let base = root("prefix");
+    let sibling = base.with_file_name(format!(
+        "{}-evil",
+        base.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&sibling).unwrap();
+    let err = authorize_write_in(&sibling.join("f.txt"), &[base])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("write refused"), "{err}");
 }

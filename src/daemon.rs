@@ -464,6 +464,7 @@ async fn handle_connection(
                         //  sink on every success exit — see turn_config)
                         let state_tag = match result.state {
                             crate::agent::RunState::StepLimitReached => "step_limit",
+                            crate::agent::RunState::NoProgress => "no_progress",
                             crate::agent::RunState::Success => "ok",
                         };
                         let _ = tx.send(format!(

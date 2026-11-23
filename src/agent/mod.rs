@@ -12,6 +12,7 @@
 
 mod context;
 mod gate;
+mod scheduler;
 #[cfg(test)]
 use context::compact_messages;
 pub use context::compact_messages_with_budget;
@@ -33,6 +34,8 @@ use crate::tools::ToolRegistry;
 mod compact_tests;
 #[cfg(test)]
 mod parallel_tests;
+#[cfg(test)]
+mod scheduler_tests;
 #[cfg(test)]
 mod tests;
 
@@ -285,6 +288,9 @@ pub enum RunState {
     /// `max_steps` was exhausted; the loop asked the model for a
     /// wrap-up summary instead of aborting mid-work.
     StepLimitReached,
+    /// Consecutive tool rounds produced identical results (`SIGIL_NO_PROGRESS`):
+    /// the loop stopped repeating them and asked for a wrap-up instead.
+    NoProgress,
 }
 
 /// Structured result of a `run_messages` run — the answer text plus
@@ -437,6 +443,40 @@ pub async fn run_messages(
     // put everything in reasoning_content, leaving content empty — a
     // silent Success("") is worse than asking once more).
     let mut retried_empty = false;
+    // Scheduler ①: first-frame floor. One tool-less draft taken before the
+    // loop so a run that spins out its budget still has something to say.
+    let fallback_draft: Option<String> = if scheduler::first_frame_enabled() {
+        match tool_less_call(
+            provider,
+            config,
+            &messages,
+            "Do not call any tools. Give your best answer to the user's request \
+             now, as complete as you can make it in one message.",
+            None,
+            &prompt_budget,
+        )
+        .await
+        {
+            Ok((draft, _)) if !draft.trim().is_empty() => {
+                eprintln!(
+                    "[scheduler] first-frame draft captured ({} chars)",
+                    draft.len()
+                );
+                Some(draft)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("[scheduler] first-frame draft unavailable: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Scheduler ②: progress guard state.
+    let no_progress_limit = scheduler::no_progress_limit();
+    let mut last_round: Option<u64> = None;
+    let mut stalled_rounds: u32 = 0;
 
     loop {
         // Cross-instance sync: if another sigil process edited the
@@ -506,57 +546,18 @@ pub async fn run_messages(
             // happened to be streaming — run one final, tool-less LLM
             // call asking for a wrap-up summary so the caller always
             // gets a real answer, tagged with StepLimitReached.
-            let (summary, summary_tokens) =
-                match provide_final_answer(provider, config, &messages, stream_cb, &prompt_budget)
-                    .await
-                {
-                    Ok((s, t)) => (s, t),
-                    Err(e) => (
-                        format!(
-                            "step limit ({}) reached — summary unavailable ({e})",
-                            config.max_steps
-                        ),
-                        None,
-                    ),
-                };
-            accumulate_usage(&mut tokens, summary_tokens);
-            // P0 hook (emit observation): observe the step-limit wrap-up
-            // too — step-budget exhaustion is exactly when delivery audit
-            // (on_done) matters most (failures land here, not on the
-            // tool-less final-answer path).
-            if let Some(hooks) = &config.hooks
-                && let Err(e) = hooks
-                    .dispatch(
-                        "on_done",
-                        crate::hooks::HookMode::Emit,
-                        serde_json::json!({
-                            "output": summary.trim(),
-                            "steps": step,
-                            "model": config.model,
-                        }),
-                    )
-                    .await
-            {
-                eprintln!("warning: on_done hook failed: {e:#}");
-            }
-            // Event sink: the wrap-up summary is model-visible output —
-            // log it (callers do not append the assistant turn themselves;
-            // the loop owns assistant events on every success exit).
-            if let Some(sink) = &config.session_sink {
-                sink(crate::session::Event::Assistant {
-                    ts: None,
-                    text: summary.clone(),
-                });
-                sink(crate::session::Event::TurnEnd { ts: None });
-            }
-            messages.push(ChatMessage::assistant(summary.clone()));
-            return Ok(RunResult {
-                output: summary,
-                steps: step,
-                state: RunState::StepLimitReached,
-                tokens,
+            return wrap_up(
+                provider,
+                config,
                 messages,
-            });
+                stream_cb,
+                &prompt_budget,
+                tokens,
+                step,
+                RunState::StepLimitReached,
+                fallback_draft,
+            )
+            .await;
         }
         step += 1;
 
@@ -917,6 +918,7 @@ pub async fn run_messages(
             let mut results_by_plan: std::collections::HashMap<usize, String> =
                 executed.into_iter().collect();
 
+            let mut round_receipts: Vec<(String, bool, String)> = Vec::new();
             for (i, plan) in plans.into_iter().enumerate() {
                 let blocked = plan.blocked.clone();
                 let (ran, raw) = match blocked {
@@ -929,7 +931,48 @@ pub async fn run_messages(
                     ),
                 };
                 let msg = gate.observe(&plan.call, ran, raw).await?;
+                round_receipts.push((
+                    plan.call.name.clone(),
+                    ran && !msg.starts_with("error:"),
+                    msg.clone(),
+                ));
                 messages.push(ChatMessage::tool_result(msg, plan.call.id));
+            }
+            // Scheduler ②: a round that produced exactly the same
+            // (tool, ok, output) triples as the previous one achieved the same
+            // thing. Say so once; if it happens again, stop paying for it and
+            // force a wrap-up instead of burning the rest of the budget.
+            if no_progress_limit > 0 && !round_receipts.is_empty() {
+                let signature = scheduler::progress_signature(&round_receipts);
+                stalled_rounds = if last_round == Some(signature) {
+                    stalled_rounds + 1
+                } else {
+                    0
+                };
+                last_round = Some(signature);
+                if stalled_rounds > no_progress_limit {
+                    eprintln!(
+                        "[scheduler] no progress for {} rounds — wrapping up",
+                        stalled_rounds
+                    );
+                    return wrap_up(
+                        provider,
+                        config,
+                        messages,
+                        stream_cb,
+                        &prompt_budget,
+                        tokens,
+                        step,
+                        RunState::NoProgress,
+                        fallback_draft,
+                    )
+                    .await;
+                }
+                if stalled_rounds == no_progress_limit {
+                    messages.push(ChatMessage::system(scheduler::no_progress_nudge(
+                        stalled_rounds,
+                    )));
+                }
             }
             // Evolution: hot-register any tools the model created this
             // turn so they are callable (and advertised) next turn.
@@ -949,6 +992,16 @@ pub async fn run_messages(
                  (it may have gone to a reasoning channel). Restate your                  final answer as normal message content now.",
             ));
             continue;
+        }
+        // Scheduler ①: still empty after the nudge — a reasoning-only model
+        // must not turn into a silent empty success. The pre-loop draft is the
+        // floor this run was promised.
+        if text.trim().is_empty()
+            && let Some(draft) = fallback_draft.as_ref()
+            && !draft.trim().is_empty()
+        {
+            eprintln!("[scheduler] empty answer — falling back to the first-frame draft");
+            text = draft.clone();
         }
         // P0 hook (emit observation): an `on_done` listener may react to
         // the finished turn (log, metrics, notify). Purely observational —
@@ -996,18 +1049,19 @@ pub async fn run_messages(
 /// its progress so far into a summary answer, using the transcript
 /// accumulated in the loop. Deliberately passes no tools — the run
 /// must end, not extend itself.
-async fn provide_final_answer(
+/// One tool-less completion: the shared body of the step-limit wrap-up and
+/// the first-frame draft. No tool specs are advertised, so the model cannot
+/// answer by calling something.
+async fn tool_less_call(
     provider: &dyn LlmProvider,
     config: &AgentConfig,
     messages: &[ChatMessage],
+    instruction: &str,
     stream_cb: Option<&StreamCb>,
     prompt_budget: &context::PromptBudget,
 ) -> Result<(String, Option<TokenUsage>)> {
     let mut msgs = messages.to_vec();
-    msgs.push(ChatMessage::system(
-        "Step budget exhausted. Do not call any tools. \
-         Summarize your progress so far and give your best final answer now.",
-    ));
+    msgs.push(ChatMessage::system(instruction));
     let msgs = prompt_budget.compact(
         &msgs,
         &[],
@@ -1021,11 +1075,11 @@ async fn provide_final_answer(
         stream: true,
         temperature: None,
     };
-    let mut stream = provider.chat_stream(req).await.context("final summary")?;
+    let mut stream = provider.chat_stream(req).await.context("tool-less call")?;
     let mut text = String::new();
     let mut tokens: Option<TokenUsage> = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading final summary")?;
+        let chunk = chunk.context("reading tool-less call")?;
         if chunk.usage.is_some() {
             tokens = chunk.usage;
         }
@@ -1040,11 +1094,96 @@ async fn provide_final_answer(
             break;
         }
     }
-    log_request_usage(config, "final summary", tokens);
-    if text.trim().is_empty() {
-        anyhow::bail!("final summary came back empty");
+    Ok((text, tokens))
+}
+
+/// End a run by asking the model for a wrap-up (no tools), then run the same
+/// exit ceremony every successful exit uses: `on_done` observation, session
+/// events, assistant turn, `RunResult`.
+///
+/// `fallback_draft` is the first-frame floor: when the wrap-up fails or comes
+/// back empty, the run still returns something the user can use instead of an
+/// apology string.
+#[allow(clippy::too_many_arguments)]
+async fn wrap_up(
+    provider: &dyn LlmProvider,
+    config: &AgentConfig,
+    messages: Vec<ChatMessage>,
+    stream_cb: Option<&StreamCb>,
+    prompt_budget: &context::PromptBudget,
+    mut tokens: Option<TokenUsage>,
+    step: u32,
+    state: RunState,
+    fallback_draft: Option<String>,
+) -> Result<RunResult> {
+    let attempt = tool_less_call(
+        provider,
+        config,
+        &messages,
+        "Step budget is used up. Do not call any tools. Summarize what you \
+         established and give your best final answer now.",
+        stream_cb,
+        prompt_budget,
+    )
+    .await;
+    let draft = fallback_draft.filter(|d| !d.trim().is_empty());
+    let (summary, summary_tokens) = match attempt {
+        Ok((s, t)) if !s.trim().is_empty() => (s, t),
+        Ok((s, t)) => match draft {
+            Some(d) => {
+                eprintln!("[scheduler] wrap-up was empty — using the first-frame draft");
+                (d, t)
+            }
+            None => (s, t),
+        },
+        Err(e) => match draft {
+            Some(d) => {
+                eprintln!("[scheduler] wrap-up failed ({e:#}) — using the first-frame draft");
+                (d, None)
+            }
+            None => (
+                format!("run ended ({state:?}) — wrap-up unavailable ({e})"),
+                None,
+            ),
+        },
+    };
+    accumulate_usage(&mut tokens, summary_tokens);
+    // P0 hook (emit observation): a budget-exhausted run is exactly when
+    // delivery audit (`on_done`) matters most.
+    if let Some(hooks) = &config.hooks
+        && let Err(e) = hooks
+            .dispatch(
+                "on_done",
+                crate::hooks::HookMode::Emit,
+                serde_json::json!({
+                    "output": summary.trim(),
+                    "steps": step,
+                    "model": config.model,
+                }),
+            )
+            .await
+    {
+        eprintln!("warning: on_done hook failed: {e:#}");
     }
-    Ok((text.trim().to_string(), tokens))
+    // Event sink: the wrap-up is model-visible output — log it (callers do not
+    // append the assistant turn themselves; the loop owns assistant events on
+    // every success exit).
+    if let Some(sink) = &config.session_sink {
+        sink(crate::session::Event::Assistant {
+            ts: None,
+            text: summary.clone(),
+        });
+        sink(crate::session::Event::TurnEnd { ts: None });
+    }
+    let mut messages = messages;
+    messages.push(ChatMessage::assistant(summary.clone()));
+    Ok(RunResult {
+        output: summary,
+        steps: step,
+        state,
+        tokens,
+        messages,
+    })
 }
 
 /// Classify a provider error: can compaction recover from it? OpenHands

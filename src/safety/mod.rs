@@ -80,6 +80,11 @@ pub fn write_roots() -> Vec<PathBuf> {
         roots.push(cwd);
     }
     roots.push(std::env::temp_dir());
+    // On macOS/BSD `temp_dir()` is $TMPDIR (/var/folders/...) while `/tmp` is
+    // a separate, legitimate scratch location that canonicalizes to
+    // /private/tmp. Found by live testing: a write to /tmp was refused.
+    #[cfg(unix)]
+    roots.push(PathBuf::from("/tmp"));
     if let Some(config) = dirs::config_dir() {
         roots.push(config.join("sigil"));
     }

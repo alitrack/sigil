@@ -63,6 +63,7 @@ src/
 ├── cli.rs           # clap: subcommands (Prompt/Acp/Mcp) + global args (--model, --base-url, --resume, ...)
 ├── config.rs        # TOML + env + CLI priority; [llm]/[agent]/[[mcp.servers]]
 ├── agent/mod.rs     # loop: stream → replay tool calls → execute → repeat; run_messages core
+│   └── gate.rs      # ToolGate: THE tool-execution chokepoint (gate → run → observe)
 │   └── tests.rs     # unit tests (tool-call extraction, SSE parsing, native calls)
 ├── repl.rs          # interactive REPL: rustyline editing, sessions, approval, streaming
 ├── session.rs       # JSONL session store (~/.sigil/sessions/), --resume
@@ -156,6 +157,12 @@ workspace (escalation fails closed without an approval channel), so
   and ACP/MCP paths run non-interactive (gate rejection stands).
   Known limit: `safety::check` only pattern-matches `bash`; every other tool
   is `Allow`. The write-scope and freeze rules below are what bound them.
+- **One execution path**: every tool call goes through `agent::ToolGate`
+  (`gate` → `run` → `observe`). The loop and the MCP server both use it, so
+  approval, hooks, the circuit breaker and the session sink cannot diverge.
+  Do not call `ToolRegistry::execute*` directly from a new path — that is how
+  EDG ended up with five P0 bypasses. Sub-agents inherit it by running
+  `run_messages`.
 - **Write scope**: `write_file` goes through `safety::authorize_write`, which
   confines model-directed writes to the workspace, the temp dir and sigil's
   state dirs (`SIGIL_WRITE_ROOTS` extends it). Escapes via `..`, absolute

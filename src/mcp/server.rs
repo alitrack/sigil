@@ -43,6 +43,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut registry = tools.clone_shallow();
+    // Per-session breaker: repeated tool failures trip it exactly as they do
+    // in the agent loop.
+    let breaker = crate::safety::CircuitBreaker::new();
     let mut lines = BufReader::new(stdin).lines();
     let mut next_id: u64 = 0;
 
@@ -235,15 +238,24 @@ where
                 if let Some(frame) = progress(0.0, format!("tool {name} started")) {
                     write_frame(&mut stdout, &frame).await?;
                 }
-                let result = if crate::safety::check(&call.name, &call.arguments)
-                    == crate::safety::GateDecision::Reject
-                {
-                    Err(anyhow::anyhow!(crate::safety::reject_message(
-                        &call.name,
-                        &call.arguments
-                    )))
-                } else {
-                    registry.execute_detailed(&call).await
+                // Route through the same chokepoint the agent loop uses, so
+                // an MCP client cannot reach a tool the approval gate would
+                // reject, and so repeated failures trip the breaker here too.
+                // No agent config in this path: hooks and the session sink do
+                // not fire for protocol-driven calls.
+                let gate = crate::agent::ToolGate::new(&registry, &breaker, None, None);
+                let result = match gate.gate(&call).await {
+                    Ok(crate::agent::GateVerdict::Blocked(reason)) => Err(anyhow::anyhow!(reason)),
+                    Ok(crate::agent::GateVerdict::Run) => {
+                        let execution = gate.run_detailed(&call).await;
+                        gate.observe(&call, !execution.is_error, execution.text)
+                            .await
+                            .map(|text| crate::tools::ToolExecution {
+                                text,
+                                is_error: execution.is_error,
+                            })
+                    }
+                    Err(e) => Err(e),
                 };
                 match result {
                     Ok(out) => {

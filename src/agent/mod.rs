@@ -11,11 +11,13 @@
 //!   4. Otherwise the streamed text is the final answer.
 
 mod context;
+mod gate;
 #[cfg(test)]
 use context::compact_messages;
 pub use context::compact_messages_with_budget;
 #[cfg(test)]
 use context::{estimate_message_tokens, estimate_tokens};
+pub use gate::{GateVerdict, ToolGate};
 
 pub mod invariant;
 pub mod provider;
@@ -875,126 +877,41 @@ pub async fn run_messages(
                     });
                 }
             }
+            // Every tool call goes through the single chokepoint
+            // (`ToolGate`): approval gate → approver → on_pre_tool veto →
+            // circuit breaker → execute → ring annotation → breaker
+            // bookkeeping → session events → on_tool_result rewrite.
+            //
+            // A second execution path must not re-implement this. That is
+            // precisely how EDG drifted out of the safety model: it ran tools
+            // itself and silently skipped four of the five controls.
+            let gate = ToolGate::new(&*tools, &breaker, Some(config), approver);
             for call in &tool_calls {
-                // Approval gate: reject destructive commands in
-                // non-interactive mode before they ever run. In
-                // interactive mode the human may override.
-                let gate = safety::check(&call.name, &call.arguments);
-                let mut allowed = matches!(gate, safety::GateDecision::Allow);
-                // Audit event helper: record the approval decision for
-                // a gate-affected call (audit-only, never replayed into
-                // model context).
-                let emit_approval = |decision: &str, reason: Option<String>| {
-                    if let Some(sink) = &config.session_sink {
-                        sink(crate::session::Event::Approval {
-                            ts: None,
-                            name: call.name.clone(),
-                            args: call.arguments.to_string(),
-                            decision: decision.into(),
-                            reason,
-                        });
-                    }
-                };
-                if !allowed
-                    && let Some(approve) = approver
-                    && approve(&call.name, &call.arguments)
-                {
-                    allowed = true;
-                    eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
-                    emit_approval("approved", None);
-                }
-                if !allowed {
-                    let decision = if approver.is_some() {
-                        "rejected"
-                    } else {
-                        "auto_rejected"
-                    };
-                    emit_approval(decision, None);
-                    plans.push(Plan {
-                        call: call.clone(),
-                        blocked: Some(safety::reject_message(&call.name, &call.arguments)),
-                    });
-                    continue;
-                }
-                // P0 hook (serial decision): an `on_pre_tool` listener can
-                // veto the call before it runs. The first non-null verdict
-                // wins; a truthy verdict (boolean true, or a non-empty
-                // string used as a human-readable reason) blocks the call.
-                // A nil / null verdict is a no-op and the chain continues.
-                if let Some(hooks) = &config.hooks
-                    && let crate::hooks::DispatchOutput::First(Some(v)) = hooks
-                        .dispatch(
-                            "on_pre_tool",
-                            crate::hooks::HookMode::Serial,
-                            serde_json::json!({
-                                "name": call.name,
-                                "args": call.arguments,
-                            }),
-                        )
-                        .await?
-                {
-                    // A verdict blocks the call when it is boolean `true`
-                    // or a non-empty string (the string is surfaced as the
-                    // reason). Anything else — `false`, null, an empty
-                    // string — is a pass and the chain continues.
-                    let veto_reason = match &v {
-                        serde_json::Value::Bool(true) => {
-                            Some("vetoed by on_pre_tool hook".to_string())
-                        }
-                        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-                        _ => None,
-                    };
-                    if let Some(reason) = veto_reason {
-                        emit_approval("hook_vetoed", Some(reason.clone()));
+                match gate.gate(call).await? {
+                    GateVerdict::Run => {
+                        executables.push(plans.len());
                         plans.push(Plan {
                             call: call.clone(),
-                            blocked: Some(format!("blocked by on_pre_tool hook: {reason}")),
+                            blocked: None,
                         });
-                        continue;
                     }
-                }
-                // Circuit breaker: skip tripped tools entirely.
-                if breaker.is_tripped(&call.name) {
-                    plans.push(Plan {
+                    GateVerdict::Blocked(reason) => plans.push(Plan {
                         call: call.clone(),
-                        blocked: Some(safety::CircuitBreaker::tripped_message(&call.name)),
-                    });
-                    continue;
+                        blocked: Some(reason),
+                    }),
                 }
-                executables.push(plans.len());
-                plans.push(Plan {
-                    call: call.clone(),
-                    blocked: None,
-                });
             }
 
-            // Parallel execution of the allowed calls. CircuitBreaker
-            // is internally locked, so per-call failure/success
-            // recording stays correct under concurrency. Errors are
-            // returned as tool output (never fatal), matching
-            // ToolRegistry::execute's contract.
-            let registry = &*tools;
-            let breaker_ref = &breaker;
+            // Parallel execution of the cleared calls: gating and
+            // bookkeeping are cheap and serial, the runs are independent (the
+            // model issues several calls in one response precisely because
+            // they do not depend on each other). Results are re-inserted in
+            // the original call order so the model always sees tool_results
+            // matching its tool_call ids.
             let futs = executables.iter().map(|&pi| {
                 let call = plans[pi].call.clone();
-                async move {
-                    let result = match registry.execute(&call).await {
-                        Ok(r) => r,
-                        Err(e) => format!("error: {e}"),
-                    };
-                    // Execution ring: flag harness mutations to the
-                    // model so it knows the toolset changed.
-                    let result = match safety::ring_of(&call.name) {
-                        safety::Ring::Harness => format!("[harness mutation] {result}"),
-                        _ => result,
-                    };
-                    if result.starts_with("error:") {
-                        breaker_ref.record_failure(&call.name);
-                    } else {
-                        breaker_ref.record_success(&call.name);
-                    }
-                    (pi, result)
-                }
+                let gate = &gate;
+                async move { (pi, gate.run(&call).await) }
             });
             let executed: Vec<(usize, String)> = futures_util::future::join_all(futs).await;
             let mut results_by_plan: std::collections::HashMap<usize, String> =
@@ -1002,49 +919,16 @@ pub async fn run_messages(
 
             for (i, plan) in plans.into_iter().enumerate() {
                 let blocked = plan.blocked.clone();
-                let msg = match &blocked {
-                    Some(m) => m.clone(),
-                    None => results_by_plan
-                        .remove(&i)
-                        .unwrap_or_else(|| "error: tool produced no result".into()),
+                let (ran, raw) = match blocked {
+                    Some(m) => (false, m),
+                    None => (
+                        true,
+                        results_by_plan
+                            .remove(&i)
+                            .unwrap_or_else(|| "error: tool produced no result".into()),
+                    ),
                 };
-                // Session event sink: emit ToolResult with the observed
-                // outcome (ok = executed and not an error-prefixed string;
-                // blocked/rejected calls emit ok=false).
-                if let Some(sink) = &config.session_sink {
-                    let ok = blocked.is_none() && !msg.starts_with("error:");
-                    // Cordis P3: annotate whether this call registered a
-                    // runtime-revertible effect (P1) so the session can be
-                    // rolled back frame-by-frame. Grounded in the actual
-                    // wiring: only a tool that opted into the P1
-                    // EffectTracker reports Some(true); everything else is
-                    // None (not assessed).
-                    let revertible = registry.revertible_of(&plan.call.name);
-                    sink(crate::session::Event::ToolResult {
-                        ts: None,
-                        id: plan.call.id.clone(),
-                        name: plan.call.name.clone(),
-                        ok,
-                        output: msg.clone(),
-                        revertible,
-                    });
-                }
-                // P-A hook: on_tool_result can rewrite what the model
-                // sees (returned string replaces the result text).
-                let msg = match &config.hooks {
-                    Some(hooks) => hooks
-                        .run(
-                            "on_tool_result",
-                            serde_json::json!({
-                                "name": plan.call.name,
-                                "args": plan.call.arguments,
-                                "result": msg,
-                            }),
-                        )
-                        .await?
-                        .unwrap_or(msg),
-                    None => msg,
-                };
+                let msg = gate.observe(&plan.call, ran, raw).await?;
                 messages.push(ChatMessage::tool_result(msg, plan.call.id));
             }
             // Evolution: hot-register any tools the model created this

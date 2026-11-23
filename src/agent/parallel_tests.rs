@@ -419,7 +419,7 @@ async fn appended_tool_output_is_budgeted_after_reported_usage() {
 }
 
 /// Minimal AgentConfig for tests (no goals, no compression).
-fn test_config() -> AgentConfig {
+pub(crate) fn test_config() -> AgentConfig {
     AgentConfig {
         model: "m".into(),
         max_steps: 0,

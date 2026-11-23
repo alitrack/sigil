@@ -14,10 +14,24 @@ file tells agent tooling how to work here without breaking things.
 ```bash
 cargo build                # debug
 cargo build --release      # release (strip + lto, single binary)
-cargo test                 # unit tests (290: agent, safety, lua, evolve, harness, mcp, acp, session, ...)
+cargo test --locked        # unit tests — `cargo test` output is the count's source of truth
 cargo fmt -- --check       # must be zero diff
 cargo clippy --all-targets -- -D warnings   # must be zero warnings
 ```
+
+Do not hard-code the test count in docs: it drifts. CI runs three
+clippy/test configurations (default, `--no-default-features` containment
+build, `--features plan`); all three must stay green.
+
+### Frozen feature: `plan`
+
+`src/plan/` (the dynamic-workflow plan DSL) is built **only** with
+`--features plan`; it is not part of the default surface. It is the fourth
+planning mechanism in the tree and its `run_plan` entry point has no caller
+(`sigil plan` exposes `check` / `price` only). Treat it as parked: keep the
+feature compiling and tested, do not extend it, and do not wire it into the
+agent loop before the candidate→evaluate→promote gate exists. Rationale:
+`review-multidomain-263bd58.md` §3.1.
 
 ### Build modes (Lua sandbox)
 
@@ -140,6 +154,15 @@ workspace (escalation fails closed without an approval channel), so
 - **Approval gate**: non-interactive mode rejects destructive commands by
   default; interactive mode (REPL) asks the human via `Approver`. Sub-agents
   and ACP/MCP paths run non-interactive (gate rejection stands).
+  Known limit: `safety::check` only pattern-matches `bash`; every other tool
+  is `Allow`. The write-scope and freeze rules below are what bound them.
+- **Write scope**: `write_file` goes through `safety::authorize_write`, which
+  confines model-directed writes to the workspace, the temp dir and sigil's
+  state dirs (`SIGIL_WRITE_ROOTS` extends it). Escapes via `..`, absolute
+  paths outside the roots and sibling-prefix lookalikes are refused.
+- **Freeze**: `safety::is_frozen()` (`SIGIL_FREEZE=1`) is the single check
+  every write surface calls (remember, memory_delete, create_lua_tool,
+  improve_harness, hooks). Add it to any new write tool.
 - **Environment hygiene**: MCP servers are spawned with `env_clear()` (never
   leak parent secrets); only PATH/HOME are restored.
 - **No blocking_lock / nested block_on**: inside the tokio runtime, use

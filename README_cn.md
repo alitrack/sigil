@@ -325,6 +325,14 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   交互 `y/N`）、熔断器（连续失败 3 次熔断）、执行环（只读/工作区/
   harness 变更）。未知 Git 子命令、自定义 alias 和外部 Git helper
   同样需要审批。
+  **请如实理解这些限制**：审批门只对 `bash` 做模式匹配 —— 其他工具一律
+  放行；交互式 `y/N` 只存在于 REPL（pipe、daemon、cron、子代理都没有
+  审批人）。真正约束其余工具的是写作用域（`write_file` 限定在工作区 /
+  临时目录 / sigil 状态目录，`SIGIL_WRITE_ROOTS` 可扩展）与冻结开关
+  （`SIGIL_FREEZE=1` 拒绝一切对进化面的写入）。默认构建开启 LuaJIT
+  **FFI**，模型自写的脚本工具可以调用任意 C 库 —— 需要隔离请用
+  `--no-default-features` 构建。一句话：sigil 假设模型被信任、可代表你
+  行动；不要在开启 FFI 的情况下把不可信内容喂给它。
 - **Memory** — `remember` / `recall`：模型自己维护的跨会话持久事实。
 - **MCP 客户端** — 配置 `[[mcp.servers]]` 拉起 stdio MCP server，其工具
   变成 `mcp_<server>_<tool>`。

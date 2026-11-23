@@ -378,6 +378,16 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   (tool tripped after 3 consecutive failures), execution rings
   (read-only / workspace / harness mutation). Unknown Git subcommands,
   custom aliases, and external Git helpers require approval too.
+  **Read the limits honestly**: the approval gate pattern-matches `bash`
+  only — every other tool is allowed, and the interactive `y/N` prompt exists
+  in the REPL alone (pipe, daemon, cron and sub-agents run with no approver).
+  What bounds the rest is write scope (`write_file` is confined to the
+  workspace / temp / sigil state dirs; `SIGIL_WRITE_ROOTS` extends it) and
+  the freeze switch (`SIGIL_FREEZE=1` refuses every write to the evolution
+  surface). The default build enables LuaJIT **FFI**, so a model-authored
+  scripted tool can call any C library — build `--no-default-features` for a
+  containment build. In short: sigil assumes the model is trusted to act with
+  your privileges. Do not point it at untrusted content with FFI enabled.
 - **Memory** — `remember` / `recall`: persistent cross-session facts the
   model maintains itself.
 - **MCP client** — `[[mcp.servers]]` in config spawns stdio MCP servers;

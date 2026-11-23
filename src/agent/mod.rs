@@ -391,11 +391,6 @@ pub fn messages_for_turn(history: &[ChatMessage], system: String) -> Vec<ChatMes
     }
     messages
 }
-/// Workspace root for relative `file_exists:` guards (same source the
-/// bash tool trusts: session cwd header, falling back to process cwd).
-fn cwd() -> Option<std::path::PathBuf> {
-    std::env::current_dir().ok()
-}
 
 /// The core agent loop over a pre-built message list
 /// (system prompt + any prior turns + the new user message). The REPL
@@ -836,14 +831,6 @@ pub async fn run_messages(
                 Some(c) if !c.text.trim().is_empty() => c.text.clone(),
                 _ => text,
             };
-            // EDG v2 (inline authoring): a ```edg fenced block in the
-            // assistant text registers a bank with NO extra tool-call
-            // round-trip — the token cost is the block itself, not a
-            // declare_edg call. Same validation as the tool path.
-            if let Some(nodes) = crate::tools::edg::parse_inline(&assistant_text) {
-                let n = tools.edg_bank().replace(nodes);
-                eprintln!("[edg] inline bank registered: {n} node(s)");
-            }
             if let Some(sink) = &config.session_sink {
                 sink(crate::session::Event::Assistant {
                     ts: None,
@@ -1012,9 +999,6 @@ pub async fn run_messages(
             let executed: Vec<(usize, String)> = futures_util::future::join_all(futs).await;
             let mut results_by_plan: std::collections::HashMap<usize, String> =
                 executed.into_iter().collect();
-            // EDG receipts: (tool, ok, output) per executed call, in plan
-            // order — observed facts for guard evaluation.
-            let mut edg_receipts: Vec<(String, bool, String)> = Vec::new();
 
             for (i, plan) in plans.into_iter().enumerate() {
                 let blocked = plan.blocked.clone();
@@ -1024,12 +1008,6 @@ pub async fn run_messages(
                         .remove(&i)
                         .unwrap_or_else(|| "error: tool produced no result".into()),
                 };
-                // EDG receipts: collect (tool, ok, output) for the bank.
-                edg_receipts.push((
-                    plan.call.name.clone(),
-                    blocked.is_none() && !msg.starts_with("error:"),
-                    msg.clone(),
-                ));
                 // Session event sink: emit ToolResult with the observed
                 // outcome (ok = executed and not an error-prefixed string;
                 // blocked/rejected calls emit ok=false).
@@ -1069,68 +1047,9 @@ pub async fn run_messages(
                 };
                 messages.push(ChatMessage::tool_result(msg, plan.call.id));
             }
-            // EDG (HarnessMM PoC): observe every tool receipt — guards
-            // consume observed facts only, never model predictions.
-            let bank = tools.edg_bank();
-            for (tool, ok, output) in &edg_receipts {
-                bank.observe(tool, *ok, output);
-            }
             // Evolution: hot-register any tools the model created this
             // turn so they are callable (and advertised) next turn.
             tools.drain_hot();
-            // Guarded decision reuse: if a stored decision's guard is
-            // satisfied by the receipts above, execute it through the
-            // same registry and REPLACE the next model call. This is
-            // sigil's certified callback substitution (SIGIL_EDG=on).
-            if std::env::var_os("SIGIL_EDG").is_some() {
-                let ws = cwd();
-                while let Some(node) = bank.next_eligible(ws.as_deref()) {
-                    let cert = bank.claim(&node);
-                    let call = crate::llm::provider::ToolCall {
-                        id: format!("edg_{}", cert.seq),
-                        name: node.tool.clone(),
-                        arguments: node.args.clone(),
-                    };
-                    // Safety: bypassed calls go through the same
-                    // approval gate as model-initiated ones.
-                    let gate = safety::check(&call.name, &call.arguments);
-                    if !matches!(gate, safety::GateDecision::Allow) {
-                        eprintln!(
-                            "[edg] node '{}' blocked by approval gate — deferring to model",
-                            node.label
-                        );
-                        bank.record_failure(&node.label);
-                        bank.abstentions
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    let result = match tools.execute(&call).await {
-                        Ok(r) => r,
-                        Err(e) => format!("error: {e}"),
-                    };
-                    let ok = !result.starts_with("error:");
-                    if !ok {
-                        bank.record_failure(&node.label);
-                    }
-                    bank.observe(&node.tool, ok, &result);
-                    // Model-visible transcript entries that keep the
-                    // assistant→tool pairing invariant intact: the
-                    // stored action is recorded as if the model issued
-                    // it (the model DID resolve it — at authoring time).
-                    messages.push(ChatMessage::assistant_with_tools(
-                        format!("[edg reuse: {}]", node.label),
-                        vec![call.clone()],
-                    ));
-                    messages.push(ChatMessage::tool_result(result, call.id.clone()));
-                    // CCS ledger line: the certificate binds the literal
-                    // action to the omitted model call.
-                    eprintln!(
-                        "[edg] cert#{} label='{}' tool={} guard={} args={} ok={}",
-                        cert.seq, cert.label, cert.tool, cert.guard, cert.args, ok
-                    );
-                    // New receipts may unlock chained nodes; loop.
-                }
-            }
             continue;
         }
 

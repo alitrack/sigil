@@ -18,6 +18,13 @@ default = ["lua-ffi"]
 # loading from Lua — the sandbox story for untrusted/leveraged
 # environments. Default ON: FFI is the core self-evolution capability.
 lua-ffi = []
+# `plan`: the dynamic-workflow plan DSL (263bd58) — FROZEN, not part of the
+# default surface. It is the fourth planning mechanism in the tree and its
+# `run_plan` entry point is not wired to the CLI yet; see
+# `review-multidomain-263bd58.md` §3.1. Kept compiling behind this feature so
+# the work is not lost, and so the default build carries none of its surface.
+plan = []
+
 
 [dependencies]
 anyhow = "1.0.104"

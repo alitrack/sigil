@@ -42,6 +42,15 @@ jobs:
       - name: Test (containment build)
         run: cargo test --locked --no-default-features
 
+      # `plan` is a frozen experiment behind a non-default feature: it must
+      # stay compiling and test-green so it does not rot while parked, but it
+      # is not part of the default surface (review-multidomain-263bd58.md §3.1).
+      - name: Clippy (frozen `plan` feature)
+        run: cargo clippy --all-targets --locked --features plan -- -D warnings
+
+      - name: Test (frozen `plan` feature)
+        run: cargo test --locked --features plan
+
       - name: Build (release)
         run: cargo build --release --locked
 

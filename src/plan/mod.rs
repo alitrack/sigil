@@ -15,6 +15,13 @@
 //! Original's rule kept verbatim: the blind stand-in must see the SAME budget
 //! the real run will see, or the price estimate is meaningless.
 
+// FROZEN EXPERIMENT (see review-multidomain-263bd58.md §3.1): this module is
+// built only behind the non-default `plan` feature. `run_plan` has no caller
+// yet — the CLI exposes only `check` / `price` — so the run/estimate surface
+// below is intentionally dead until it is wired behind the
+// candidate→evaluate→promote gate. Keep it compiling, do not extend it.
+#![allow(dead_code)]
+
 use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -250,11 +257,9 @@ fn inject_whitelist(lua: &Lua, globals: &Table) -> mlua::Result<()> {
         "pairs",
         lua.create_function(|lua, t: Table| {
             let keys = lua.create_table()?;
-            let mut i = 1;
-            for kv in t.pairs::<Value, Value>() {
+            for (i, kv) in (1..).zip(t.pairs::<Value, Value>()) {
                 let (k, _) = kv?;
                 keys.set(i, k)?;
-                i += 1;
             }
             Ok(keys)
         })?,
@@ -285,7 +290,7 @@ fn arm_runaway_hook(lua: &Lua, wall: Duration) {
 fn plan_result_string(lua: &Lua) -> mlua::Result<String> {
     // re-stringify through the whitelist tostring, the same path a plan gets
     let f: mlua::Function = lua.globals().get("tostring")?;
-    Ok(f.call::<String>(lua.load("__plan_result").eval::<Value>()?)?)
+    f.call::<String>(lua.load("__plan_result").eval::<Value>()?)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,10 @@
 //! plan_pool: minimal fan-out pool for plan runs (barrier semantics, like the
 //! original dynamic-workflow runtime's `parallel()`).
+//!
+//! FROZEN EXPERIMENT: built only behind the non-default `plan` feature; the
+//! drain side of the barrier is not wired yet, so the internals stay dead by
+//! design (see review-multidomain-263bd58.md §3.1).
+#![allow(dead_code)]
 
 use std::sync::{Arc, Condvar, Mutex};
 

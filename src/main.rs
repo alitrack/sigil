@@ -13,6 +13,7 @@ mod llm;
 mod lua;
 mod mcp;
 mod memory;
+#[cfg(feature = "plan")]
 mod plan;
 mod repl;
 mod revertible;
@@ -26,7 +27,9 @@ use clap::Parser;
 use serde_json::Value;
 use std::io::Write;
 
-use crate::cli::{Cli, Command, PlanAction};
+#[cfg(feature = "plan")]
+use crate::cli::PlanAction;
+use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::llm::openai::{OpenAiConfig, OpenAiProvider};
 use crate::tools::{ToolRegistry, scripted};
@@ -42,6 +45,8 @@ async fn main() -> Result<()> {
     }
 
     // `sigil plan check|price <file>` — pure local sandbox work, no provider.
+    // FROZEN behind the non-default `plan` feature (see Cargo.toml).
+    #[cfg(feature = "plan")]
     if let Some(Command::Plan { action }) = &cli.command {
         return plan_cli(action);
     }
@@ -539,6 +544,59 @@ fn prepare_pipe_turn(
     Ok((messages, id))
 }
 
+/// `sigil plan check|price` — local-only plan sandbox CLI.
+/// FROZEN behind the non-default `plan` feature (see Cargo.toml).
+#[cfg(feature = "plan")]
+fn plan_cli(action: &PlanAction) -> Result<()> {
+    use std::time::Duration;
+    let (file, budget, price) = match action {
+        PlanAction::Check { file } => (file, 0.0, 0.0),
+        PlanAction::Price {
+            file,
+            budget,
+            price,
+        } => (file, *budget, *price),
+    };
+    let src = std::fs::read_to_string(file).with_context(|| format!("read plan file {file}"))?;
+    match action {
+        PlanAction::Check { .. } => {
+            let problems = plan::static_gate(&src);
+            if problems.is_empty() {
+                println!(
+                    "OK: plan passes the static gate ({} lines)",
+                    src.lines().count()
+                );
+            } else {
+                println!("REFUSED ({} problems):", problems.len());
+                for p in problems.iter().take(8) {
+                    println!("  - {p}");
+                }
+                std::process::exit(1);
+            }
+        }
+        PlanAction::Price { .. } => {
+            match plan::dry_run(&src, budget, price, Duration::from_secs(60)) {
+                Ok(est) => {
+                    let (verdict, why) = plan::approve(&est, budget);
+                    println!(
+                        "estimate: {} calls, {:.1} credits (price {:.1}/call, budget {:.0})",
+                        est.calls, est.credits, price, budget
+                    );
+                    println!("gate: {verdict} — {why}");
+                }
+                Err(problems) => {
+                    println!("REFUSED ({} problems):", problems.len());
+                    for p in problems.iter().take(8) {
+                        println!("  - {p}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod pipe_tests {
     use super::*;
@@ -612,55 +670,4 @@ mod pipe_tests {
         assert_eq!(messages.len(), 1);
         assert!(!dir.exists());
     }
-}
-
-/// `sigil plan check|price` — local-only plan sandbox CLI.
-fn plan_cli(action: &PlanAction) -> Result<()> {
-    use std::time::Duration;
-    let (file, budget, price) = match action {
-        PlanAction::Check { file } => (file, 0.0, 0.0),
-        PlanAction::Price {
-            file,
-            budget,
-            price,
-        } => (file, *budget, *price),
-    };
-    let src = std::fs::read_to_string(file).with_context(|| format!("read plan file {file}"))?;
-    match action {
-        PlanAction::Check { .. } => {
-            let problems = plan::static_gate(&src);
-            if problems.is_empty() {
-                println!(
-                    "OK: plan passes the static gate ({} lines)",
-                    src.lines().count()
-                );
-            } else {
-                println!("REFUSED ({} problems):", problems.len());
-                for p in problems.iter().take(8) {
-                    println!("  - {p}");
-                }
-                std::process::exit(1);
-            }
-        }
-        PlanAction::Price { .. } => {
-            match plan::dry_run(&src, budget, price, Duration::from_secs(60)) {
-                Ok(est) => {
-                    let (verdict, why) = plan::approve(&est, budget);
-                    println!(
-                        "estimate: {} calls, {:.1} credits (price {:.1}/call, budget {:.0})",
-                        est.calls, est.credits, price, budget
-                    );
-                    println!("gate: {verdict} — {why}");
-                }
-                Err(problems) => {
-                    println!("REFUSED ({} problems):", problems.len());
-                    for p in problems.iter().take(8) {
-                        println!("  - {p}");
-                    }
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-    Ok(())
 }

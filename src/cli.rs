@@ -141,6 +141,10 @@ pub enum Command {
     /// Check / price / run a dynamic-workflow plan (LuaJIT sandbox).
     /// `sigil plan check <file>` — static gate only.
     /// `sigil plan price <file>` — static gate + blind dry-run estimate + approval verdict.
+    ///
+    /// FROZEN: only compiled with the non-default `plan` feature
+    /// (`cargo build --features plan`). See `review-multidomain-263bd58.md` §3.1.
+    #[cfg(feature = "plan")]
     Plan {
         #[command(subcommand)]
         action: PlanAction,
@@ -172,6 +176,7 @@ pub enum Command {
 }
 
 /// Actions for `sigil plan`.
+#[cfg(feature = "plan")]
 #[derive(Subcommand, Debug)]
 pub enum PlanAction {
     /// Run the static gate on a plan file; print problems or OK.

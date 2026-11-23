@@ -271,3 +271,23 @@ README 砍到 ~200 行 + 独立 `CHANGELOG.md`；AGENTS.md 删除具体测试数
 | 3 | `memory_delete` 加 freeze + `write_file`/写类工具加路径策略 | 1 小时 | 堵住"基准可被污染"和"任意绝对路径写" |
 
 然后才是 `execute_gated` 重构（1–2 天）与 loop 拆分（2–3 天）——**在这之前，任何新特性都只是在给一条无法验证的路径加负载。**
+
+---
+
+## 6. 实弹验证（2026-11-23，本机 MLX 端点跑真实二进制）
+
+评审结论如果只停在文档里，就是这个项目最该被批评的那种做法。因此本轮的改动都过了端到端验证：`cargo build --release` 出二进制，`SIGIL_BASE_URL=http://127.0.0.1:12345/v1`、模型 `Qwen3.8-Flash-Next-Sushi-2.6bpw`，在 `/tmp/sigil-e2e` 里跑 `sigil prompt`。
+
+| 用例 | 期望 | 实测 |
+|---|---|---|
+| 1. 工作区内 `write_file` | 允许 | ✅ 写入成功（模型自己注意到"写入被限制在该可写根目录内"） |
+| 2. `write_file` → `/tmp/sigil-escape-probe/evil.txt` | 拒绝 | ✅ `write refused: ... is outside the writable roots (...)` |
+| 3. `write_file` → `/tmp/sigil-e2e/tmp-ok.txt` | 允许 | ✅ 成功（**首轮实测失败**，见下） |
+| 4. `write_file` → `~/sigil-escape-probe.txt` | 拒绝 | ✅ `write refused: ...` |
+| 5. `SIGIL_FREEZE=1` + `create_lua_tool` | 拒绝 | ✅ `frozen mode ...: create_lua_tool writes are disabled` |
+| 6. `SIGIL_FREEZE=1` + `improve_harness add_skill` | 拒绝 | ✅ `frozen mode ...: improve_harness writes are disabled` |
+| 7. `SIGIL_FREEZE=1` + `memory_delete` | 拒绝 | ✅ `frozen mode (SIGIL_FREEZE=1): memory_delete is disabled for this run`（本轮新增的覆盖） |
+
+**验证抓到的真问题（这正是"必须有可执行反馈回路"的价值）**：首轮用例 2/3 同时失败——macOS 上 `/tmp` 是 `/private/tmp` 的软链，而 `std::env::temp_dir()` 返回 `$TMPDIR=/var/folders/...`，两者不相等，于是**往 `/tmp` 写也被拒**。规范化把 `/tmp` 解析成 `/private/tmp`，与 `temp_dir()` 永远对不上。修复：Unix 下把 `/tmp` 显式加入可写根。这个 bug 在纸面评审里看不出来，只有跑一次才会现形。
+
+**仍未验证的部分（如实标注）**：`read_file` 与 Lua `host.read_file` 仍可读任意绝对路径——本轮没有收紧（大量正常任务需要读 `/usr/include`、`/etc/os-release` 之类），但它意味着"读→外传"这条链仍然通畅。要真正闭环，需要一次独立的设计决定（读白名单 + `host.env` 键白名单），不建议顺手做。

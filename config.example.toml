@@ -8,6 +8,7 @@
 
 [agent]
 # max_steps = 10            # tool-call budget per turn (0 = unlimited)
+# planning_interval = 3     # restate the plan every N steps (0 = off)
 # system_prompt = "..."     # optional override of the default system prompt
 
 # Agent-loop Lua hooks (default: ~/.sigil/hooks/).

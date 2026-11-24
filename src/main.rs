@@ -199,7 +199,7 @@ async fn main() -> Result<()> {
         // Where goals.jsonl lives — the agent loop persists turn-budget
         // auto-pauses there (same dir the manage_goals tool writes).
         goals_dir: Some(goals_dir),
-        planning_interval: 0,
+        planning_interval: config.planning_interval,
         session_sink: None,
     };
 

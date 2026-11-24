@@ -39,6 +39,7 @@ The default compaction trigger is an estimated 48,000 input-prompt tokens, with 
 [agent]
 max_context_tokens = 48000
 max_context_messages = 0
+planning_interval = 0       # restate the plan every N steps (0 = off)
 ```
 
 Each zero disables that trigger; setting both to zero disables proactive compaction. The estimate includes message framing and tool schemas. Real usage calibrates the current request rather than reusing a previous absolute token count, so new tool outputs and history shrinkage are reflected. Cold estimates allow roughly two tokens per non-ASCII character and one per four ASCII characters; this is a heuristic, not a model tokenizer. The threshold is not a hard request-size limit: pinned instructions, summary overhead, and an indivisible current tool turn can exceed it. Configure it below your model context window to reserve output capacity. Provider context errors still allow one reactive compaction retry.

@@ -146,7 +146,7 @@ error: enclosing `Ok` and `?` operator unneeded   src/plan/mod.rs:288
 |---|---|---|
 | **EDG**：`tools/edg.rs` + agent 接线 + `declare_edg` 注册 + README 章节 → `git revert` 到 `69069b0` 之前；设计存 `docs/design/edg.md` | ~600 | P0 三周未修；收益=省一次模型调用，代价=旁路一切治理；且与 plan/goals 功能重叠 |
 | **plan DSL**：`plan/` + `tools/plan_pool.rs` + CLI 接线 → feature flag 后面冻结 | ~835 | 5 天前刚加、gate 未过（clippy 红、`run_plan` 无调用者）、且是第 4 套计划机制 |
-| **`planning_interval`** → 二选一：补齐 config/CLI 让它真能用，或连同 `parallel_tests.rs:569` 那条测试一起删除 | ~30 | **不是死代码**（循环里生效 + 有测试），但 config/CLI 未暴露，用户无法开启；四套计划机制里它是唯一"有实现却不可达"的 |
+| ~~**`planning_interval`**~~ → **✅ 已补齐 config（2026-11-23）**：`[agent] planning_interval = N`，默认 0（关闭） | +15 | 原本**不是死代码**（循环里生效 + 有测试），但 config/CLI 未暴露 → 用户无法开启。选择"补齐"而非删除：实现与测试都已存在，补一个字段比删代码再改测试便宜，且"长任务定期重述计划"对多工具回合是有用的 |
 
 ### 3.2 砍
 

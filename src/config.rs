@@ -61,6 +61,7 @@ struct AgentFileConfig {
     max_steps: Option<u32>,
     max_context_messages: Option<usize>,
     max_context_tokens: Option<usize>,
+    planning_interval: Option<u32>,
     system_prompt: Option<String>,
 }
 
@@ -104,6 +105,11 @@ pub struct Config {
     pub max_steps: u32,
     pub max_context_messages: usize,
     pub max_context_tokens: usize,
+    /// Ask the model to restate its plan every N agent-loop steps
+    /// (0 = off). Keeps long multi-tool turns on track instead of drifting;
+    /// a checkpoint is injected, then removed on the next step so history
+    /// never accumulates stale ones.
+    pub planning_interval: u32,
     /// MCP servers to connect at startup.
     pub mcp_servers: Vec<McpServerConfig>,
     /// Fallback LLM endpoints (base_url + api_key), tried in order
@@ -176,6 +182,7 @@ impl Config {
             max_steps,
             max_context_messages: file_cfg.agent.max_context_messages.unwrap_or(0),
             max_context_tokens: file_cfg.agent.max_context_tokens.unwrap_or(48_000),
+            planning_interval: file_cfg.agent.planning_interval.unwrap_or(0),
             mcp_servers,
             fallbacks,
         })
@@ -237,14 +244,19 @@ mod context_tests {
         let config = Config::load(path.to_str()).unwrap();
         assert_eq!(config.max_context_messages, 0);
         assert_eq!(config.max_context_tokens, 48_000);
+        assert_eq!(
+            config.planning_interval, 0,
+            "planning checkpoints are opt-in"
+        );
         std::fs::write(
             &path,
-            "[agent]\nmax_context_messages = 80\nmax_context_tokens = 24000\n",
+            "[agent]\nmax_context_messages = 80\nmax_context_tokens = 24000\nplanning_interval = 3\n",
         )
         .unwrap();
         let config = Config::load(path.to_str()).unwrap();
         assert_eq!(config.max_context_messages, 80);
         assert_eq!(config.max_context_tokens, 24_000);
+        assert_eq!(config.planning_interval, 3);
         std::fs::remove_file(path).unwrap();
     }
 }

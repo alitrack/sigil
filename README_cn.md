@@ -37,6 +37,7 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 [agent]
 max_context_tokens = 48000
 max_context_messages = 0
+planning_interval = 0       # 每 N 步重述一次计划（0 = 关闭）
 ```
 
 每个零值关闭对应触发条件；两个都为零则关闭主动压缩。估算包含消息封装和工具定义。真实 usage 用于校准当前请求，而不是复用上一次请求的绝对 token 数；新增工具输出和历史缩短都会重新计入。首轮粗估为非 ASCII 字符约两个 tokens、ASCII 约每四字符一个 token；它是启发式，不是模型 tokenizer。阈值不是请求大小的硬上限：固定系统指令、摘要开销和不能拆开的当前工具回合仍可能超出它。应按实际模型上下文窗口设置更低阈值，为输出预留空间。遇到服务端上下文错误时，仍允许一次被动压缩重试。

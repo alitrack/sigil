@@ -72,7 +72,11 @@ error: enclosing `Ok` and `?` operator unneeded   src/plan/mod.rs:288
 
 **第二病灶：状态没有作用域。** `clone_shallow()` 就是 `self.clone()`（`tools/mod.rs:189`），`hot_queue`、`edg_bank` 是 Arc，随浅克隆共享给 sub-agent（`delegate.rs:488,574`）、MCP server（`mcp/server.rs:31`）、daemon 每连接、cron。谁写一个 Lua 工具，它就出现在别人的工具列表里。
 
-**第三病灶：四套"让模型别跑偏"的机制并存**——goals、`planning_interval`、EDG、plan DSL。其中 `planning_interval` 全仓**没有任何一处设为非零**（只有 `= 0` 和 `config.planning_interval > 0` 的判断），是个死开关；`plan::run_plan` 是死代码。四套里有两套是死的。这比"五套都活着"更能说明问题：**加机制的成本已经低到不需要验证它是否被接上**。
+**第三病灶：四套"让模型别跑偏"的机制并存**——goals、`planning_interval`、EDG、plan DSL。其中 `plan::run_plan` 是死代码（无调用者）；`planning_interval` 则处在一个更微妙的状态：它在 `agent/mod.rs:496` 的循环里**确实生效**，`parallel_tests.rs:569` 还把 `planning_interval: 2` 写进去断言 checkpoint 注入，**但 `config.rs` 与 `cli.rs` 都没有这个字段**——用户无法开启它，只有写 Rust 代码（测试）才能碰到。
+
+> **更正（2026-11-23）**：本报告初版在这里写成"`planning_interval` 全仓无一处非零赋值，是个死开关"，**这是错的**。当时那条 grep 的输出被 `head` 截断，我先入为主下了结论而没有回查。真实情况是"**有实现、有测试、但未暴露给用户**"，与"死代码"是两个不同的问题：死代码可以放心删；这个要么补 config/CLI 让它可用，要么连同测试一起删掉，属于产品决定而非清理。
+
+这条错误的教训与本报告的主旨一致：**证据必须可复核到具体行，尤其是"不存在"这类断言——`grep | head` 会伪造"不存在"**。
 
 ### 2.2 安全 —— 实测不是"三层"，是"一层半"，且那半层是标签
 
@@ -142,7 +146,7 @@ error: enclosing `Ok` and `?` operator unneeded   src/plan/mod.rs:288
 |---|---|---|
 | **EDG**：`tools/edg.rs` + agent 接线 + `declare_edg` 注册 + README 章节 → `git revert` 到 `69069b0` 之前；设计存 `docs/design/edg.md` | ~600 | P0 三周未修；收益=省一次模型调用，代价=旁路一切治理；且与 plan/goals 功能重叠 |
 | **plan DSL**：`plan/` + `tools/plan_pool.rs` + CLI 接线 → feature flag 后面冻结 | ~835 | 5 天前刚加、gate 未过（clippy 红、`run_plan` 无调用者）、且是第 4 套计划机制 |
-| **`planning_interval`** → 删除（或补齐 config/CLI 并写出唯一一套计划机制） | ~30 | 全仓无一处非零赋值：死开关 |
+| **`planning_interval`** → 二选一：补齐 config/CLI 让它真能用，或连同 `parallel_tests.rs:569` 那条测试一起删除 | ~30 | **不是死代码**（循环里生效 + 有测试），但 config/CLI 未暴露，用户无法开启；四套计划机制里它是唯一"有实现却不可达"的 |
 
 ### 3.2 砍
 

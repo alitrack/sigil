@@ -474,6 +474,24 @@ impl ToolRegistry {
     /// loop after each turn so newly created tools are available to the
     /// model on the very next turn.
     pub fn drain_hot(&mut self) {
+        // A frozen run (SIGIL_FREEZE=1) must keep its capability surface
+        // byte-identical: `create_lua_tool` refuses to write, but the hot
+        // queue is a shared `Arc`, so a *concurrent* non-frozen session could
+        // otherwise queue an op that lands in this run's registry. Refuse the
+        // whole drain, and say so when something was actually waiting.
+        if crate::safety::is_frozen() {
+            let pending = self
+                .hot_queue
+                .try_lock()
+                .map(|q| q.len())
+                .unwrap_or_default();
+            if pending > 0 {
+                eprintln!(
+                    "[freeze] {pending} hot-registration op(s) discarded: a frozen run must not change its tool surface"
+                );
+            }
+            return;
+        }
         let lua = Arc::new(Mutex::new(LuaRuntime::new().expect("lua runtime init")));
         // try_lock: we're in an async context; the queue is only touched
         // here and by the (sync) evolution tool, so contention is nil.

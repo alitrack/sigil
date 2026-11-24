@@ -167,6 +167,15 @@ workspace (escalation fails closed without an approval channel), so
   confines model-directed writes to the workspace, the temp dir and sigil's
   state dirs (`SIGIL_WRITE_ROOTS` extends it). Escapes via `..`, absolute
   paths outside the roots and sibling-prefix lookalikes are refused.
+- **Hot registration is process-shared — one known limit**: evolution tools
+  push `HotOp`s into the `hot_queue` they captured at `with_tools()` time, and
+  that `Arc` is inherited by every `clone_shallow()` (sub-agents, MCP server,
+  daemon connections, cron). Whoever drains first consumes the op, so a tool
+  created in one session can become callable in another without a restart.
+  The tools *directory* is global by design, so this only skips the restart —
+  but true per-session scoping needs the evolution tools re-bound to a
+  per-registry queue, which is not done yet. A frozen run now refuses the
+  whole drain (below), which is the case that mattered for benchmarking.
 - **Freeze**: `safety::is_frozen()` (`SIGIL_FREEZE=1`) is the single check
   every write surface calls (remember, memory_delete, create_lua_tool,
   improve_harness, hooks). Add it to any new write tool.

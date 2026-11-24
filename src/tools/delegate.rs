@@ -54,8 +54,6 @@ pub struct DelegateState {
     /// The original task text (kept so a resumed sub-agent can be
     /// rebuilt with the full task context).
     pub task: String,
-    /// Handle id this sub-agent was resumed from, if any (lineage).
-    pub resume_from: Option<String>,
     /// Number of agent steps the sub-agent took, once finished.
     /// (Absent for legacy states written before this field existed.)
     #[serde(default)]
@@ -378,7 +376,6 @@ impl DelegateTool {
         &self,
         task: String,
         name: Option<String>,
-        resume_from: Option<String>,
         subagent_type: Option<&str>,
         model: Option<&str>,
         max_context_messages: Option<usize>,
@@ -436,7 +433,6 @@ impl DelegateTool {
                 result: None,
                 error: None,
                 task: task.clone(),
-                resume_from,
                 steps: None,
                 model: model.map(|m| m.to_string()),
                 tokens: None,
@@ -664,12 +660,10 @@ impl Tool for DelegateTool {
                  'timeout' seconds, default 600), 'status' (id — running/completed/failed \
                  for one sub-agent; with no id, the whole delegation bill in token \
                  usage with a grand total), 'result' \
-                 (id — the sub-agent's final summary once completed), 'resume' \
-                 (id + task — continue a finished/failed sub-agent with a new \
-                 instruction: its original task and final report are fed back \
-                 as context, and a fresh handle is returned), 'list' \
+                 (id — the sub-agent's final summary once completed), 'list' \
                  (all sub-agents), 'delete' (id — remove a finished sub-agent's \
-                 record and free its handle). At most 5 sub-agents \
+                 record and free its handle). To continue a finished sub-agent, \
+                 read its result and spawn a new one with that context. At most 5 sub-agents \
                  may run at once (a spawn or batch beyond the cap is rejected); \
                  sub-agent nesting is capped at depth 1 (a delegated sub-agent \
                  cannot delegate further). Use for parallel \
@@ -706,7 +700,7 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "delete"],
+                    "enum": ["spawn", "delegate", "status", "result", "list", "delete"],
                     "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record"
                 },
                 "task": {
@@ -788,7 +782,6 @@ impl Tool for DelegateTool {
                     .spawn_subagent(
                         task,
                         spawn_name(args)?,
-                        None,
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
                         args.get("max_context_messages")
@@ -880,7 +873,6 @@ impl Tool for DelegateTool {
                         .spawn_subagent(
                             task,
                             name,
-                            None,
                             t.get("subagent_type").and_then(Value::as_str),
                             t.get("model").and_then(Value::as_str),
                             t.get("max_context_messages")
@@ -903,63 +895,6 @@ impl Tool for DelegateTool {
                 )
                 .await?;
                 Ok(ToolOutput { text })
-            }
-            "resume" => {
-                self.check_depth()?;
-                let id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .context("delegate resume requires 'id'")?;
-                let new_task = args
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .context("delegate resume requires a 'task' string")?;
-                let states = self.delegates.snapshot().await;
-                let st = states
-                    .iter()
-                    .find(|s| s.id == id)
-                    .context("no such delegate id (see action=list)")?;
-                if st.status == DelegateStatus::Running {
-                    anyhow::bail!(
-                        "delegate '{id}' is still running; wait for it to finish before resuming"
-                    );
-                }
-                // Rebuild the task with the earlier run's outcome as
-                // context (the OpenHands partial-result pattern: a
-                // non-finished/stopped sub-agent's partial result goes
-                // back to the parent, which can then continue it).
-                let prev = match (&st.result, &st.error) {
-                    (Some(r), _) => {
-                        format!("Previous progress (the earlier run's final report):\n{r}")
-                    }
-                    (None, Some(e)) => format!("The earlier run failed: {e}"),
-                    (None, None) => "The earlier run ended without a recorded result.".to_string(),
-                };
-                let task = format!(
-                    "{}\n\nCONTEXT FROM EARLIER RUN (delegate {}):\n{}\n\nNew instruction: {new_task}",
-                    st.task, st.id, prev
-                );
-                let new_id = self
-                    .spawn_subagent(
-                        task,
-                        Some(st.name.clone()),
-                        Some(st.id.clone()),
-                        args.get("subagent_type").and_then(Value::as_str),
-                        args.get("model").and_then(Value::as_str),
-                        args.get("max_context_messages")
-                            .and_then(Value::as_u64)
-                            .map(|v| v as usize),
-                        args.get("max_context_tokens")
-                            .and_then(Value::as_u64)
-                            .map(|v| v as usize),
-                    )
-                    .await?;
-                Ok(ToolOutput {
-                    text: format!(
-                        "delegate '{new_id}' spawned as a continuation of '{}' (status: running). Poll with action=status, collect with action=result.",
-                        st.id
-                    ),
-                })
             }
             "status" => {
                 // Without an id: the whole delegation bill (every sub-agent's
@@ -1080,14 +1015,10 @@ impl Tool for DelegateTool {
                         })
                         .unwrap_or_default();
                     text.push_str(&format!(
-                        "\n- {} [{}] — {}{}{}{}{}",
+                        "\n- {} [{}] — {}{}{}{}",
                         st.id,
                         st.status.as_str(),
                         st.name,
-                        st.resume_from
-                            .as_deref()
-                            .map(|r| format!(" (resumed from {r})"))
-                            .unwrap_or_default(),
                         steps,
                         model,
                         tokens
@@ -1192,9 +1123,7 @@ mod tests {
         let names: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(
             names,
-            vec![
-                "spawn", "delegate", "status", "result", "resume", "list", "delete"
-            ]
+            vec!["spawn", "delegate", "status", "result", "list", "delete"]
         );
     }
 
@@ -1210,7 +1139,6 @@ mod tests {
             result: None,
             error: None,
             task: "first task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -1249,7 +1177,6 @@ mod tests {
                     result: None,
                     error: None,
                     task: format!("task-{i}"),
-                    resume_from: None,
                     steps: None,
                     model: None,
                     tokens: None,
@@ -1295,7 +1222,6 @@ mod tests {
                 result: Some(format!("answer-{i}")),
                 error: None,
                 task: format!("task-{i}"),
-                resume_from: None,
                 steps: Some(1),
                 model: None,
                 tokens: None,
@@ -1337,7 +1263,6 @@ mod tests {
                 result: Some(format!("answer-{i}")),
                 error: None,
                 task: format!("task-{i}"),
-                resume_from: None,
                 steps: Some(1),
                 model: None,
                 tokens: None,
@@ -1400,7 +1325,6 @@ mod tests {
                 },
                 error: None,
                 task: format!("task-{i}"),
-                resume_from: None,
                 steps: if i == 0 { Some(1) } else { None },
                 model: None,
                 tokens: None,
@@ -1443,7 +1367,6 @@ mod tests {
             result: None,
             error: None,
             task: "some task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -1482,7 +1405,6 @@ mod tests {
             result: None,
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -1519,7 +1441,6 @@ mod tests {
                 "result": "old",
                 "error": null,
                 "task": "task",
-                "resume_from": null
             }))
             .unwrap(),
         )
@@ -1610,25 +1531,6 @@ mod tests {
         let snap = tool.delegates.snapshot().await;
         let st = snap.iter().find(|s| s.id == id).unwrap();
         assert_eq!(st.name, "my sub-agent");
-
-        // Resume keeps the original name on the continuation handle.
-        // The spawned background task hits a dead provider port, so
-        // mark the handle completed before resuming.
-        reg.update(&id, |st| st.status = DelegateStatus::Completed)
-            .await;
-        let resume = tool
-            .run(&json!({"action": "resume", "id": id, "task": "continue"}))
-            .await
-            .unwrap();
-        let new_id = resume
-            .text
-            .split('\'')
-            .nth(1)
-            .expect("resume output carries the new handle id")
-            .to_string();
-        let snap = tool.delegates.snapshot().await;
-        let st = snap.iter().find(|s| s.id == new_id).unwrap();
-        assert_eq!(st.name, "my sub-agent", "name survives resume");
     }
 
     #[tokio::test]
@@ -1643,7 +1545,6 @@ mod tests {
             result: Some("done".into()),
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: Some(7),
             model: Some("model-x".into()),
             tokens: Some(crate::llm::provider::TokenUsage {
@@ -1663,7 +1564,6 @@ mod tests {
             result: None,
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -1742,7 +1642,6 @@ mod tests {
             result: Some("done".into()),
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: Some(2),
             model: None,
             tokens: Some(crate::llm::provider::TokenUsage {
@@ -1762,7 +1661,6 @@ mod tests {
             result: Some("done".into()),
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: Some(3),
             model: None,
             tokens: Some(crate::llm::provider::TokenUsage {
@@ -1783,7 +1681,6 @@ mod tests {
             result: None,
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -1871,7 +1768,6 @@ mod tests {
                 result: None,
                 error: None,
                 task: format!("task-{i}"),
-                resume_from: None,
                 steps: None,
                 model: None,
                 tokens: None,
@@ -2019,14 +1915,6 @@ mod tests {
             format!("{err2}").contains("nesting depth limit (1) reached"),
             "delegate depth message: {err2}"
         );
-        let err3 = deep
-            .run(&json!({"action": "resume", "id": "d00001", "task": "continue"}))
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err3}").contains("nesting depth limit (1) reached"),
-            "resume depth message: {err3}"
-        );
     }
 
     #[tokio::test]
@@ -2087,7 +1975,6 @@ mod tests {
             result: Some("done".into()),
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: Some(3),
             model: Some("model-y".into()),
             tokens: None,
@@ -2166,7 +2053,6 @@ mod tests {
             result: None,
             error: None,
             task: "task".into(),
-            resume_from: None,
             steps: None,
             model: None,
             tokens: None,
@@ -2205,7 +2091,6 @@ mod tests {
                 result: Some("old result".into()),
                 error: None,
                 task: "old task".into(),
-                resume_from: None,
                 steps: None,
                 model: None,
                 tokens: None,
@@ -2223,84 +2108,6 @@ mod tests {
         assert_eq!(next, 43, "next id re-indexed above recovered d00042");
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn resume_rejects_running_and_unknown() {
-        let tool = DelegateTool {
-            provider: Arc::new(
-                crate::llm::openai::OpenAiProvider::with_fallbacks(
-                    crate::llm::openai::OpenAiConfig {
-                        base_url: "http://localhost:1/v1".into(),
-                        api_key: "x".into(),
-                    },
-                    vec![],
-                )
-                .unwrap(),
-            ),
-            registry: ToolRegistry::with_tools(None, None, None, None, None, None),
-            config: AgentConfig {
-                model: "test".into(),
-                max_steps: 3,
-                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
-                    crate::harness::PromptState {
-                        system_prompt: "sys".into(),
-                        skills: vec![],
-                        fingerprint: None,
-                    },
-                )),
-                max_inline_skills: 0,
-                sync_dir: None,
-                max_context_messages: 0,
-                max_context_tokens: 0,
-                goals: None,
-                goals_dir: None,
-                planning_interval: 0,
-                hooks: None,
-                session_sink: None,
-            },
-            delegates: Arc::new(DelegateRegistry::default()),
-            agents: Arc::new(subagent::AgentRegistry::new(None)),
-            description: std::sync::OnceLock::new(),
-            depth: 0,
-            progress: None,
-        };
-
-        // Unknown id → clear error.
-        let err = tool
-            .run(&json!({"action": "resume", "id": "d99999", "task": "continue"}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no such delegate id"), "err: {err}");
-
-        // Running sub-agent → refused (must finish first).
-        let reg = Arc::new(DelegateRegistry::default());
-        reg.insert(DelegateState {
-            id: "d00003".into(),
-            name: "busy".into(),
-            status: DelegateStatus::Running,
-            started_ts: "t0".into(),
-            finished_ts: None,
-            result: None,
-            error: None,
-            task: "task".into(),
-            resume_from: None,
-            steps: None,
-            model: None,
-            tokens: None,
-        })
-        .await;
-        let tool = DelegateTool {
-            delegates: reg,
-            ..tool
-        };
-        let err = tool
-            .run(&json!({"action": "resume", "id": "d00003", "task": "continue"}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("still running"), "err: {err}");
     }
 
     #[tokio::test]

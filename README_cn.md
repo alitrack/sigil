@@ -183,14 +183,13 @@ Qwen3.8-27B）、同一任务、同一套断言。
 >
 > 状态：**Phase 69** — 嵌套深度上限（prime-agent `RLM_MAX_DEPTH`，默认 1）：
 > 每个 `DelegateTool` 实例带 `depth`（0 = 顶层）；子代理的工具注册表拿到的是
-> depth+1 副本（替换共享父实例），因此被委托的子代理的 spawn/delegate/resume
+> depth+1 副本（替换共享父实例），因此被委托的子代理的 spawn/delegate
 > 被拒（「nesting depth limit (1) reached」）。E2E：子代理两次尝试委托均被拒，
 > 并通过 `delegate list` 核验无子子代理产生。
 >
 > 状态：**Phase 68** — per-agent condenser（OpenHands `definition.condenser`）：
 > `spawn` 与 `delegate` 批量的每个 task 接受 `max_context_messages` /
-> `max_context_tokens` 覆盖——该子代理的上下文预算替换父代理全局设置（resume
-> 也携带）。E2E：以 `max_context_messages: 4` / `max_context_tokens: 3000`
+> `max_context_tokens` 覆盖——该子代理的上下文预算替换父代理全局设置。E2E：以 `max_context_messages: 4` / `max_context_tokens: 3000`
 > 派发的子代理在紧预算下正常完成。
 >
 > 状态：**Phase 67** — max_children 上限（OpenHands=5）：同时最多 5 个子代理

@@ -205,7 +205,7 @@ versioned rollback, refinement gate, revertible effects — already exist).
 > `RLM_MAX_DEPTH`, default 1): each `DelegateTool` instance carries a
 > `depth` (0 = top level); a sub-agent's tool registry gets a depth+1
 > copy in place of the shared parent instance, so a delegated
-> sub-agent's spawn/delegate/resume are refused ("nesting depth limit
+> sub-agent's spawn/delegate are refused ("nesting depth limit
 > (1) reached"). E2E: the sub-agent tried to delegate twice, got
 > rejected both times, and verified via `delegate list` that no
 > grandchild was created.
@@ -214,7 +214,7 @@ versioned rollback, refinement gate, revertible effects — already exist).
 > `definition.condenser`): `spawn` and each `delegate` batch task
 > accept `max_context_messages` / `max_context_tokens` overrides that
 > replace the parent's global context budget for that sub-agent
-> (resume carries them too). E2E: a sub-agent spawned with
+> E2E: a sub-agent spawned with
 > `max_context_messages: 4` / `max_context_tokens: 3000` completed
 > normally under the tight budget.
 >
@@ -590,10 +590,10 @@ Four mechanisms borrowed from the research round landed:
   nest arbitrarily deep.
 - Now each `DelegateTool` carries a `depth` (0 = top level). A
   sub-agent's registry gets a `depth + 1` copy (`with_depth`) in
-  place of the shared instance; spawn/delegate/resume refuse once
+  place of the shared instance; spawn/delegate refuse once
   `depth >= MAX_SUBAGENT_DEPTH` (`check_depth`, "nesting depth limit
-  (1) reached"). Read-only actions (status/result/list/metrics/
-  delete/send) stay available at any depth.
+  (1) reached"). Read-only actions (status/result/list/delete) stay
+  available at any depth.
 - Tests 173 → 174 (depth-0 spawn passes; depth-1 spawn/delegate/
   resume all refused). E2E: a sub-agent tried to delegate twice, got
   rejected both times, and verified via `delegate list` that no

@@ -12,16 +12,21 @@
 //!   daemon → client: {"type":"delta","text":"..."}  (streamed)
 //!                    {"type":"done","text":"..."}   (final answer)
 //!                    {"type":"error","text":"..."}
+//!                    {"type":"approval","id":N,"name":"…","args":"…"}
+//!   client → daemon: {"type":"approval_reply","id":N,"allow":true}
 
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{AgentConfig, run_messages};
 use crate::llm::provider::{ChatMessage, LlmProvider};
@@ -309,7 +314,7 @@ async fn handle_connection(
     sessions_dir: &Path,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let lines = BufReader::new(reader).lines();
 
     // Stream deltas to the socket via a channel (the agent loop's
     // stream callback is synchronous; a writer task drains it). Must
@@ -328,9 +333,43 @@ async fn handle_connection(
         }
     });
 
-    while let Some(line) = lines.next_line().await? {
-        let v: Value =
-            serde_json::from_str(&line).unwrap_or(json!({"type": "error", "text": "bad json"}));
+    // Pending approvals for this connection. The turn runs inline in the loop
+    // below, so it cannot read frames while it waits for an answer — a separate
+    // reader task resolves these instead. This avoids moving the `ToolRegistry`
+    // out of the loop (which would force it behind a lock and risk holding that
+    // lock across an await).
+    let pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<bool>>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let next_approval_id = Arc::new(AtomicU64::new(1));
+
+    // Frames for the main loop. `approval_reply` never reaches it: the reader
+    // task resolves the waiting oneshot directly.
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Value>();
+    let reader_pending = pending.clone();
+    let reader_task = {
+        let mut lines = lines;
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let v: Value = serde_json::from_str(&line)
+                    .unwrap_or(json!({"type": "error", "text": "bad json"}));
+                if v["type"].as_str() == Some("approval_reply") {
+                    let Some(id) = v["id"].as_u64() else { continue };
+                    let allow = v["allow"].as_bool().unwrap_or(false);
+                    let waiter = reader_pending.lock().unwrap().remove(&id);
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(allow);
+                    }
+                    continue;
+                }
+                if frame_tx.send(v).is_err() {
+                    break;
+                }
+            }
+        })
+    };
+
+    let mut frames = frame_rx;
+    while let Some(v) = frames.recv().await {
         match v["type"].as_str() {
             Some("quit") => break,
             Some("session") => {
@@ -437,12 +476,53 @@ async fn handle_connection(
                         let _ = tx2.send(format!("{}\n", json!({"type": "delta", "text": d})));
                     }
                 };
+                // Approval channel: ask THIS client over the socket and wait.
+                // Fails closed — no reply within the timeout means deny, the
+                // same outcome a non-interactive client got before.
+                let approver_pending = pending.clone();
+                let approver_ids = next_approval_id.clone();
+                let approver_tx = tx.clone();
+                let approver = move |name: String,
+                                     args: Value|
+                      -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = bool> + Send>,
+                > {
+                    let pending = approver_pending.clone();
+                    let ids = approver_ids.clone();
+                    let tx = approver_tx.clone();
+                    Box::pin(async move {
+                        const APPROVAL_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_secs(300);
+                        let id = ids.fetch_add(1, Ordering::SeqCst);
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        pending.lock().unwrap().insert(id, reply_tx);
+                        let _ = tx.send(format!(
+                            "{}\n",
+                            json!({
+                                "type": "approval",
+                                "id": id,
+                                "name": name,
+                                "args": args.to_string(),
+                            })
+                        ));
+                        match tokio::time::timeout(APPROVAL_TIMEOUT, reply_rx).await {
+                            Ok(Ok(allow)) => allow,
+                            _ => {
+                                pending.lock().unwrap().remove(&id);
+                                eprintln!(
+                                    "  [daemon] approval timeout/closed for {name} — denying"
+                                );
+                                false
+                            }
+                        }
+                    })
+                };
                 let result = run_messages(
                     provider.as_ref(),
                     &mut tools,
                     &turn_config,
                     &run_msgs,
-                    None,
+                    Some(&approver),
                     Some(&stream_cb),
                 )
                 .await;
@@ -646,6 +726,7 @@ async fn handle_connection(
     }
 
     drop(tx);
+    reader_task.abort();
     let _ = writer_task.await;
     Ok(())
 }

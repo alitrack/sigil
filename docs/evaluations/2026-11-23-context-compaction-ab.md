@@ -84,3 +84,25 @@ context window. Fix the economics instead:
    without this measurement.
 
 Raw session data was produced in `/tmp/ctx-ab` and is not committed.
+
+## 修复尝试失败记录（2026-11-23，已回滚）
+
+第一次尝试：在 `PromptBudget::compact` 里加"压缩收益低于 25% 就不压"的门禁，并给收尾调用加 `compact_forced()`。结果 4 个测试变红，回滚。
+
+失败原因（已用临时日志确认，不是猜的）：
+
+| 测试 | 配置轴 | 日志 | 结论 |
+|---|---|---|---|
+| `request_budget_includes_tool_schemas…` | token=1000 | transcript=292, limit=128, tools=872, cand=277（只省 15 个 token） | 872 token 的 schema 已占掉预算，压不进去；测试只断言"消息数变少"（42→20），而 token 几乎没动、请求仍 1149>1000。**这条断言恰好固化了本报告要修的缺陷** |
+| `reactive_compaction_retries…` | 消息数轴 | transcript=115, limit=0, cand=111（省 4） | 门禁挡掉了主动压缩，反应式那条只能把 21 条砍到 10 条，达不到 `<8` |
+| `next_turn_request_retains…` | `max_context_messages=6` | transcript=206, limit=0 | 纯消息数配置。这里"消息数变少"本身就是目的，token 收益门禁不该适用 |
+| `appended_tool_output…` | token=1000 | transcript=3550, limit=969, cand=3508（省 42） | 当前轮 10k 字符的工具输出不可切分，压不进去；但测试要求"当前工具输出必须触发一次压缩" |
+
+结论：**一个纯"按 token 收益"的门禁无法同时满足这四条契约**，因为其中两条本身要求的正是"压不进去也要压"。
+
+**下次正确的做法**（按这个顺序做，不要再试百分比门禁）：
+
+1. 门禁只作用在 token 轴：`max_msgs > 0` 时完全不适用（消息数就是契约）。
+2. token 轴改用**深压摊薄**：一次砍到预算的一半，而不是只蹭到阈值边缘。这样同一次重写买来多步余量，避免每步重复重写前缀（本次实测的病因就是每步重写）。
+3. `request_budget_includes…` 那条断言要改写成 token 级契约（要么压到预算内，要么历史不动），并在提交信息里说明它原本钉住的是缺陷行为。
+4. 改完必须重跑本报告的 12k 对照组，用同一任务对比 205,009 这个基线；如果深压没有改善，就承认这个修复不成立，只保留"默认 48k 别调低"这条结论。

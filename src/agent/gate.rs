@@ -84,13 +84,14 @@ impl<'a> ToolGate<'a> {
     pub async fn gate(&self, call: &ToolCall) -> Result<GateVerdict> {
         let gate = safety::check(&call.name, &call.arguments);
         let mut allowed = matches!(gate, safety::GateDecision::Allow);
-        if !allowed
-            && let Some(approve) = self.approver
-            && approve(&call.name, &call.arguments)
-        {
-            allowed = true;
-            eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
-            self.emit_approval(call, "approved", None);
+        if !allowed && let Some(approve) = self.approver {
+            // Await the channel: a terminal prompt answers immediately, a
+            // socket / ACP round-trip answers when the host replies.
+            if approve(call.name.clone(), call.arguments.clone()).await {
+                allowed = true;
+                eprintln!("⚠ approved by user: {} {}", call.name, call.arguments);
+                self.emit_approval(call, "approved", None);
+            }
         }
         if !allowed {
             let decision = if self.approver.is_some() {

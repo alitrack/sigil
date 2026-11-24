@@ -15,30 +15,40 @@ pub fn should_enter_repl(sub_prompt: &Option<String>) -> bool {
     sub_prompt.is_none() && std::io::stdin().is_terminal()
 }
 
-/// Interactive approver: print the rejected call, ask y/N.
-fn interactive_approver() -> Box<Approver> {
-    Box::new(|name: &str, args: &serde_json::Value| {
-        let warn = crate::ui::YELLOW.paint(
-            &format!(
-                "\n⚠ sigil wants to run a command the gate flags as destructive:\n  {name} {args}\n"
-            ),
-            &std::io::stderr(),
-        );
-        eprintln!("{warn}");
-        loop {
-            let prompt = crate::ui::GREEN.paint("  Allow it? [y/N] ", &std::io::stderr());
-            eprint!("{prompt}");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            if std::io::stdin().lock().read_line(&mut line).is_err() {
-                return false;
-            }
-            match line.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" => return true,
-                "" | "n" | "no" => return false,
-                _ => continue,
-            }
+/// Ask the human at the terminal: print the rejected call, y/N.
+///
+/// Blocking on purpose — the REPL owns the terminal and nothing else can
+/// progress while a person decides.
+fn ask_terminal(name: &str, args: &serde_json::Value) -> bool {
+    let warn = crate::ui::YELLOW.paint(
+        &format!(
+            "\n⚠ sigil wants to run a command the gate flags as destructive:\n  {name} {args}\n"
+        ),
+        &std::io::stderr(),
+    );
+    eprintln!("{warn}");
+    loop {
+        let prompt = crate::ui::GREEN.paint("  Allow it? [y/N] ", &std::io::stderr());
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_err() {
+            return false;
         }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "" | "n" | "no" => return false,
+            _ => continue,
+        }
+    }
+}
+
+/// Terminal approval channel: resolves as soon as the human answers. A daemon
+/// or ACP channel would instead resolve when its host replies over the socket
+/// or protocol — that is why [`Approver`] returns a future.
+fn interactive_approver() -> Box<Approver> {
+    Box::new(|name: String, args: serde_json::Value| {
+        Box::pin(async move { ask_terminal(&name, &args) })
     })
 }
 

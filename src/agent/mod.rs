@@ -194,7 +194,18 @@ fn inject_goals_block(messages: &mut Vec<ChatMessage>, block: &str) {
 /// Approval callback: given a tool call that the gate rejected in
 /// non-interactive mode, decide whether the human allows it anyway.
 /// Returns true to run it (interactive override).
-pub type Approver = dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync;
+/// Approval channel: ask a human, or a host protocol, whether a call the
+/// safety gate rejected may still run.
+///
+/// Async on purpose. A synchronous callback can only re-prompt a terminal, which
+/// is why only the REPL ever had an approver: the daemon would have to block its
+/// executor on a socket round-trip, and an ACP client would have to answer a
+/// request/response frame. Returning a future lets a channel await the answer
+/// without blocking the runtime. Arguments are owned so the future can outlive
+/// the caller's borrow.
+pub type Approver = dyn Fn(String, serde_json::Value) -> futures_util::future::BoxFuture<'static, bool>
+    + Send
+    + Sync;
 
 /// The shape of a mid-turn question (mirrors the NPP DecisionCanvas
 /// structured question contract: pick_one / pick_many / confirm /

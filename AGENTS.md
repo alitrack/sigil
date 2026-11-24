@@ -155,6 +155,13 @@ workspace (escalation fails closed without an approval channel), so
 - **Approval gate**: non-interactive mode rejects destructive commands by
   default; interactive mode (REPL) asks the human via `Approver`. Sub-agents
   and ACP/MCP paths run non-interactive (gate rejection stands).
+  `Approver` returns a **future** on purpose — a synchronous callback can only
+  re-prompt a terminal, which is why only the REPL ever had one. Wiring the
+  remaining channels is not done yet, and each needs its own plumbing:
+  the daemon's connection loop currently awaits the whole turn inline, so it
+  reads no client frames until the turn ends and an approval reply could not
+  arrive (it needs the turn in a spawned task plus a pending-approval map); an
+  ACP channel needs a `session/request_permission` round-trip.
   Known limit: `safety::check` only pattern-matches `bash`; every other tool
   is `Allow`. The write-scope and freeze rules below are what bound them.
 - **One execution path**: every tool call goes through `agent::ToolGate`

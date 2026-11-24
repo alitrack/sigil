@@ -81,7 +81,6 @@ src/
 │   ├── server.rs    # MCP server mode (sigil mcp): expose registry to clients
 ├── acp/
 │   ├── mod.rs       # ACP server mode (sigil acp): handle_message + serve
-│   ├── client.rs    # ACP client: spawn external ACP server, prompt, collect reply
 │   └── client_tests.rs  # client against test-tools/fake_acp_server.py
 └── tools/
     ├── mod.rs       # Tool trait + ToolRegistry (unified lookup, hot registration)
@@ -92,7 +91,6 @@ src/
     ├── evolve.rs    # create_lua_tool + improve_harness (AHE: tools + instruction layer)
     ├── memory.rs    # remember / recall tools
     ├── mcp.rs       # MCP-backed tools (mcp_<server>_<tool>)
-    ├── acp.rs       # acp_call: cross-process delegation to an external ACP server
     └── delegate.rs  # delegate: sub-agent with own tool loop
 ```
 

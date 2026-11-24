@@ -13,7 +13,6 @@ use crate::harness;
 use crate::llm::ToolSpec;
 use crate::lua::LuaRuntime;
 
-pub mod acp;
 pub mod ask;
 pub mod bash;
 pub mod delegate;
@@ -265,10 +264,6 @@ impl ToolRegistry {
                 harness_dir: harness_dir.clone(),
                 tools_dir: tools_dir.clone(),
                 hooks_dir: hooks_dir.clone(),
-            }));
-            registry.register(Arc::new(acp::AcpCallTool {
-                command: "sigil".to_string(),
-                args: vec!["acp".to_string()],
             }));
         }
     }

@@ -396,9 +396,6 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   (Claude Desktop, Cursor, other agents) over stdio.
 - **ACP server** — `sigil acp` speaks Agent Client Protocol (JSON-RPC
   over stdio); any ACP host (editors, other agents) can drive sigil.
-- **ACP client** — the `acp_call` tool spawns an external ACP server
-  (another sigil, codex, an editor agent) and delegates a task to it —
-  cross-process delegation, protocol-both-ways.
 - **Interactive REPL** — multi-turn conversation with human approval for
   destructive commands.
 - **True multi-turn context** — the REPL keeps the real message list across
@@ -479,7 +476,7 @@ MCP tool list.
 | **9** ✅ | True multi-turn context, rustyline line editing + history |
 | **10** ✅ | `improve_harness` — instruction-layer self-evolution |
 | **11** ✅ | In-REPL session switching (`/sessions`, `/session <id>`) |
-| **12** ✅ | ACP client + `acp_call` — cross-process delegation |
+| **12** ✅ | ACP client + `acp_call` — **removed 2026-11-23**: it duplicated `delegate` and made sigil into an agent that drives other agents, an extra un-auditable trust path |
 | **13** ✅ | Skill content inlining (small skills embedded in the prompt) |
 | **14** ✅ | TUI colors + `/tools <query>` search |
 | **15** ✅ | `sigil doctor` environment self-check |

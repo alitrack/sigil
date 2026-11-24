@@ -11,14 +11,6 @@
 //! The protocol logic lives in [`handle_message`], which is pure (no
 //! I/O) and unit-testable; [`serve`] is a thin stdio loop around it.
 
-//! ACP (Agent Client Protocol) — server mode (`sigil acp`) plus a
-//! client for driving external ACP servers (`acp_call` tool).
-
-pub mod client;
-
-#[cfg(test)]
-mod client_tests;
-
 use std::sync::Arc;
 
 use anyhow::Result;

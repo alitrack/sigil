@@ -340,8 +340,6 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   （Claude Desktop、Cursor、其他 agent）。
 - **ACP server** — `sigil acp` 说 Agent Client Protocol（stdio 上的
   JSON-RPC），任意 ACP 宿主（编辑器、其他 agent）都能驱动 sigil。
-- **ACP client** — `acp_call` 工具 spawn 外部 ACP server（另一个
-  sigil、codex、编辑器 agent）并派发任务——跨进程委托，协议双向。
 - **交互式 REPL** — 多轮对话 + 破坏性命令人工审批。
 - **真正多轮上下文** — REPL 跨轮维护真实消息列表，包括工具调用、结果和
   压缩摘要；`--resume` 从持久化对话事件恢复上下文（模型记得对话，
@@ -417,7 +415,7 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **9** ✅ | 真正多轮上下文、rustyline 行编辑 + 历史 |
 | **10** ✅ | `improve_harness` — 指令层自进化 |
 | **11** ✅ | REPL 内会话切换（`/sessions`、`/session <id>`） |
-| **12** ✅ | ACP client + `acp_call` — 跨进程委托 |
+| **12** ✅ | ACP client + `acp_call` — **2026-11-23 移除**：与 `delegate` 功能重复，且让 sigil 变成"驱动其他 agent 的 agent"，多出一条无法审计的信任路径 |
 | **13** ✅ | 技能内容内联（小技能直接嵌入 prompt） |
 | **14** ✅ | TUI 彩色输出 + `/tools <查询>` 搜索 |
 | **15** ✅ | `sigil doctor` 环境自检 |

@@ -295,3 +295,39 @@ README 砍到 ~200 行 + 独立 `CHANGELOG.md`；AGENTS.md 删除具体测试数
 **验证抓到的真问题（这正是"必须有可执行反馈回路"的价值）**：首轮用例 2/3 同时失败——macOS 上 `/tmp` 是 `/private/tmp` 的软链，而 `std::env::temp_dir()` 返回 `$TMPDIR=/var/folders/...`，两者不相等，于是**往 `/tmp` 写也被拒**。规范化把 `/tmp` 解析成 `/private/tmp`，与 `temp_dir()` 永远对不上。修复：Unix 下把 `/tmp` 显式加入可写根。这个 bug 在纸面评审里看不出来，只有跑一次才会现形。
 
 **仍未验证的部分（如实标注）**：`read_file` 与 Lua `host.read_file` 仍可读任意绝对路径——本轮没有收紧（大量正常任务需要读 `/usr/include`、`/etc/os-release` 之类），但它意味着"读→外传"这条链仍然通畅。要真正闭环，需要一次独立的设计决定（读白名单 + `host.env` 键白名单），不建议顺手做。
+
+---
+
+## 7. delegate 削减核查（2026-11-23，实测，未动刀）
+
+§3.2 说"delegate 砍到 1/3"。核查后发现**逐特性砍是错的切入点**，记录实测数据以免下一轮重复摸索。
+
+### 6 条特性都有真实接线，没有一条是死代码
+
+| 特性 | `delegate.rs` 内引用 | 外部接线 / 用户可见面 | 测试 |
+|---|---:|---|---|
+| 父子消息（`child_message` / `check_parent_messages`） | 56 | `delegate send` 动作 + 持久化的 `messages`/`inbox` 字段 + `transfer_inbox`（resume 搬移） | 4 条（含 bounded / persisted / status / transfer） |
+| resume | 56 | `--delegates-dir` CLI，跨进程恢复 | 多条 |
+| registry 持久化 | 32 | 同上 | 多条 |
+| condenser / context_budget | 10 | 子代理配置 | — |
+| metrics | 9 | `delegate metrics` 动作 ≈ **30 行** | 1 条 |
+| typing（AgentDefinition） | 3 | `subagent.rs` 274 行 + `agent` 参数 | — |
+
+全文 24 个测试覆盖这些。
+
+### 结论：真正的复杂度不是"某个特性多余"，是动作面
+
+`delegate` 是**一个工具挂 9 个动作**：`spawn | delegate | status | result | resume | list | metrics | delete | send`（`delegate.rs:918`）。这带来两个后果：
+
+1. 一个巨型 action 分支（`delegate.rs` 单文件 2928 行，全仓最大），任何单特性的增删都要穿过这个交换机、持久化结构、以及 CLI。
+2. 每个动作都要和"持久化 + 恢复 + 消息总线"三件事对齐，这才是行数的来源。
+
+**因此下一轮该做的不是删特性，而是削动作面**，按这个顺序：
+
+1. **把消息总线整体去掉**（`child_message` / `check_parent_messages` / `delegate send` / `messages` / `inbox` / `transfer_inbox` / `MAX_MESSAGES`）。它是最自洽的一块：去掉后子代理仍有 `delegate result` 这条唯一回传通道，语义不丢。预计 −200 行、−4 测试。
+2. **拆工具**：`delegate`（spawn / delegate / result）与 `delegate_admin`（list / status / delete）分开，各自小交换机；`metrics` 并进 `status` 输出（它本来就只是 usage 的一个视图，单独一个动作不划算）。
+3. `resume` + registry 持久化**最后动**：它是已发布的 CLI 契约（`--delegates-dir`），要单独一轮并配 ratchet 验证。
+
+### 本轮为什么没动手
+
+刚完成三处结构改动（`ToolGate` 单点化、hot 队列重绑、审批通道改异步），验证预算已经用掉；再叠一个 200 行 + 4 测试的删除，出问题难归因。**宁可留一张准确的清单，也不留半个手术。**

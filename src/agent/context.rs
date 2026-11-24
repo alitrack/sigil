@@ -4,6 +4,14 @@ use crate::llm::provider::{ChatMessage, Role, ToolSpec};
 
 const SUMMARY_CHARS: usize = 16_000;
 
+/// A proactive compaction must land the request under this share of the token
+/// budget (%) to be worth invalidating the provider's prefix cache.
+const COMPACT_TARGET_SHARE: usize = 70;
+
+/// …or the transcript must be this many times over the budget, in which case
+/// folding the old history is damage control for an unfittable request.
+const FAR_OVER: usize = 2;
+
 /// Fold the oldest turns of a transcript into one compact summary
 /// message so long sessions don't grow the context without bound.
 ///
@@ -90,12 +98,56 @@ impl PromptBudget {
         (tokens as f64 * self.scale).ceil() as usize
     }
 
+    /// Proactive compaction.
+    ///
+    /// Compacting rewrites the prompt prefix from the summary onward, and a
+    /// provider cache pays for exactly that prefix — so a rewrite has to earn
+    /// its cost. Measured on a tool-using loop
+    /// (`docs/evaluations/2026-11-23-context-compaction-ab.md`): shaving the
+    /// transcript to the threshold re-fired every step, dropped the cache-hit
+    /// rate from 85.7% to 83.1% and raised total prompt tokens 9.8% at
+    /// identical quality.
+    ///
+    /// Two rules come out of that, both only meaningful on the token axis —
+    /// when the budget is expressed in messages, the message count *is* the
+    /// contract and any reduction is progress:
+    ///
+    /// * **Cut deep, once.** Target half the transcript budget rather than
+    ///   shaving to the edge, so one rewrite buys many steps of headroom
+    ///   instead of firing again on the next step.
+    /// * **Skip marginal rewrites.** A rewrite is taken when it lands the
+    ///   request under [`COMPACT_TARGET_SHARE`] of the budget, or when the
+    ///   transcript is at least [`FAR_OVER`] times the budget and folding the
+    ///   old history is damage control for a request that cannot fit anyway.
     pub(super) fn compact(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
         max_msgs: usize,
         max_prompt_tokens: usize,
+    ) -> Vec<ChatMessage> {
+        self.compact_with(messages, tools, max_msgs, max_prompt_tokens, false)
+    }
+
+    /// Must-fit variant for the tool-less draft / wrap-up calls: those exist to
+    /// fit one last request, so the value rules above do not apply.
+    pub(super) fn compact_forced(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        max_msgs: usize,
+        max_prompt_tokens: usize,
+    ) -> Vec<ChatMessage> {
+        self.compact_with(messages, tools, max_msgs, max_prompt_tokens, true)
+    }
+
+    fn compact_with(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        max_msgs: usize,
+        max_prompt_tokens: usize,
+        forced: bool,
     ) -> Vec<ChatMessage> {
         let tool_tokens = self.scaled(Self::tools_tokens(tools));
         let transcript_limit = if max_prompt_tokens == 0 {
@@ -104,19 +156,44 @@ impl PromptBudget {
             max_prompt_tokens.saturating_sub(tool_tokens).max(1)
         };
         let transcript_tokens = self.scaled(messages.iter().map(estimate_message_tokens).sum());
-        let candidate = compact_messages_with_budget(
-            messages,
-            max_msgs,
-            transcript_limit,
-            Some(transcript_tokens),
-        );
-        if max_msgs == 0
-            && candidate.iter().map(estimate_message_tokens).sum::<usize>()
-                >= messages.iter().map(estimate_message_tokens).sum::<usize>()
-        {
-            messages.to_vec()
+        let attempt = |limit: usize| -> (Vec<ChatMessage>, usize) {
+            let candidate =
+                compact_messages_with_budget(messages, max_msgs, limit, Some(transcript_tokens));
+            let tokens = self.scaled(candidate.iter().map(estimate_message_tokens).sum());
+            (candidate, tokens)
+        };
+        // Message-count axis (or a must-fit call): nothing to trade off.
+        let ungated = forced || max_prompt_tokens == 0;
+        let limit = if ungated {
+            transcript_limit
         } else {
+            // Deep cut: aim at half the budget.
+            (transcript_limit / 2).max(1)
+        };
+        let (candidate, candidate_tokens) = attempt(limit);
+        if ungated {
+            // Message-count axis (or a must-fit call): the message count is the
+            // contract, so a smaller transcript wins even when the summary
+            // costs a few more tokens than the lines it replaced.
+            return if candidate_tokens < transcript_tokens || candidate.len() < messages.len() {
+                candidate
+            } else {
+                messages.to_vec()
+            };
+        }
+        if candidate_tokens >= transcript_tokens {
+            return messages.to_vec();
+        }
+        // Land comfortably under the budget → the rewrite pays for itself.
+        let landed =
+            candidate_tokens + tool_tokens <= max_prompt_tokens * COMPACT_TARGET_SHARE / 100;
+        // Far over → the request cannot fit anyway; folding old history is
+        // damage control rather than an optimisation.
+        let far_over = transcript_tokens >= transcript_limit.saturating_mul(FAR_OVER);
+        if landed || far_over {
             candidate
+        } else {
+            messages.to_vec()
         }
     }
 }
@@ -598,6 +675,75 @@ mod estimate_tests {
             serde_json::to_value(result).unwrap(),
             serde_json::to_value(history).unwrap(),
             "an expanding summary cannot solve overflow and would invalidate the prefix"
+        );
+    }
+
+    /// A history that fits the budget must never be rewritten: every rewrite
+    /// invalidates the provider's prefix cache for nothing.
+    #[test]
+    fn a_history_within_budget_is_not_rewritten() {
+        let mut history = vec![ChatMessage::system("base")];
+        for i in 0..5 {
+            history.push(ChatMessage::user(format!("q{i}")));
+            history.push(ChatMessage::assistant("a"));
+        }
+        let out = PromptBudget::default().compact(&history, &[], 0, 100_000);
+        assert_eq!(
+            serde_json::to_value(&out).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+    }
+
+    /// Marginally-over budget with a trimmable tail: the old policy shaved to
+    /// the threshold and re-fired on the next step (measured: +9.8% tokens,
+    /// cache hits 85.7% → 83.1%). Now it cuts deep so the next rewrite is far
+    /// away — the retained transcript must land well under the budget, not on
+    /// its edge.
+    #[test]
+    fn over_budget_compaction_cuts_deep_instead_of_shaving() {
+        // Realistic shape: few messages, large tool results. (Many *small*
+        // messages cannot be compressed much at all — the per-message excerpt
+        // cap makes the summary roughly as large as the content it replaces,
+        // which is why the old policy shaved and re-fired forever.)
+        let mut history = vec![ChatMessage::system("base")];
+        for i in 0..20 {
+            history.push(ChatMessage::user(format!("turn {i}")));
+            history.push(ChatMessage::assistant("ran a tool"));
+            history.push(ChatMessage::tool_result(
+                format!("big output {i} {}", "x".repeat(4_000)),
+                "call-1".to_string(),
+            ));
+        }
+        let before = history.iter().map(estimate_message_tokens).sum::<usize>();
+        let budget = before / 2;
+        let out = PromptBudget::default().compact(&history, &[], 0, budget);
+        assert!(out.len() < history.len(), "a rewrite must happen");
+        let after = out.iter().map(estimate_message_tokens).sum::<usize>();
+        assert!(
+            after < budget,
+            "one deep cut must put the request back inside the budget:              after={after} budget={budget}"
+        );
+        assert!(
+            before - after >= before / 2,
+            "one deep cut must remove at least half, so the next rewrite is far              away: before={before} after={after}"
+        );
+    }
+
+    /// When the transcript is far over budget and cannot be folded under it,
+    /// folding the old history is still damage control — do not refuse.
+    #[test]
+    fn far_over_budget_still_compacts() {
+        let mut history = vec![ChatMessage::system("base")];
+        for _ in 0..40 {
+            history.push(ChatMessage::user("u"));
+            history.push(ChatMessage::assistant("a"));
+        }
+        let before = history.iter().map(estimate_message_tokens).sum::<usize>();
+        // A budget so tight that no compaction can reach it.
+        let out = PromptBudget::default().compact(&history, &[], 0, before / 8);
+        assert!(
+            out.len() < history.len(),
+            "damage control must still fold old history"
         );
     }
 

@@ -1062,7 +1062,9 @@ async fn tool_less_call(
 ) -> Result<(String, Option<TokenUsage>)> {
     let mut msgs = messages.to_vec();
     msgs.push(ChatMessage::system(instruction));
-    let msgs = prompt_budget.compact(
+    // Must-fit: this call exists to squeeze one last request in, so the
+    // cache-vs-savings rules that gate proactive compaction do not apply.
+    let msgs = prompt_budget.compact_forced(
         &msgs,
         &[],
         config.max_context_messages,

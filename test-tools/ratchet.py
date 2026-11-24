@@ -18,11 +18,22 @@ import sys
 import tempfile
 import time
 
-EXE = "/mnt/d/wsl2/sigil/target/release/sigil"
+if sys.version_info < (3, 10):
+    sys.exit(
+        "ratchet.py needs Python >= 3.10 (PEP 604 unions in annotations).\n"
+        f"Running: {sys.version.split()[0]} at {sys.executable}\n"
+        "On macOS: /opt/homebrew/bin/python3.13 test-tools/ratchet.py"
+    )
+
+# Override with SIGIL_EXE when the binary is not at the default build path
+# (the default is this repo's Windows/WSL build directory).
+EXE = os.environ.get("SIGIL_EXE", "/mnt/d/wsl2/sigil/target/release/sigil")
 HARNESS = "/tmp/sigil-harness-test"
 TIMEOUT = 180
 WORK = "/tmp/sigil-ratchet-work"
 TOOLS = "/tmp/sigil-ratchet-tools"
+# ACP session working directory: the checkout the ACP client claims to be in.
+ACP_CWD = os.environ.get("SIGIL_ACP_CWD", os.getcwd())
 
 
 def run(prompt: str, harness: str = HARNESS, extra: list | None = None) -> str:
@@ -97,7 +108,7 @@ def run_acp(prompt: str, harness: str = HARNESS) -> str:
                          "clientInfo": {"name": "ratchet"}}})
         recv()
         send({"jsonrpc": "2.0", "id": 2, "method": "agent/session/new",
-              "params": {"cwd": "/mnt/d/wsl2/sigil", "mcpServers": []}})
+              "params": {"cwd": ACP_CWD, "mcpServers": []}})
         sess = recv()
         session_id = sess["result"]["sessionId"]
         send({"jsonrpc": "2.0", "id": 3, "method": "agent/session.prompt",

@@ -64,16 +64,6 @@ pub struct DelegateState {
     /// (rlm.find_models-style per-sub-task model pick).
     #[serde(default)]
     pub model: Option<String>,
-    /// Messages the sub-agent sent to its parent via `child_message`
-    /// while running (rlm `agent_message.send` semantics); the parent
-    /// reads them with `delegate status`. Bounded to the most recent
-    /// [`MAX_MESSAGES`].
-    #[serde(default)]
-    pub messages: Vec<String>,
-    /// Parent→sub-agent queued messages (`delegate send`); consumed by
-    /// the sub-agent's `check_parent_messages` tool.
-    #[serde(default)]
-    pub inbox: Vec<String>,
     /// Cumulative token usage reported by the provider for the run
     /// (None when the provider does not report usage).
     #[serde(default)]
@@ -249,182 +239,6 @@ impl DelegateRegistry {
         }
         Ok(())
     }
-
-    /// Append a message the sub-agent sent to its parent (via the
-    /// `child_message` tool). Bounded to the most recent
-    /// [`MAX_MESSAGES`]; unknown ids are ignored (e.g. the
-    /// record was deleted mid-run).
-    async fn push_message(&self, id: &str, msg: &str) {
-        self.update(id, |st| {
-            st.messages.push(msg.to_string());
-            if st.messages.len() > MAX_MESSAGES {
-                let excess = st.messages.len() - MAX_MESSAGES;
-                st.messages.drain(..excess);
-            }
-        })
-        .await;
-    }
-
-    /// Queue a message from the parent to the sub-agent (the parent→
-    /// child direction of rlm `agent_message.send`); the sub-agent
-    /// consumes it with `check_parent_messages`. Unknown ids are
-    /// ignored (e.g. the record was deleted mid-run).
-    async fn send_to_child(&self, id: &str, msg: &str) {
-        self.update(id, |st| {
-            st.inbox.push(msg.to_string());
-            if st.inbox.len() > MAX_MESSAGES {
-                let excess = st.inbox.len() - MAX_MESSAGES;
-                st.inbox.drain(..excess);
-            }
-        })
-        .await;
-    }
-
-    /// Take (and clear) the parent's queued messages for a sub-agent,
-    /// returning them oldest-first. The `check_parent_messages` tool
-    /// calls this, so a message is consumed exactly once.
-    async fn take_inbox(&self, id: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        self.update(id, |st| std::mem::swap(&mut out, &mut st.inbox))
-            .await;
-        out
-    }
-
-    /// Move the parent's queued messages from `from` to `to` — the
-    /// resume-continuation semantics: the new handle keeps seeing the
-    /// parent's messages and the old record never consumes them twice.
-    async fn transfer_inbox(&self, from: &str, to: &str) {
-        let mut guard = self.states.lock().await;
-        let mut msgs = Vec::new();
-        if let Some(old) = guard.get_mut(from) {
-            std::mem::swap(&mut msgs, &mut old.inbox);
-        }
-        if let Some(new) = guard.get_mut(to) {
-            new.inbox = msgs;
-        }
-        if let Some(dir) = &self.dir {
-            if let Some(old) = guard.get(from) {
-                let _ = old.persist(dir);
-            }
-            if let Some(new) = guard.get(to) {
-                let _ = new.persist(dir);
-            }
-        }
-    }
-}
-
-/// Cap on queued child→parent and parent→child messages (keeps
-/// `delegate status` / `check_parent_messages` from growing without
-/// bound when a chatty sub-agent streams updates).
-const MAX_MESSAGES: usize = 50;
-
-/// Tool injected into every sub-agent's tool set so it can send
-/// messages to its parent while running (the rlm `agent_message.send`
-/// semantics): the text lands in the delegate's `messages` queue,
-/// which the parent reads via `delegate status`.
-pub struct ChildMessageTool {
-    delegates: Arc<DelegateRegistry>,
-    id: String,
-}
-
-impl ChildMessageTool {
-    pub fn new(delegates: Arc<DelegateRegistry>, id: String) -> Self {
-        Self { delegates, id }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::tools::Tool for ChildMessageTool {
-    fn name(&self) -> &str {
-        "child_message"
-    }
-
-    fn description(&self) -> &str {
-        "Send a message to the parent agent. Only available to sub-agents; \
-         the parent reads your messages with delegate status. Use it for \
-         progress updates, intermediate findings, or anything the parent \
-         should know before you finish."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "the message to send to the parent"
-                }
-            },
-            "required": ["text"]
-        })
-    }
-
-    async fn run(&self, args: &Value) -> anyhow::Result<ToolOutput> {
-        let text = args
-            .get("text")
-            .and_then(Value::as_str)
-            .context("child_message requires a 'text' string")?;
-        self.delegates.push_message(&self.id, text).await;
-        Ok(ToolOutput {
-            text: "message sent to parent".to_string(),
-        })
-    }
-}
-
-/// Tool injected into every sub-agent's tool set so it can read
-/// messages the parent sent while it runs (`delegate send` — the
-/// parent→child direction of rlm `agent_message.send`). Consumes the
-/// queued messages (each is delivered exactly once). The sub-agent's
-/// system prompt tells it to check at the start of every step.
-pub struct CheckParentMessagesTool {
-    delegates: Arc<DelegateRegistry>,
-    id: String,
-}
-
-impl CheckParentMessagesTool {
-    pub fn new(delegates: Arc<DelegateRegistry>, id: String) -> Self {
-        Self { delegates, id }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::tools::Tool for CheckParentMessagesTool {
-    fn name(&self) -> &str {
-        "check_parent_messages"
-    }
-
-    fn description(&self) -> &str {
-        "Check for messages your parent sent you (via delegate send). \
-         Only available to sub-agents. Call this at the start of every \
-         step and follow any instructions in the messages. Takes no \
-         arguments; returns the waiting messages, or a note that there \
-         are none."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    async fn run(&self, _args: &Value) -> anyhow::Result<ToolOutput> {
-        let inbox = self.delegates.take_inbox(&self.id).await;
-        if inbox.is_empty() {
-            return Ok(ToolOutput {
-                text: "no messages from parent".to_string(),
-            });
-        }
-        Ok(ToolOutput {
-            text: format!(
-                "messages from parent ({n}):\n{}",
-                inbox
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| format!("{}. {m}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                n = inbox.len()
-            ),
-        })
-    }
 }
 
 /// Tool that delegates a sub-task to a fresh agent turn.
@@ -558,7 +372,7 @@ impl DelegateTool {
     /// rlm.find_models idea: pick a model per sub-task) and is
     /// recorded on the handle.
     // Internal spawn plumbing — many knobs, all explicit (task, name,
-    // resume, type, model, inbox, per-sub-agent condenser overrides).
+    // resume, type, model, per-sub-agent condenser overrides).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_subagent(
         &self,
@@ -567,7 +381,6 @@ impl DelegateTool {
         resume_from: Option<String>,
         subagent_type: Option<&str>,
         model: Option<&str>,
-        inbox: Vec<String>,
         max_context_messages: Option<usize>,
         max_context_tokens: Option<usize>,
     ) -> anyhow::Result<String> {
@@ -613,17 +426,6 @@ impl DelegateTool {
         };
         let id = self.delegates.allocate_id();
         let ts = crate::session::chrono_like_timestamp();
-        // The sub-agent can message its parent while running (rlm
-        // agent_message.send semantics). Registered after the type's
-        // allowlist filter so it survives every sub-agent type.
-        sub_tools.register(Arc::new(ChildMessageTool::new(
-            self.delegates.clone(),
-            id.clone(),
-        )));
-        sub_tools.register(Arc::new(CheckParentMessagesTool::new(
-            self.delegates.clone(),
-            id.clone(),
-        )));
         self.delegates
             .insert(DelegateState {
                 id: id.clone(),
@@ -637,8 +439,6 @@ impl DelegateTool {
                 resume_from,
                 steps: None,
                 model: model.map(|m| m.to_string()),
-                messages: Vec::new(),
-                inbox,
                 tokens: None,
             })
             .await;
@@ -652,16 +452,6 @@ impl DelegateTool {
             "{task}\n\n\
              When you finish, end your reply with a short report:\n\
              \
-             [COMMUNICATION RULES — sub-agent]\n\
-             - Your parent can send you messages while you work\n\
-               (they appear via the check_parent_messages tool).\n\
-             - Call check_parent_messages at the start of EVERY step\n\
-               and follow any instructions in the messages.\n\
-             - You can message your parent any time with the\n\
-               child_message tool (the parent reads them via delegate\n\
-               status).\n\
-             [END COMMUNICATION RULES]\n\
-             \n\
              <final_answer>\n  (the answer to the task)\n</final_answer>\n\
              <key_steps>\n  - 2-5 bullet points of what you did\n</key_steps>\n"
         );
@@ -915,8 +705,8 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete", "send"],
-                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; metrics: per-sub-agent token usage with a grand total; delete: remove a finished sub-agent's record; send: queue a message to a running sub-agent (it reads it via check_parent_messages)"
+                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete"],
+                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; metrics: per-sub-agent token usage with a grand total; delete: remove a finished sub-agent's record"
                 },
                 "task": {
                     "type": "string",
@@ -1000,7 +790,6 @@ impl Tool for DelegateTool {
                         None,
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
-                        Vec::new(),
                         args.get("max_context_messages")
                             .and_then(Value::as_u64)
                             .map(|v| v as usize),
@@ -1093,7 +882,6 @@ impl Tool for DelegateTool {
                             None,
                             t.get("subagent_type").and_then(Value::as_str),
                             t.get("model").and_then(Value::as_str),
-                            Vec::new(),
                             t.get("max_context_messages")
                                 .and_then(Value::as_u64)
                                 .map(|v| v as usize),
@@ -1157,7 +945,6 @@ impl Tool for DelegateTool {
                         Some(st.id.clone()),
                         args.get("subagent_type").and_then(Value::as_str),
                         args.get("model").and_then(Value::as_str),
-                        Vec::new(),
                         args.get("max_context_messages")
                             .and_then(Value::as_u64)
                             .map(|v| v as usize),
@@ -1166,11 +953,6 @@ impl Tool for DelegateTool {
                             .map(|v| v as usize),
                     )
                     .await?;
-                // The parent's queued messages transfer to the new
-                // handle (the continuation keeps seeing them) and are
-                // cleared from the old record so they are never
-                // consumed twice.
-                self.delegates.transfer_inbox(&st.id, &new_id).await;
                 Ok(ToolOutput {
                     text: format!(
                         "delegate '{new_id}' spawned as a continuation of '{}' (status: running). Poll with action=status, collect with action=result.",
@@ -1201,12 +983,6 @@ impl Tool for DelegateTool {
                         st.error.as_deref().unwrap_or("unknown error")
                     ),
                 };
-                if !st.messages.is_empty() {
-                    text.push_str("\nmessages from sub-agent:");
-                    for m in &st.messages {
-                        text.push_str(&format!("\n- {m}"));
-                    }
-                }
                 if let Some(t) = st.tokens {
                     text.push_str(&format!(
                         "\nusage: {} prompt + {} completion tokens",
@@ -1334,24 +1110,8 @@ impl Tool for DelegateTool {
                     text: format!("delegate '{id}' deleted"),
                 })
             }
-            "send" => {
-                let id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("send requires 'id'"))?;
-                let text = args
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("send requires 'text'"))?;
-                self.delegates.send_to_child(id, text).await;
-                Ok(ToolOutput {
-                    text: format!(
-                        "message queued for delegate '{id}'; it will see it on its next check_parent_messages call"
-                    ),
-                })
-            }
             _ => anyhow::bail!(
-                "unknown action '{action}' (spawn|delegate|status|result|resume|list|metrics|delete|send)"
+                "unknown action '{action}' (spawn|delegate|status|result|resume|list|metrics|delete)"
             ),
         }
     }
@@ -1438,8 +1198,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete",
-                "send"
+                "spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete"
             ]
         );
     }
@@ -1459,8 +1218,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -1500,8 +1257,6 @@ mod tests {
                     resume_from: None,
                     steps: None,
                     model: None,
-                    messages: Vec::new(),
-                    inbox: Vec::new(),
                     tokens: None,
                 })
                 .await;
@@ -1548,8 +1303,6 @@ mod tests {
                 resume_from: None,
                 steps: Some(1),
                 model: None,
-                messages: Vec::new(),
-                inbox: Vec::new(),
                 tokens: None,
             })
             .await;
@@ -1592,8 +1345,6 @@ mod tests {
                 resume_from: None,
                 steps: Some(1),
                 model: None,
-                messages: Vec::new(),
-                inbox: Vec::new(),
                 tokens: None,
             })
             .await;
@@ -1657,8 +1408,6 @@ mod tests {
                 resume_from: None,
                 steps: if i == 0 { Some(1) } else { None },
                 model: None,
-                messages: Vec::new(),
-                inbox: Vec::new(),
                 tokens: None,
             })
             .await;
@@ -1702,8 +1451,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -1743,8 +1490,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -1906,8 +1651,6 @@ mod tests {
             resume_from: None,
             steps: Some(7),
             model: Some("model-x".into()),
-            messages: vec!["ping from child".into()],
-            inbox: vec!["ping from parent".into()],
             tokens: Some(crate::llm::provider::TokenUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -1928,8 +1671,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -2009,8 +1750,6 @@ mod tests {
             resume_from: None,
             steps: Some(2),
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: Some(crate::llm::provider::TokenUsage {
                 prompt_tokens: 100,
                 completion_tokens: 30,
@@ -2031,8 +1770,6 @@ mod tests {
             resume_from: None,
             steps: Some(3),
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: Some(crate::llm::provider::TokenUsage {
                 prompt_tokens: 200,
                 completion_tokens: 40,
@@ -2054,8 +1791,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -2144,8 +1879,6 @@ mod tests {
                 resume_from: None,
                 steps: None,
                 model: None,
-                messages: Vec::new(),
-                inbox: Vec::new(),
                 tokens: None,
             })
             .await;
@@ -2346,254 +2079,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_messages_are_bounded_persisted_and_shown_in_status() {
-        let dir = std::env::temp_dir().join(format!("sigil-delegate-msg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let reg = Arc::new(DelegateRegistry::new(Some(dir.clone())));
-        reg.insert(DelegateState {
-            id: "d00001".into(),
-            name: "chatty".into(),
-            status: DelegateStatus::Running,
-            started_ts: "t0".into(),
-            finished_ts: None,
-            result: None,
-            error: None,
-            task: "task".into(),
-            resume_from: None,
-            steps: None,
-            model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
-            tokens: None,
-        })
-        .await;
-        // A chatty sub-agent streams more than the cap.
-        for i in 0..60 {
-            reg.push_message("d00001", &format!("msg {i:02}")).await;
-        }
-        // Bounded to the most recent MAX_CHILD_MESSAGES.
-        let snap = reg.snapshot().await;
-        let st = snap.iter().find(|s| s.id == "d00001").unwrap();
-        assert_eq!(st.messages.len(), 50, "queue is bounded");
-        assert_eq!(st.messages.first().map(String::as_str), Some("msg 10"));
-        assert_eq!(st.messages.last().map(String::as_str), Some("msg 59"));
-        // Persisted to meta.json.
-        let back: DelegateState = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("d00001").join("meta.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(back.messages.len(), 50, "messages persisted to meta.json");
-        // Unknown ids are ignored (record deleted mid-run etc).
-        reg.push_message("d99999", "nobody home").await;
-        // `delegate status` surfaces the messages to the parent.
-        let tool = DelegateTool {
-            provider: Arc::new(
-                crate::llm::openai::OpenAiProvider::with_fallbacks(
-                    crate::llm::openai::OpenAiConfig {
-                        base_url: "http://localhost:1/v1".into(),
-                        api_key: "x".into(),
-                    },
-                    vec![],
-                )
-                .unwrap(),
-            ),
-            registry: ToolRegistry::default(),
-            config: AgentConfig {
-                model: "test".into(),
-                max_steps: 3,
-                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
-                    crate::harness::PromptState {
-                        system_prompt: "sys".into(),
-                        skills: vec![],
-                        fingerprint: None,
-                    },
-                )),
-                max_inline_skills: 0,
-                sync_dir: None,
-                max_context_messages: 0,
-                max_context_tokens: 0,
-                goals: None,
-                goals_dir: None,
-                planning_interval: 0,
-                hooks: None,
-                session_sink: None,
-            },
-            delegates: reg.clone(),
-            agents: Arc::new(subagent::AgentRegistry::new(None)),
-            description: std::sync::OnceLock::new(),
-            depth: 0,
-            progress: None,
-        };
-        let out = tool
-            .run(&json!({
-                "action": "status",
-                "id": "d00001",
-            }))
-            .await
-            .unwrap();
-        assert!(
-            out.text.contains("messages from sub-agent"),
-            "status shows the messages section: {}",
-            out.text
-        );
-        assert!(
-            out.text.contains("msg 59"),
-            "status shows the message text: {}",
-            out.text
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn parent_messages_are_queued_persisted_and_consumed_once() {
-        let dir = std::env::temp_dir().join(format!("sigil-delegate-inbox-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let reg = Arc::new(DelegateRegistry::new(Some(dir.clone())));
-        reg.insert(DelegateState {
-            id: "d00001".into(),
-            name: "child".into(),
-            status: DelegateStatus::Running,
-            started_ts: "t0".into(),
-            finished_ts: None,
-            result: None,
-            error: None,
-            task: "task".into(),
-            resume_from: None,
-            steps: None,
-            model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
-            tokens: None,
-        })
-        .await;
-        // The parent queues two messages (the rlm parent→child send).
-        reg.send_to_child("d00001", "first instruction").await;
-        reg.send_to_child("d00001", "second instruction").await;
-        // Persisted to meta.json.
-        let back: DelegateState = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("d00001").join("meta.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(back.inbox.len(), 2, "inbox persisted to meta.json");
-        // The sub-agent's check consumes them exactly once, oldest-first.
-        let taken = reg.take_inbox("d00001").await;
-        assert_eq!(taken, vec!["first instruction", "second instruction"]);
-        let again = reg.take_inbox("d00001").await;
-        assert!(again.is_empty(), "messages are consumed exactly once");
-        // The delegate `send` action surfaces the queueing message.
-        let tool = DelegateTool {
-            provider: Arc::new(
-                crate::llm::openai::OpenAiProvider::with_fallbacks(
-                    crate::llm::openai::OpenAiConfig {
-                        base_url: "http://localhost:1/v1".into(),
-                        api_key: "x".into(),
-                    },
-                    vec![],
-                )
-                .unwrap(),
-            ),
-            registry: ToolRegistry::default(),
-            config: AgentConfig {
-                model: "test".into(),
-                max_steps: 3,
-                prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
-                    crate::harness::PromptState {
-                        system_prompt: "sys".into(),
-                        skills: vec![],
-                        fingerprint: None,
-                    },
-                )),
-                max_inline_skills: 0,
-                sync_dir: None,
-                max_context_messages: 0,
-                max_context_tokens: 0,
-                goals: None,
-                goals_dir: None,
-                planning_interval: 0,
-                hooks: None,
-                session_sink: None,
-            },
-            delegates: reg.clone(),
-            agents: Arc::new(subagent::AgentRegistry::new(None)),
-            description: std::sync::OnceLock::new(),
-            depth: 0,
-            progress: None,
-        };
-        let out = tool
-            .run(&json!({"action": "send", "id": "d00001", "text": "watch out"}))
-            .await
-            .unwrap();
-        assert!(
-            out.text.contains("message queued for delegate 'd00001'"),
-            "send action reports the queue: {}",
-            out.text
-        );
-        assert_eq!(
-            reg.take_inbox("d00001").await,
-            vec!["watch out"],
-            "the queued message reaches the sub-agent"
-        );
-        // Unknown ids are ignored (no error).
-        reg.send_to_child("d99999", "nobody home").await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn resume_transfers_parent_inbox_to_new_handle() {
-        let dir = std::env::temp_dir().join(format!("sigil-delegate-xfer-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let reg = Arc::new(DelegateRegistry::new(Some(dir.clone())));
-        reg.insert(DelegateState {
-            id: "d00001".into(),
-            name: "old".into(),
-            status: DelegateStatus::Completed,
-            started_ts: "t0".into(),
-            finished_ts: Some("t1".into()),
-            result: Some("r".into()),
-            error: None,
-            task: "task".into(),
-            resume_from: None,
-            steps: None,
-            model: None,
-            messages: Vec::new(),
-            inbox: vec!["pending message".into()],
-            tokens: None,
-        })
-        .await;
-        reg.insert(DelegateState {
-            id: "d00002".into(),
-            name: "continuation".into(),
-            status: DelegateStatus::Running,
-            started_ts: "t2".into(),
-            finished_ts: None,
-            result: None,
-            error: None,
-            task: "task".into(),
-            resume_from: Some("d00001".into()),
-            steps: None,
-            model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
-            tokens: None,
-        })
-        .await;
-        // The continuation inherits the parent's queued messages…
-        reg.transfer_inbox("d00001", "d00002").await;
-        let snap = reg.snapshot().await;
-        let old = snap.iter().find(|s| s.id == "d00001").unwrap();
-        let new = snap.iter().find(|s| s.id == "d00002").unwrap();
-        assert!(old.inbox.is_empty(), "old record's inbox cleared");
-        assert_eq!(new.inbox, vec!["pending message"]);
-        // …and the transfer is persisted to both meta.jsons.
-        let back_new: DelegateState = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("d00002").join("meta.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(back_new.inbox, vec!["pending message"]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
     async fn delete_removes_record_and_disk_dir() {
         let dir = std::env::temp_dir().join(format!("sigil-delegate-del-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2610,8 +2095,6 @@ mod tests {
             resume_from: None,
             steps: Some(3),
             model: Some("model-y".into()),
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -2691,8 +2174,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;
@@ -2732,8 +2213,6 @@ mod tests {
                 resume_from: None,
                 steps: None,
                 model: None,
-                messages: Vec::new(),
-                inbox: Vec::new(),
                 tokens: None,
             })
             .await;
@@ -2814,8 +2293,6 @@ mod tests {
             resume_from: None,
             steps: None,
             model: None,
-            messages: Vec::new(),
-            inbox: Vec::new(),
             tokens: None,
         })
         .await;

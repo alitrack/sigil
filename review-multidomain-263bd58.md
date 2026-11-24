@@ -324,7 +324,7 @@ README 砍到 ~200 行 + 独立 `CHANGELOG.md`；AGENTS.md 删除具体测试数
 
 **因此下一轮该做的不是删特性，而是削动作面**，按这个顺序：
 
-1. **把消息总线整体去掉**（`child_message` / `check_parent_messages` / `delegate send` / `messages` / `inbox` / `transfer_inbox` / `MAX_MESSAGES`）。它是最自洽的一块：去掉后子代理仍有 `delegate result` 这条唯一回传通道，语义不丢。预计 −200 行、−4 测试。
+1. ~~把消息总线整体去掉~~ **✅ 已完成（2026-11-23, commit 见下）**：`child_message` / `check_parent_messages` / `delegate send` 动作 / `DelegateState.messages`+`inbox` / `push_message` / `send_to_child` / `take_inbox` / `transfer_inbox` / `MAX_MESSAGES` / 子代理提示词里的 COMMUNICATION RULES 全部移除，净 **−528 行**、−3 测试。子代理回传仍走 `delegate result`。
 2. **拆工具**：`delegate`（spawn / delegate / result）与 `delegate_admin`（list / status / delete）分开，各自小交换机；`metrics` 并进 `status` 输出（它本来就只是 usage 的一个视图，单独一个动作不划算）。
 3. `resume` + registry 持久化**最后动**：它是已发布的 CLI 契约（`--delegates-dir`），要单独一轮并配 ratchet 验证。
 

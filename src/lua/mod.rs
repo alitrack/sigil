@@ -161,10 +161,10 @@ impl LuaRuntime {
         host.set(
             "read_file",
             lua.create_function(|_lua, path: String| {
-                std::fs::read_to_string(crate::agent::provider::resolve_path(std::path::Path::new(
-                    &path,
-                )))
-                .map_err(|e| mlua::Error::RuntimeError(format!("read_file: {e}")))
+                let resolved = crate::safety::authorize_read(std::path::Path::new(&path))
+                    .map_err(|e| mlua::Error::RuntimeError(format!("{e}")))?;
+                std::fs::read_to_string(resolved)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("read_file: {e}")))
             })
             .map_err(lua_err)?,
         )
@@ -184,7 +184,16 @@ impl LuaRuntime {
         .map_err(lua_err)?;
         host.set(
             "env",
-            lua.create_function(|_lua, key: String| Ok(std::env::var(key).unwrap_or_default()))
+            // A key that names a credential is not "context": reading it is
+            // exfiltration of the very key this process runs under.
+            lua.create_function(|_lua, key: String| {
+                if crate::safety::is_credential_env(&key) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "host.env('{key}') refused: credential-shaped names are not readable from Lua"
+                    )));
+                }
+                Ok(std::env::var(key).unwrap_or_default())
+            })
                 .map_err(lua_err)?,
         )
         .map_err(lua_err)?;

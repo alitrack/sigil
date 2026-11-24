@@ -328,7 +328,10 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
   **请如实理解这些限制**：审批门只对 `bash` 做模式匹配 —— 其他工具一律
   放行；交互式 `y/N` 只存在于 REPL（pipe、daemon、cron、子代理都没有
   审批人）。真正约束其余工具的是写作用域（`write_file` 限定在工作区 /
-  临时目录 / sigil 状态目录，`SIGIL_WRITE_ROOTS` 可扩展）与冻结开关
+  临时目录 / sigil 状态目录，`SIGIL_WRITE_ROOTS` 可扩展）、凭据读取黑名单
+  （`read_file`、Lua `host.read_file`、`host.env` 拒绝钥匙材料——`~/.ssh`、
+  `~/.aws`、`~/.netrc`、代理的 `*.db`，以及任何名字像密钥的环境变量；
+  `SIGIL_READ_ALLOW` 可显式豁免某个路径）与冻结开关
   （`SIGIL_FREEZE=1` 拒绝一切对进化面的写入）。默认构建开启 LuaJIT
   **FFI**，模型自写的脚本工具可以调用任意 C 库 —— 需要隔离请用
   `--no-default-features` 构建。一句话：sigil 假设模型被信任、可代表你

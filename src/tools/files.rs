@@ -70,14 +70,11 @@ impl Tool for ReadFileTool {
             .unwrap_or(500)
             .min(2000);
 
+        // Credential stores are not project content: refuse rather than hand
+        // key material to whatever text ended up in the transcript.
+        let resolved = crate::safety::authorize_read(std::path::Path::new(path))?;
         // Phase B: 文件 IO 走 FsProvider 缝隙（默认 LocalFsProvider）。
-        let content = match self
-            .fs
-            .read_to_string(&crate::agent::provider::resolve_path(std::path::Path::new(
-                path,
-            )))
-            .await
-        {
+        let content = match self.fs.read_to_string(&resolved).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolOutput {

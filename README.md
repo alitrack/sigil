@@ -383,9 +383,12 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   only — every other tool is allowed, and the interactive `y/N` prompt exists
   in the REPL alone (pipe, daemon, cron and sub-agents run with no approver).
   What bounds the rest is write scope (`write_file` is confined to the
-  workspace / temp / sigil state dirs; `SIGIL_WRITE_ROOTS` extends it) and
-  the freeze switch (`SIGIL_FREEZE=1` refuses every write to the evolution
-  surface). The default build enables LuaJIT **FFI**, so a model-authored
+  workspace / temp / sigil state dirs; `SIGIL_WRITE_ROOTS` extends it), a
+  credential-read denylist (`read_file`, Lua `host.read_file` and `host.env`
+  refuse key material — `~/.ssh`, `~/.aws`, `~/.netrc`, `*.db` of the proxy,
+  and any env var whose name looks like a secret; `SIGIL_READ_ALLOW` exempts a
+  path deliberately), and the freeze switch (`SIGIL_FREEZE=1` refuses every
+  write to the evolution surface). The default build enables LuaJIT **FFI**, so a model-authored
   scripted tool can call any C library — build `--no-default-features` for a
   containment build. In short: sigil assumes the model is trusted to act with
   your privileges. Do not point it at untrusted content with FFI enabled.

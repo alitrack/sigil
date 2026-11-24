@@ -71,6 +71,90 @@ pub fn is_frozen() -> bool {
     std::env::var_os("SIGIL_FREEZE").is_some_and(|v| v == "1")
 }
 
+// ---------------------------------------------------------------------------
+// Credential reads — narrow on purpose.
+// ---------------------------------------------------------------------------
+
+/// Path fragments whose contents are credentials rather than project files.
+///
+/// This is deliberately a denylist, not an allowlist: an allowlist breaks real
+/// work (agents legitimately read `/etc/os-release`, `/usr/include`, a project
+/// `.env`), while these locations are never part of the task and are exactly
+/// what an injected instruction would go after. Matched case-insensitively
+/// against the canonical path.
+const CREDENTIAL_PATHS: &[&str] = &[
+    "/.ssh/",
+    "/.aws/",
+    "/.gnupg/",
+    "/.kube/",
+    "/.docker/config.json",
+    "/.netrc",
+    "/.git-credentials",
+    "/.config/gh/hosts",
+    "/.codex/auth.json",
+    "/cc-switch.db",
+    "/Library/Keychains/",
+    "/.config/sigil/secret",
+    "/.sigil/secret",
+];
+
+/// Environment variables whose value is a credential. `host.env()` used to hand
+/// any of these to a model-authored script, which is a one-call exfiltration of
+/// the endpoint key it runs under.
+const CREDENTIAL_ENV_HINTS: &[&str] = &[
+    "API_KEY",
+    "APIKEY",
+    "ACCESS_KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+];
+
+/// True when `path` names a credential store. `SIGIL_READ_ALLOW` may list
+/// substrings to exempt (an explicit, auditable opt-in).
+pub fn is_credential_path(path: &Path) -> bool {
+    let resolved = canonical_or_lexical(&crate::agent::provider::resolve_path(path));
+    let shown = resolved.to_string_lossy().to_lowercase();
+    let shown = shown.replace('\\', "/");
+    for extra in std::env::var_os("SIGIL_READ_ALLOW")
+        .map(|v| {
+            std::env::split_paths(&v)
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+    {
+        if !extra.is_empty() && shown.contains(&extra) {
+            return false;
+        }
+    }
+    CREDENTIAL_PATHS
+        .iter()
+        .any(|frag| shown.contains(&frag.to_lowercase()))
+}
+
+/// Refuse a model-directed read of a credential store.
+pub fn authorize_read(path: &Path) -> anyhow::Result<PathBuf> {
+    if is_credential_path(path) {
+        anyhow::bail!(
+            "read refused: {} is a credential store, not project content. \
+             Model-directed reads cannot touch key material; set SIGIL_READ_ALLOW \
+             to exempt a specific path deliberately.",
+            path.display()
+        );
+    }
+    Ok(crate::agent::provider::resolve_path(path))
+}
+
+/// True when an environment variable name looks like it carries a secret.
+pub fn is_credential_env(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    CREDENTIAL_ENV_HINTS.iter().any(|hint| upper.contains(hint))
+}
+
 /// Roots a model-directed write may land in: the workspace, the OS temp dir
 /// and sigil's own state directory. `SIGIL_WRITE_ROOTS` (split on the platform
 /// path separator) extends the list for hosts that genuinely need it.

@@ -1,6 +1,9 @@
 //! Safety unit tests: gate decisions, rings, circuit breaker.
 
-use crate::safety::{CircuitBreaker, GateDecision, Ring, authorize_write_in, check, ring_of};
+use crate::safety::{
+    CircuitBreaker, GateDecision, Ring, authorize_read, authorize_write_in, check,
+    is_credential_env, ring_of,
+};
 use serde_json::json;
 
 #[cfg(test)]
@@ -273,4 +276,61 @@ fn sibling_prefix_is_not_treated_as_inside() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("write refused"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Credential reads: a denylist narrow enough not to break real work.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn credential_stores_are_refused() {
+    for path in [
+        "/Users/someone/.ssh/id_rsa",
+        "/home/u/.aws/credentials",
+        "/home/u/.netrc",
+        "/home/u/.git-credentials",
+        "/home/u/.codex/auth.json",
+        "/home/u/.docker/config.json",
+    ] {
+        let err = authorize_read(std::path::Path::new(path))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credential store"), "{path}: {err}");
+    }
+}
+
+#[test]
+fn ordinary_project_files_are_readable() {
+    // The whole point of a denylist: these must keep working, or the policy
+    // breaks the job it is protecting.
+    for path in [
+        "/etc/os-release",
+        "/usr/include/stdio.h",
+        "/Users/someone/project/.env",
+        "/Users/someone/project/src/main.rs",
+        "/Users/someone/project/README.md",
+    ] {
+        assert!(
+            authorize_read(std::path::Path::new(path)).is_ok(),
+            "{path} must stay readable"
+        );
+    }
+}
+
+#[test]
+fn credential_shaped_env_names_are_refused() {
+    for key in [
+        "SIGIL_API_KEY",
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "DB_PASSWORD",
+        "SSH_PRIVATE_KEY",
+        "SOME_CREDENTIAL",
+    ] {
+        assert!(is_credential_env(key), "{key} must be refused");
+    }
+    for key in ["PATH", "HOME", "PWD", "LANG", "SIGIL_MODEL", "TERM"] {
+        assert!(!is_credential_env(key), "{key} must stay readable");
+    }
 }

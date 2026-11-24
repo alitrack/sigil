@@ -181,6 +181,12 @@ workspace (escalation fails closed without an approval channel), so
   but true per-session scoping needs the evolution tools re-bound to a
   per-registry queue, which is not done yet. A frozen run now refuses the
   whole drain (below), which is the case that mattered for benchmarking.
+- **Credential reads**: `safety::authorize_read` + `safety::is_credential_env`.
+  A *denylist*, deliberately: an allowlist would break real work (agents read
+  `/etc/os-release`, `/usr/include`, a project `.env`), while `~/.ssh`,
+  `~/.aws`, `~/.netrc`, proxy stores and secret-named env vars are never part
+  of the task and are exactly what injected text goes after. Both enforced in
+  `read_file`, Lua `host.read_file` and Lua `host.env`.
 - **Freeze**: `safety::is_frozen()` (`SIGIL_FREEZE=1`) is the single check
   every write surface calls (remember, memory_delete, create_lua_tool,
   improve_harness, hooks). Add it to any new write tool.

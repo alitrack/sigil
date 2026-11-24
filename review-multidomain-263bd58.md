@@ -294,7 +294,7 @@ README 砍到 ~200 行 + 独立 `CHANGELOG.md`；AGENTS.md 删除具体测试数
 
 **验证抓到的真问题（这正是"必须有可执行反馈回路"的价值）**：首轮用例 2/3 同时失败——macOS 上 `/tmp` 是 `/private/tmp` 的软链，而 `std::env::temp_dir()` 返回 `$TMPDIR=/var/folders/...`，两者不相等，于是**往 `/tmp` 写也被拒**。规范化把 `/tmp` 解析成 `/private/tmp`，与 `temp_dir()` 永远对不上。修复：Unix 下把 `/tmp` 显式加入可写根。这个 bug 在纸面评审里看不出来，只有跑一次才会现形。
 
-**仍未验证的部分（如实标注）**：`read_file` 与 Lua `host.read_file` 仍可读任意绝对路径——本轮没有收紧（大量正常任务需要读 `/usr/include`、`/etc/os-release` 之类），但它意味着"读→外传"这条链仍然通畅。要真正闭环，需要一次独立的设计决定（读白名单 + `host.env` 键白名单），不建议顺手做。
+**读取范围（2026-11-23 已收紧）**：原状是 `read_file` 与 Lua `host.read_file` 可读任意绝对路径、`host.env` 可读任意环境变量，"读→外传"链通畅。采用的方案是**凭据黑名单**而非白名单：白名单会破坏真实工作（agent 确实要读 `/etc/os-release`、`/usr/include`、项目 `.env`），而 `~/.ssh`、`~/.aws`、`~/.netrc`、`~/.codex/auth.json`、代理的 `cc-switch.db`、以及任何名字像密钥的环境变量（`*API_KEY*`、`*TOKEN*`、`*SECRET*`…）从来不属于任务内容，正是注入文本会去找的东西。三处入口统一执行（`read_file`、`host.read_file`、`host.env`），`SIGIL_READ_ALLOW` 可显式豁免单个路径。实测：读项目文件正常、读 `~/.ssh/id_rsa` 被拒；ratchet 12/12 未受影响。
 
 ---
 

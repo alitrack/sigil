@@ -476,9 +476,10 @@ pub fn dry_run(
             }
         }
         Err(e) if e.contains("PLAN_RUNAWAY") => {
-            return Err(vec![format!(
+            return Err(vec![
                 "line 1: the dry run exceeded its wall budget, so the plan probably loops without end"
-            )]);
+                    .to_string(),
+            ]);
         }
         Err(e) => return Err(vec![e]),
     };

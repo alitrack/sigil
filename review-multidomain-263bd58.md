@@ -331,3 +331,29 @@ README 砍到 ~200 行 + 独立 `CHANGELOG.md`；AGENTS.md 删除具体测试数
 ### 本轮为什么没动手
 
 刚完成三处结构改动（`ToolGate` 单点化、hot 队列重绑、审批通道改异步），验证预算已经用掉；再叠一个 200 行 + 4 测试的删除，出问题难归因。**宁可留一张准确的清单，也不留半个手术。**
+
+---
+
+## 8. daemon / ACP 审批通道：设计（未实施，2026-11-23）
+
+`Approver` 已改为返回 future（`ac846b5`），所以通道类型不再是障碍。剩下的都是**循环结构**问题。
+
+### daemon：`handle_connection` 的 turn 是 inline await
+
+现状（`daemon.rs:303-`）：连接循环 `while let Some(line) = lines.next_line()` 里，`"user"` 分支直接 `run_messages(...).await`。**turn 运行期间读不到任何客户端帧**，所以 `{"type":"approval_reply"}` 只能等到 turn 结束才被读到 —— 审批往返不可能完成。
+
+要接通，需要三件事：
+
+1. **turn 移入 spawn 的任务**，连接循环改为事件循环（`tokio::select!` 于 `lines.next_line()` 与 turn 完成之间）。
+2. **待审批表**：`Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>` + 计数器。approver 闭包发 `{"type":"approval","id":N,"name":…,"args":…}` 后 `await` 对应的 oneshot；收到 `{"type":"approval_reply","id":N,"allow":bool}` 时 resolver 塞值。
+3. **`tools` 的所有权重排**（容易漏掉的坑）：`handle_connection` 现在独占 `tools: ToolRegistry`。turn 一旦 spawn 出去，`tools` 必须移进任务；下一轮 turn 要再用它，只能"turn 结束时交还"或"注册表移到 `Arc<Mutex<ToolRegistry>>` 后面"。后者更简单，但 `ToolGate` 目前持有 `&ToolRegistry`，需要改成在临界区内执行、不能跨 await 持锁 —— 与 AGENTS.md 的"no blocking_lock / 嵌套 block_on"约定相邻，必须小心。
+
+**这是并发 + 所有权改造，不是加几十行**。失败形态是死锁，最难归因，所以不适合在验证预算不足时动。
+
+### ACP：结构上更简单，但要动协议
+
+ACP 有标准的 `session/request_permission` 请求/响应，是这类审批的**原生机制**，比自定义帧更该走。前提同样是 turn 不能阻塞在帧读取循环里（`acp/mod.rs` 需确认其 turn 是否已 spawn；AGENTS.md 提到 ACP 的 turn executor 是 async `BoxFuture`，可能已经具备条件）。
+
+### 便宜的替代方案（我没选，但值得记下）
+
+预声明白名单：`--allow-destructive "git reset --hard"`，approver 变成对**静态清单**的查表（同步、无需往返）。这是 CI 里的常见形态，成本远低于事件循环。没选的理由：它会新增一个"自动放行破坏性命令"的开关，而这个开关一旦出现在 agent 能读到的环境里就是新的被利用面 —— 审批通道的价值恰恰在于"人在环里"，静态清单把这一点让掉了。

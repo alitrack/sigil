@@ -69,6 +69,27 @@ pub fn progress_signature(receipts: &[(String, bool, String)]) -> u64 {
     hasher.finish()
 }
 
+/// Markers that mean a "tool-less" answer is not an answer. The first-frame
+/// draft is requested with no tool specs, but a weak instruction-follower
+/// still emits the call as text — and that text would become the fallback the
+/// user sees. Measured on a local 27B model, `--max-steps 1` returned a raw
+/// `<tool_call><function=search_node_spec>` blob as the final answer.
+const TOOL_CALL_MARKERS: &[&str] = &[
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+    "\"tool_calls\":",
+    "\"name\": \"bash\"",
+];
+
+/// True when a draft is a leaked tool call rather than prose the user can use.
+pub fn looks_like_tool_call(draft: &str) -> bool {
+    let lower = draft.to_ascii_lowercase();
+    TOOL_CALL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(&marker.to_ascii_lowercase()))
+}
+
 /// The nudge injected when a round repeats: state the fact, ask for a change of
 /// approach, do not scold.
 pub fn no_progress_nudge(repeats: u32) -> String {
@@ -123,5 +144,33 @@ mod tests {
         assert!(text.contains('2'));
         assert!(text.contains("change approach"));
         assert!(text.contains("wrapped up"));
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    #[test]
+    fn leaked_tool_call_markup_is_not_an_answer() {
+        for draft in [
+            "<tool_call>\n<function=search_node_spec>\n<parameter=query>\n写文件\n",
+            "I will call <function=bash> now",
+            "{\"tool_calls\": [{\"name\": \"bash\", \"arguments\": {}}]}",
+        ] {
+            assert!(looks_like_tool_call(draft), "{draft}");
+        }
+    }
+
+    #[test]
+    fn ordinary_prose_still_counts_as_an_answer() {
+        for draft in [
+            "The answer is 42.",
+            "f1=9870, f2=9915",
+            "我先读了文件，内容是 hello。",
+            "Use the tool_call naming convention in the docs.",
+        ] {
+            assert!(!looks_like_tool_call(draft), "{draft}");
+        }
     }
 }

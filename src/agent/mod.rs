@@ -469,11 +469,22 @@ pub async fn run_messages(
         .await
         {
             Ok((draft, _)) if !draft.trim().is_empty() => {
-                eprintln!(
-                    "[scheduler] first-frame draft captured ({} chars)",
-                    draft.len()
-                );
-                Some(draft)
+                // A leaked tool call is not an answer: a model that ignores
+                // "do not call tools" emits the call as text, and that text
+                // would become the fallback handed to the user. Drop it and
+                // keep the real answer path instead.
+                if scheduler::looks_like_tool_call(&draft) {
+                    eprintln!(
+                        "[scheduler] first-frame draft discarded: it is a leaked tool call, not an answer"
+                    );
+                    None
+                } else {
+                    eprintln!(
+                        "[scheduler] first-frame draft captured ({} chars)",
+                        draft.len()
+                    );
+                    Some(draft)
+                }
             }
             Ok(_) => None,
             Err(e) => {
@@ -1140,14 +1151,38 @@ async fn wrap_up(
     )
     .await;
     let draft = fallback_draft.filter(|d| !d.trim().is_empty());
+    // A wrap-up that is really a leaked tool call is not an answer either: the
+    // same weak instruction-following that produces one in the draft produces
+    // it here, and it would be streamed to the user as the final answer.
+    let usable = |text: &str| !text.trim().is_empty() && !scheduler::looks_like_tool_call(text);
+    let attempt = match attempt {
+        Ok((s, t)) if s.trim().is_empty() || scheduler::looks_like_tool_call(&s) => {
+            eprintln!(
+                "[scheduler] wrap-up discarded: {}",
+                if s.trim().is_empty() {
+                    "it came back empty"
+                } else {
+                    "it is a leaked tool call, not an answer"
+                }
+            );
+            Ok((s, t))
+        }
+        other => other,
+    };
     let (summary, summary_tokens) = match attempt {
-        Ok((s, t)) if !s.trim().is_empty() => (s, t),
-        Ok((s, t)) => match draft {
+        Ok((s, t)) if usable(&s) => (s, t),
+        Ok((_s, t)) => match draft {
             Some(d) => {
-                eprintln!("[scheduler] wrap-up was empty — using the first-frame draft");
+                eprintln!("[scheduler] falling back to the first-frame draft");
                 (d, t)
             }
-            None => (s, t),
+            None => (
+                format!(
+                    "run ended ({state:?}) — the model produced no usable answer \
+                     (empty or leaked tool-call markup)"
+                ),
+                t,
+            ),
         },
         Err(e) => match draft {
             Some(d) => {

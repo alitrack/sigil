@@ -97,7 +97,16 @@ pub struct ToolRegistry {
     /// introspection tool (which holds a clone of this same Arc) without
     /// needing the registry that registered it.
     deps: Arc<RwLock<DependencyState>>,
+    /// Re-binds the evolution tools (`create_lua_tool`, `improve_harness`,
+    /// version rollback, goals) to a given hot queue. Set by
+    /// [`ToolRegistry::with_tools`]; used by [`ToolRegistry::clone_shallow`] so
+    /// a new session gets its own queue *and* tools that push into it.
+    rebind: Option<Arc<EvolutionBinder>>,
 }
+
+/// Re-binds the evolution tool set to a registry and a hot queue. A `Fn`
+/// (not `FnOnce`) because every clone needs its own bind.
+type EvolutionBinder = dyn Fn(&mut ToolRegistry, Arc<Mutex<Vec<HotOp>>>) + Send + Sync;
 
 /// Cordis P2 (reactive coeffects): the dependency graph and per-tool
 /// readiness for one registry, kept in its own `Arc<RwLock<..>>` so both
@@ -173,7 +182,95 @@ impl ToolRegistry {
     /// Cheap clone for concurrent sessions: shares the Arc'd tools and
     /// the hot queue, giving each session its own registry bookkeeping.
     pub fn clone_shallow(&self) -> Self {
-        self.clone()
+        let mut cloned = self.clone();
+        // Per-session hot queue: a tool created in another session must not
+        // become callable here without a restart. The registry's own tools are
+        // shared (they are stateless handles), so re-bind the evolution set to
+        // the new queue — otherwise `create_lua_tool` would keep pushing into
+        // the parent's queue and this session would never see its own tools.
+        cloned.hot_queue = Arc::new(Mutex::new(Vec::new()));
+        if let Some(bind) = self.rebind.clone() {
+            let queue = cloned.hot_queue.clone();
+            bind(&mut cloned, queue);
+        }
+        cloned
+    }
+
+    /// Builds the closure that registers the evolution tool set, bound to the
+    /// hot queue it is handed. Shared state that must survive a clone (the
+    /// goals cell, the revertible-effect tracker, the live prompt state) is
+    /// captured once here and re-used by every bind.
+    fn evolution_binder(
+        scripted_dir: Option<std::path::PathBuf>,
+        harness_dir: Option<std::path::PathBuf>,
+        prompt_state: Option<std::sync::Arc<std::sync::RwLock<crate::harness::PromptState>>>,
+        goals: Option<std::sync::Arc<std::sync::RwLock<Vec<crate::goals::GoalState>>>>,
+        local_harness_dir: Option<std::path::PathBuf>,
+        hooks_dir: Option<std::path::PathBuf>,
+    ) -> impl Fn(&mut ToolRegistry, Arc<Mutex<Vec<HotOp>>>) + Send + Sync {
+        let tools_dir = scripted_dir.unwrap_or_else(scripted::default_tools_dir);
+        let harness_dir = harness_dir.unwrap_or_else(harness::default_harness_dir);
+        let goals = goals.unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
+        // Cordis P1: one tracker for the whole session — the write side
+        // (improve_harness) and the revert side (revert_effects) must agree.
+        let effects = std::sync::Arc::new(crate::revertible::EffectTracker::new());
+        move |registry: &mut ToolRegistry, queue: Arc<Mutex<Vec<HotOp>>>| {
+            let q_create = queue.clone();
+            let q_delete = queue.clone();
+            let q_rollback = queue.clone();
+            registry.register(Arc::new(evolve::CreateLuaToolTool {
+                tools_dir: tools_dir.clone(),
+                register: Box::new(move |name: &str, path: std::path::PathBuf| {
+                    if let Ok(mut q) = q_create.try_lock() {
+                        q.push(HotOp::register(name, path));
+                    }
+                }),
+                unregister: Box::new(move |name: &str| {
+                    if let Ok(mut q) = q_delete.try_lock() {
+                        q.push(HotOp::unregister(name));
+                    }
+                }),
+            }));
+            registry.register(Arc::new(evolve::ImproveHarnessTool {
+                harness_dir: harness_dir.clone(),
+                local_dir: local_harness_dir.clone(),
+                prompt_state: prompt_state.clone(),
+                hooks_dir: hooks_dir.clone(),
+                effects: Some(effects.clone()),
+            }));
+            registry.register(Arc::new(evolve::RevertEffectsTool {
+                tracker: effects.clone(),
+            }));
+            registry.register(Arc::new(goals_tool::ManageGoalsTool {
+                goals_dir: harness_dir.clone(),
+                goals: goals.clone(),
+            }));
+            registry.register(Arc::new(versions::SkillHistoryTool {
+                harness_dir: harness_dir.clone(),
+                tools_dir: tools_dir.clone(),
+                hooks_dir: hooks_dir.clone(),
+            }));
+            registry.register(Arc::new(versions::SkillRollbackTool {
+                harness_dir: harness_dir.clone(),
+                tools_dir: tools_dir.clone(),
+                hooks_dir: hooks_dir.clone(),
+                register: Some(Box::new(move |name: &str, path: std::path::PathBuf| {
+                    if let Ok(mut q) = q_rollback.try_lock() {
+                        q.push(HotOp::register(name, path));
+                    }
+                })),
+                prompt_state: prompt_state.clone(),
+            }));
+            registry.register(Arc::new(versions::VersionsGcTool {
+                harness_dir: harness_dir.clone(),
+                tools_dir: tools_dir.clone(),
+                hooks_dir: hooks_dir.clone(),
+            }));
+            registry.register(Arc::new(acp::AcpCallTool {
+                command: "sigil".to_string(),
+                args: vec!["acp".to_string()],
+            }));
+        }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> ReadinessDelta {
@@ -363,83 +460,19 @@ impl ToolRegistry {
         registry.register(Arc::new(git::GitStatusTool::new()));
         registry.register(Arc::new(git::GitDiffTool::new()));
         registry.register(Arc::new(git::GitLogTool::new()));
-        // Evolution tool: the model can write new Lua tools at runtime.
-        let tools_dir = scripted_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(scripted::default_tools_dir);
-        let hot_queue = registry.hot_queue.clone();
-        let hot_queue2 = hot_queue.clone();
-        let hot_queue3 = hot_queue.clone();
-        registry.register(Arc::new(evolve::CreateLuaToolTool {
-            tools_dir: tools_dir.clone(),
-            register: Box::new(move |name: &str, path: std::path::PathBuf| {
-                if let Ok(mut q) = hot_queue.try_lock() {
-                    q.push(HotOp::register(name, path));
-                }
-            }),
-            unregister: Box::new(move |name: &str| {
-                if let Ok(mut q) = hot_queue2.try_lock() {
-                    q.push(HotOp::unregister(name));
-                }
-            }),
-        }));
-        // Harness evolution: the model can improve its own instruction
-        // layer (system prompt / skills). Follows --harness-dir so the
-        // tool edits exactly what the agent loaded.
-        let harness_dir = harness_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(harness::default_harness_dir);
-        // Cordis P1: runtime revertible-effect tracker, shared between the
-        // write side (improve_harness registers an inverse per write) and
-        // the revert side (revert_effects rolls them back LIFO at runtime).
-        let effects = std::sync::Arc::new(crate::revertible::EffectTracker::new());
-        registry.register(Arc::new(evolve::ImproveHarnessTool {
-            harness_dir: harness_dir.clone(),
-            local_dir: local_harness_dir.map(Path::to_path_buf),
-            prompt_state: prompt_state.clone(),
-            hooks_dir: hooks_dir.map(Path::to_path_buf),
-            effects: Some(effects.clone()),
-        }));
-        // Runtime rollback of the above: undo the most recent improve_harness
-        // write(s) in-process, LIFO. The model gets a one-call "undo my last
-        // harness edit" without reaching for git or the on-disk archive.
-        registry.register(Arc::new(evolve::RevertEffectsTool { tracker: effects }));
-        // Persistent goals: the model declares long-running objectives;
-        // active goals are injected into the system context each turn.
-        // (The same `Arc` is handed to the agent loop, so tool writes
-        // are visible to the loop without a restart.)
-        let goals = goals.unwrap_or_else(|| Arc::new(RwLock::new(Vec::new())));
-        registry.register(Arc::new(goals_tool::ManageGoalsTool {
-            goals_dir: harness_dir.clone(),
-            goals: goals.clone(),
-        }));
-        // Version library: list & roll back model-written assets.
-        registry.register(Arc::new(versions::SkillHistoryTool {
-            harness_dir: harness_dir.clone(),
-            tools_dir: tools_dir.clone(),
-            hooks_dir: hooks_dir.map(Path::to_path_buf),
-        }));
-        registry.register(Arc::new(versions::SkillRollbackTool {
-            harness_dir: harness_dir.clone(),
-            tools_dir: tools_dir.clone(),
-            hooks_dir: hooks_dir.map(Path::to_path_buf),
-            register: Some(Box::new(move |name: &str, path: std::path::PathBuf| {
-                if let Ok(mut q) = hot_queue3.try_lock() {
-                    q.push(HotOp::register(name, path));
-                }
-            })),
-            prompt_state: prompt_state.clone(),
-        }));
-        registry.register(Arc::new(versions::VersionsGcTool {
-            harness_dir,
-            tools_dir: tools_dir.clone(),
-            hooks_dir: hooks_dir.map(Path::to_path_buf),
-        }));
-        // Cross-process ACP delegation: spawn an external ACP server.
-        registry.register(Arc::new(acp::AcpCallTool {
-            command: "sigil".to_string(),
-            args: vec!["acp".to_string()],
-        }));
+        // Evolution tools: bound to THIS registry's hot queue. The binder is
+        // kept so `clone_shallow` can re-bind the same set to a fresh queue.
+        let binder = Arc::new(Self::evolution_binder(
+            scripted_dir.map(Path::to_path_buf),
+            harness_dir.map(Path::to_path_buf),
+            prompt_state,
+            goals,
+            local_harness_dir.map(Path::to_path_buf),
+            hooks_dir.map(Path::to_path_buf),
+        ));
+        let start_queue = registry.hot_queue.clone();
+        binder(&mut registry, start_queue);
+        registry.rebind = Some(binder);
         if let Some(dir) = scripted_dir {
             registry.register_scripted(dir);
         }
@@ -468,6 +501,20 @@ impl ToolRegistry {
                 Err(e) => eprintln!("warning: skipping scripted tool {stem}: {e}"),
             }
         }
+    }
+
+    /// Test-only: push a hot op the way an evolution tool would.
+    #[cfg(test)]
+    pub(crate) fn queue_hot_for_test(&self, op: HotOp) {
+        if let Ok(mut q) = self.hot_queue.try_lock() {
+            q.push(op);
+        }
+    }
+
+    /// Advertised tool names, in registration order.
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.order.clone()
     }
 
     /// Hot-register tools queued by evolution tools. Called by the agent
@@ -752,6 +799,36 @@ pub fn error_output(msg: impl Into<String>) -> ToolOutput {
 mod registry_tests {
     use super::*;
     use crate::tools::bash::BashTool;
+
+    /// A session clone must not inherit another session's hot registrations.
+    /// Regression guard for the shared-`Arc` queue: before the re-bind,
+    /// whoever drained first consumed the op and the tool showed up in the
+    /// wrong session.
+    #[test]
+    fn a_shallow_clone_has_its_own_hot_queue() {
+        let dir = std::env::temp_dir().join(format!("sigil-hotq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lua = dir.join("other_session.lua");
+        std::fs::write(&lua, "return function(args) return \"hi\" end\n").unwrap();
+
+        let mut session_a = ToolRegistry::with_tools(None, None, None, None, None, None);
+        let mut session_b = session_a.clone_shallow();
+
+        // A's evolution tool queues a registration on A's own queue.
+        session_a.queue_hot_for_test(HotOp::register("other_session", lua.clone()));
+        session_b.drain_hot();
+        assert!(
+            !session_b.names().contains(&"other_session".to_string()),
+            "a clone must not register another session's queued tool"
+        );
+        session_a.drain_hot();
+        assert!(
+            session_a.names().contains(&"other_session".to_string()),
+            "the owning session must still hot-register its own tool"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn re_register_same_name_does_not_duplicate_order() {

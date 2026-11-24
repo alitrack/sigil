@@ -216,6 +216,14 @@ TASKS = [
         "name": "memory_remember_and_recall",
         "prompt": "先用 remember 记住事实：ratchet-memory-marker-77。然后立即用 recall 查看是否记住了。报告 recall 的输出。",
         "assert": ["ratchet-memory-marker-77"],
+        # Measured at ~2/3 pass on an identical prompt (2026-11-23): the model
+        # sometimes answers "已写入事实 `" and truncates the transcript instead
+        # of pasting the recall output, and occasionally emits the call as
+        # `<tool_call>` text rather than a native tool call. Neither is a sigil
+        # regression, so this task gets the same variance tolerance the `live`
+        # and `skilldeps` tasks already have.
+        "retries": 1,
+        "retry_prompt": "严格按两步执行，不要解释：第一步调用 remember 工具，参数 fact 为 ratchet-memory-marker-77；第二步调用 recall 工具，并把它返回的内容逐字粘贴到回复里（不要改写、不要总结、不要用其它工具）。",
         "special": "memory",
     },
     {

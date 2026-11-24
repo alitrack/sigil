@@ -661,14 +661,15 @@ impl Tool for DelegateTool {
                  (tasks: [{task, name?, subagent_type?, model?}, ...] — spawn the \
                  whole batch concurrently and block until every sub-agent \
                  finishes, returning aggregated results in one call; optional \
-                 'timeout' seconds, default 600), 'status' (id — running/completed/failed), 'result' \
+                 'timeout' seconds, default 600), 'status' (id — running/completed/failed \
+                 for one sub-agent; with no id, the whole delegation bill in token \
+                 usage with a grand total), 'result' \
                  (id — the sub-agent's final summary once completed), 'resume' \
                  (id + task — continue a finished/failed sub-agent with a new \
                  instruction: its original task and final report are fed back \
                  as context, and a fresh handle is returned), 'list' \
-                 (all sub-agents), 'delete' (id — remove a finished \
-                 sub-agent's record and free its handle), 'metrics' \
-                 (per-sub-agent token usage with a grand total). At most 5 sub-agents \
+                 (all sub-agents), 'delete' (id — remove a finished sub-agent's \
+                 record and free its handle). At most 5 sub-agents \
                  may run at once (a spawn or batch beyond the cap is rejected); \
                  sub-agent nesting is capped at depth 1 (a delegated sub-agent \
                  cannot delegate further). Use for parallel \
@@ -705,8 +706,8 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete"],
-                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; metrics: per-sub-agent token usage with a grand total; delete: remove a finished sub-agent's record"
+                    "enum": ["spawn", "delegate", "status", "result", "resume", "list", "delete"],
+                    "description": "spawn (default): start one sub-agent; delegate: spawn a batch of tasks concurrently and block until they finish (aggregated results); status: poll one; result: collect one's summary; resume: continue a finished/failed sub-agent with a new instruction (returns a fresh handle); list: enumerate all; delete: remove a finished sub-agent's record"
                 },
                 "task": {
                     "type": "string",
@@ -961,10 +962,40 @@ impl Tool for DelegateTool {
                 })
             }
             "status" => {
-                let id = args
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .context("delegate status requires 'id'")?;
+                // Without an id: the whole delegation bill (every sub-agent's
+                // token usage plus a grand total). This was its own `metrics`
+                // action until 2026-11-23 — one more enum member and schema
+                // branch for a view of the same state `status` already reads.
+                let Some(id) = args.get("id").and_then(Value::as_str) else {
+                    let states = self.delegates.snapshot().await;
+                    let with_usage: Vec<&DelegateState> =
+                        states.iter().filter(|s| s.tokens.is_some()).collect();
+                    if with_usage.is_empty() {
+                        return Ok(ToolOutput {
+                            text: "no sub-agent token usage recorded yet (delegates report usage once they finish)".to_string(),
+                        });
+                    }
+                    let mut total_prompt = 0u64;
+                    let mut total_completion = 0u64;
+                    let mut text =
+                        format!("delegate token usage ({} sub-agents):", with_usage.len());
+                    for st in with_usage {
+                        let t = st.tokens.unwrap();
+                        total_prompt += t.prompt_tokens;
+                        total_completion += t.completion_tokens;
+                        text.push_str(&format!(
+                            "\n- {id} {name}: {} prompt + {} completion",
+                            t.prompt_tokens,
+                            t.completion_tokens,
+                            id = st.id,
+                            name = st.name,
+                        ));
+                    }
+                    text.push_str(&format!(
+                        "\ntotal: {total_prompt} prompt + {total_completion} completion"
+                    ));
+                    return Ok(ToolOutput { text });
+                };
                 let states = self.delegates.snapshot().await;
                 let st = states
                     .iter()
@@ -1064,42 +1095,6 @@ impl Tool for DelegateTool {
                 }
                 Ok(ToolOutput { text })
             }
-            "metrics" => {
-                // OpenHands usage_to_metrics view, keyed per delegate
-                // id: one line per sub-agent with its own token usage,
-                // plus a grand total so the parent can see the whole
-                // delegation bill at a glance (each sub-agent's usage
-                // is recorded once, on completion — replace, never
-                // merged, so resumed handles don't double-count).
-                let states = self.delegates.snapshot().await;
-                let with_usage: Vec<&DelegateState> =
-                    states.iter().filter(|s| s.tokens.is_some()).collect();
-                if with_usage.is_empty() {
-                    return Ok(ToolOutput {
-                        text: "no sub-agent token usage recorded yet (delegates report usage once they finish)"
-                            .to_string(),
-                    });
-                }
-                let mut total_prompt = 0u64;
-                let mut total_completion = 0u64;
-                let mut text = format!("delegate token usage ({} sub-agents):", with_usage.len());
-                for st in with_usage {
-                    let t = st.tokens.unwrap();
-                    total_prompt += t.prompt_tokens;
-                    total_completion += t.completion_tokens;
-                    text.push_str(&format!(
-                        "\n- {id} {name}: {} prompt + {} completion",
-                        t.prompt_tokens,
-                        t.completion_tokens,
-                        id = st.id,
-                        name = st.name,
-                    ));
-                }
-                text.push_str(&format!(
-                    "\ntotal: {total_prompt} prompt + {total_completion} completion"
-                ));
-                Ok(ToolOutput { text })
-            }
             "delete" => {
                 let id = args
                     .get("id")
@@ -1111,7 +1106,7 @@ impl Tool for DelegateTool {
                 })
             }
             _ => anyhow::bail!(
-                "unknown action '{action}' (spawn|delegate|status|result|resume|list|metrics|delete)"
+                "unknown action '{action}' (spawn|delegate|status|result|resume|list|delete)"
             ),
         }
     }
@@ -1198,7 +1193,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "spawn", "delegate", "status", "result", "resume", "list", "metrics", "delete"
+                "spawn", "delegate", "status", "result", "resume", "list", "delete"
             ]
         );
     }
@@ -1736,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_aggregates_token_usage_per_subagent() {
+    async fn status_without_id_aggregates_token_usage_per_subagent() {
         let reg = Arc::new(DelegateRegistry::default());
         reg.insert(DelegateState {
             id: "d00001".into(),
@@ -1832,7 +1827,7 @@ mod tests {
             depth: 0,
             progress: None,
         };
-        let out = tool.run(&json!({"action": "metrics"})).await.unwrap();
+        let out = tool.run(&json!({"action": "status"})).await.unwrap();
         assert!(
             out.text.contains("delegate token usage (2 sub-agents)"),
             "only sub-agents with usage counted: {}",

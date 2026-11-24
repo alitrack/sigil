@@ -156,10 +156,12 @@ workspace (escalation fails closed without an approval channel), so
   `Approver` returns a **future** on purpose — a synchronous callback can only
   re-prompt a terminal, which is why only the REPL ever had one. Wiring the
   remaining channels is not done yet, and each needs its own plumbing:
-  the daemon's connection loop currently awaits the whole turn inline, so it
-  reads no client frames until the turn ends and an approval reply could not
-  arrive (it needs the turn in a spawned task plus a pending-approval map); an
-  ACP channel needs a `session/request_permission` round-trip.
+  **daemon: wired** (`daemon.rs`) — a reader task owns the socket lines so it
+  can resolve `{"type":"approval_reply","id":N,"allow":bool}` while the turn
+  runs inline; the turn itself stays in the loop, which is what keeps
+  `ToolRegistry` out of a lock. No reply within 300s, or a client that
+  disconnects, denies (fail closed).
+  **ACP: still missing** — needs a `session/request_permission` round-trip.
   Known limit: `safety::check` only pattern-matches `bash`; every other tool
   is `Allow`. The write-scope and freeze rules below are what bound them.
 - **One execution path**: every tool call goes through `agent::ToolGate`

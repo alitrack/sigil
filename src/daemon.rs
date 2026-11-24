@@ -365,6 +365,10 @@ async fn handle_connection(
                     break;
                 }
             }
+            // Client gone (or the loop is shutting down): drop every waiting
+            // sender so in-flight approvals resolve immediately as a denial
+            // instead of sitting until the timeout. Fail closed, fast.
+            reader_pending.lock().unwrap().clear();
         })
     };
 

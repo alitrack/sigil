@@ -295,18 +295,19 @@ echo "这个仓库里有哪些文件？" | ./target/release/sigil
 | `SIGIL_API_KEY` | `EMPTY` | API key（bearer token） |
 
 任意 OpenAI 兼容端点都可通过 `SIGIL_BASE_URL` 使用——vLLM、Ollama、
-llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
-`[agent]`、`[[mcp.servers]]`）；优先级 CLI > 环境变量 > 文件 > 默认值。
-另有 `--tools-dir`（Lua 工具，默认 `~/.sigil/tools/`）、`--harness-dir`
-（system prompt + skills，默认 `~/.sigil/harness/`）、`--memory`
-（remember/recall 存储，默认 `~/.sigil/memory.md`）。
+llama.cpp、DeepSeek 等。配置文件位于平台配置目录
+（Linux `~/.config/sigil/config.toml`、Windows `%APPDATA%\sigil\config.toml`；
+`[llm]`、`[agent]`、`[[mcp.servers]]`）；优先级 CLI > 环境变量 > 文件 > 默认值。
+另有 `--tools-dir`（Lua 工具，默认 `配置目录/sigil/tools/`）、`--harness-dir`
+（system prompt + skills，默认 `配置目录/sigil/harness/`）、`--memory`
+（remember/recall 存储，默认 `配置目录/sigil/memory.md`）。
 
 ## 能力
 
 - **原生工具调用** — 流式补全 + 非流式重放拿完整 tool-call 负载
   （OpenAI function-calling；兼容任意后端）。
 - **工具** — `bash`、`read_file`、`write_file`、`git_status/diff/log`，
-  加上 **Lua 脚本化工具**（`~/.sigil/tools/*.lua`，文件名 = 工具名，
+  加上 **Lua 脚本化工具**（`配置目录/sigil/tools/*.lua`，文件名 = 工具名，
   `-- desc:` / `-- schema:` 头部注释）。
 - **嵌入式 LuaJIT + FFI** — `mlua` + vendored LuaJIT。脚本可
   `require("ffi")` 调任意 C 库（zlib `crc32` 已端到端验证）。
@@ -319,7 +320,7 @@ llama.cpp、DeepSeek 等。配置文件 `~/.sigil/config.toml`（`[llm]`、
 - **Harness 自我改进** — `improve_harness`：模型可编辑自己的
   `system_prompt.md`（`edit_prompt`）和新增技能（`add_skill`）——
   指令层从内部进化，免重编译。
-- **Harness bundle** — `~/.sigil/harness/` 存放 `system_prompt.md` 和
+- **Harness bundle** — `配置目录/sigil/harness/` 存放 `system_prompt.md` 和
   `skills/`；改文件（不改代码）即可改变 agent 行为。
 - **Safety（三层）** — 审批门（破坏性命令非交互模式默认拒绝；REPL 里
   交互 `y/N`）、熔断器（连续失败 3 次熔断）、执行环（只读/工作区/

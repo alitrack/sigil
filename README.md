@@ -343,11 +343,12 @@ echo "what files are in this repo?" | ./target/release/sigil
 | `SIGIL_API_KEY` | `EMPTY` | API key (bearer token) |
 
 Any OpenAI-compatible endpoint works via `SIGIL_BASE_URL` — vLLM, Ollama,
-llama.cpp, DeepSeek, etc. Config file at `~/.sigil/config.toml`
-(`[llm]`, `[agent]`, `[[mcp.servers]]`); precedence is CLI > env > file >
-defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
-`--harness-dir` (system prompt + skills, default `~/.sigil/harness/`),
-`--memory` (remember/recall store, default `~/.sigil/memory.md`),
+llama.cpp, DeepSeek, etc. Config file at the platform config dir
+(`~/.config/sigil/config.toml` on Linux, `%APPDATA%\sigil\config.toml` on
+Windows; `[llm]`, `[agent]`, `[[mcp.servers]]`); precedence is CLI > env >
+file > defaults. `--tools-dir` (Lua tools, default `config dir/sigil/tools/`),
+`--harness-dir` (system prompt + skills, default `config dir/sigil/harness/`),
+`--memory` (remember/recall store, default `config dir/sigil/memory.md`),
 `--sessions-dir` (session transcripts, default `~/.sigil/sessions/`),
 `--resume <id>` (continue a session), `--list-sessions`.
 
@@ -357,7 +358,7 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
   full tool-call payloads (OpenAI function-calling; works against any
   compatible backend).
 - **Tools** — `bash`, `read_file`, `write_file`, `git_status/diff/log`,
-  plus **Lua scripted tools** (`~/.sigil/tools/*.lua`, filename = tool name,
+  plus **Lua scripted tools** (`config dir/sigil/tools/*.lua`, filename = tool name,
   `-- desc:` / `-- schema:` headers).
 - **Embedded LuaJIT + FFI** — `mlua` with vendored LuaJIT. Scripts can
   `require("ffi")` and call any C library (zlib `crc32` verified end to end).
@@ -372,7 +373,7 @@ defaults. `--tools-dir` (Lua tools, default `~/.sigil/tools/`),
 - **Harness self-improvement** — `improve_harness`: the model can edit its
   own `system_prompt.md` (`edit_prompt`) and add skills (`add_skill`) —
   the instruction layer evolves from within, recompile-free.
-- **Harness bundle** — `~/.sigil/harness/` holds `system_prompt.md` and
+- **Harness bundle** — `config dir/sigil/harness/` holds `system_prompt.md` and
   `skills/`; edit files (not code) to change agent behavior.
 - **Safety (3 layers)** — approval gate (destructive commands rejected in
   non-interactive mode; interactive `y/N` in the REPL), circuit breaker

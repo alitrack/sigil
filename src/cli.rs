@@ -25,11 +25,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 0, global = true)]
     pub max_steps: u32,
 
-    /// Config file (default: ~/.sigil/config.toml).
+    /// Config file (default: platform config dir —
+    /// ~/.config/sigil/config.toml on Linux, %APPDATA%\sigil\config.toml on Windows).
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Directory with Lua scripted tools (default: ~/.sigil/tools/).
+    /// Directory with Lua scripted tools (default: config dir/sigil/tools/).
     #[arg(long, global = true)]
     pub tools_dir: Option<String>,
 
@@ -40,7 +41,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub hooks_dir: Option<String>,
 
-    /// Harness bundle directory (system prompt + skills; default: ~/.sigil/harness/).
+    /// Harness bundle directory (system prompt + skills; default: config dir/sigil/harness/).
     #[arg(long, global = true)]
     pub harness_dir: Option<String>,
 
@@ -52,7 +53,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub local_harness_dir: Option<String>,
 
-    /// Memory file for remember/recall tools (default: ~/.sigil/memory.md).
+    /// Memory file for remember/recall tools (default: config dir/sigil/memory.md).
     #[arg(long, global = true)]
     pub memory: Option<String>,
 

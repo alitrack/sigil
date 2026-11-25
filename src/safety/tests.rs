@@ -222,7 +222,6 @@ fn git_aliases_and_unknown_helpers_require_approval() {
 
 fn root(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("sigil-write-scope-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
@@ -333,4 +332,35 @@ fn credential_shaped_env_names_are_refused() {
     for key in ["PATH", "HOME", "PWD", "LANG", "SIGIL_MODEL", "TERM"] {
         assert!(!is_credential_env(key), "{key} must stay readable");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Relative paths with no execution context (REPL / pipe mode): the process
+// cwd is the workspace root, so a relative path into it must be accepted
+// (and a `..` escape above it must still be refused). These read the
+// process cwd but never mutate it, so they are parallel-test safe.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_relative_new_file_inside_cwd_root_is_accepted() {
+    let cwd = std::env::current_dir().unwrap();
+    let ok = authorize_write_in(
+        std::path::Path::new("some-new-file.txt"),
+        std::slice::from_ref(&cwd),
+    )
+    .expect("a relative path into the cwd root must be accepted");
+    assert!(ok.is_absolute(), "{ok:?} must resolve to an absolute path");
+    assert!(ok.starts_with(&cwd), "{ok:?} must land under the cwd root");
+}
+
+#[test]
+fn write_relative_escape_above_cwd_root_is_refused() {
+    let cwd = std::env::current_dir().unwrap();
+    let err = authorize_write_in(
+        std::path::Path::new("../outside-escape.txt"),
+        std::slice::from_ref(&cwd),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("write refused"), "{err}");
 }

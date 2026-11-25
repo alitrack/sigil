@@ -44,9 +44,21 @@ pub fn with_sync_execution_context<T>(
 
 /// Resolve tool paths in the active turn while retaining injected providers.
 pub fn resolve_path(path: &Path) -> std::path::PathBuf {
-    match execution_context() {
+    let resolved = match execution_context() {
         Some(context) if path.is_relative() => context.cwd.join(path),
         _ => path.to_path_buf(),
+    };
+    // No execution context (REPL / pipe mode): anchor a surviving relative
+    // path to the process cwd — the same directory `safety::write_roots()`
+    // treats as the workspace. Without this a relative path can never match
+    // an absolute root, so `write_file` on a NEW file was always refused
+    // and models were pushed to write through `bash` instead.
+    if resolved.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&resolved))
+            .unwrap_or(resolved)
+    } else {
+        resolved
     }
 }
 
@@ -321,9 +333,22 @@ mod execution_context_tests {
             assert_eq!(result, ("origin".into(), cwd.join("file")));
         })
         .await;
+    }
+
+    #[test]
+    fn relative_path_anchors_to_process_cwd_without_context() {
+        // REPL / pipe mode: no ExecutionContext — a relative path must be
+        // anchored to the process cwd (the workspace root), not passed
+        // through raw. A raw relative path can never match an absolute
+        // write root, so writing a NEW file with a relative path was
+        // always refused.
+        assert!(execution_context().is_none());
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_path(Path::new("file"));
+        assert!(resolved.is_absolute(), "{resolved:?} must be absolute");
         assert!(
-            execution_context().is_none(),
-            "scope must not escape the turn"
+            resolved.starts_with(&cwd),
+            "{resolved:?} must anchor to the cwd"
         );
     }
 }

@@ -447,6 +447,12 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(session::default_sessions_dir);
+            // Absolute up front: prepare_pipe_turn may chdir to the
+            // session's project.
+            let sessions_dir = match std::fs::canonicalize(&sessions_dir) {
+                Ok(p) => p,
+                Err(_) => sessions_dir,
+            };
             // Pipe mode is stream-only: the answer reaches the user as `stream_cb`
             // prints each delta, and `RunResult::output` is never echoed at the
             // end. Any answer the loop synthesises *without* the model — the
@@ -546,6 +552,11 @@ fn prepare_pipe_turn(
         None if record => Some(session::start(sessions_dir)?),
         None => None,
     };
+    // Pipe mode is a dedicated process like the REPL: follow the
+    // session back to its project and re-record the effective cwd.
+    if let Some(id) = &id {
+        session::enter_session(sessions_dir, id)?;
+    }
     let mut messages = if let Some(id) = &id {
         session::repair_unpaired_tool_calls(sessions_dir, id)?;
         session::events_to_messages(&session::load_events(sessions_dir, id)?)

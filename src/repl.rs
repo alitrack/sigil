@@ -64,6 +64,15 @@ pub async fn run(
     let mut stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
+    // Resolve the sessions dir to an absolute path up front: entering a
+    // session may chdir back to its project, which would strand a
+    // relative --sessions-dir.
+    let sessions_dir_abs = match std::fs::canonicalize(sessions_dir) {
+        Ok(p) => p,
+        Err(_) => sessions_dir.to_path_buf(),
+    };
+    let sessions_dir = &sessions_dir_abs;
+
     // Session: resume an existing one or start fresh. `session_id`,
     // `history` and `hist_path` are mutable: `/session <id>` can switch
     // mid-REPL. `--resume latest` (and `/session latest`) resume the
@@ -76,6 +85,13 @@ pub async fn run(
         Some(id) => id.to_string(),
         None => crate::session::start(sessions_dir)?,
     };
+    // Return to the project this session was working in (its newest
+    // SessionStart event) and record the effective cwd. The REPL is a
+    // dedicated process, so the process chdir is safe; a failure must
+    // not kill the loop.
+    if let Err(e) = crate::session::enter_session(sessions_dir, &resume_id) {
+        eprintln!("  warning: could not restore session cwd: {e}");
+    }
     let mut session_id = resume_id;
     let mut history = crate::session::load(sessions_dir, &session_id)?;
 
@@ -182,6 +198,10 @@ pub async fn run(
                 match crate::session::load(sessions_dir, &target) {
                     Ok(turns) => {
                         session_id = target.to_string();
+                        // Follow the session to its project (and re-record it).
+                        if let Err(e) = crate::session::enter_session(sessions_dir, &session_id) {
+                            eprintln!("  warning: could not restore session cwd: {e}");
+                        }
                         if let Ok(mut g) = sid_shared.lock() {
                             *g = session_id.clone();
                         }

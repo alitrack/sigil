@@ -36,20 +36,41 @@ pub async fn run_with_timeout(
 
 pub struct BashTool {
     shell: crate::agent::provider::ArcShell,
+    description: String,
 }
 
 impl BashTool {
     pub fn new() -> Self {
         Self {
             shell: crate::agent::provider::default_shell(),
+            description: tool_description(),
         }
     }
 
     /// Phase B: 缝隙注入 —— 宿主可换沙箱/远程/审计 shell 实现。
     #[allow(dead_code)]
     pub fn with_shell(shell: crate::agent::provider::ArcShell) -> Self {
-        Self { shell }
+        Self {
+            shell,
+            description: tool_description(),
+        }
     }
+}
+
+/// Model-facing description, honest about the shell's platform. On
+/// Windows the child is a Linux bash (WSL interop or Git Bash): its
+/// working directory has a `/mnt/<drive>/...` form, so a path copied
+/// from bash output into read_file/write_file fails unless the model
+/// knows the mapping.
+fn tool_description() -> String {
+    let mut d = String::from(
+        "Run a shell command in the project directory and capture stdout/stderr.          Returns combined output. Commands are killed after 60s.          Prefer relative paths — they resolve against the session working directory.",
+    );
+    #[cfg(windows)]
+    d.push_str(
+        " Note: on Windows this runs in a Linux bash (WSL or Git Bash); the working          directory appears there in /mnt/<drive>/... form (e.g. D:\\proj → /mnt/d/proj).          Inside bash use that Linux form for absolute paths; read_file/write_file take          the Windows form of the same files.",
+    );
+    d
 }
 
 impl Default for BashTool {
@@ -65,7 +86,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the project directory and capture stdout/stderr. Returns combined output. Commands are killed after 60s."
+        &self.description
     }
 
     fn parameters(&self) -> Value {
@@ -158,5 +179,23 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none(), "slow command must be killed, got {out:?}");
+    }
+
+    #[test]
+    fn description_is_platform_honest() {
+        let tool = BashTool::new();
+        let d = tool.description();
+        assert!(d.contains("60s"), "{d}");
+        assert!(d.contains("relative paths"), "{d}");
+        #[cfg(windows)]
+        assert!(
+            d.contains("/mnt/"),
+            "Windows description must mention the Linux path view: {d}"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !d.contains("/mnt/"),
+            "non-Windows description has no WSL note: {d}"
+        );
     }
 }

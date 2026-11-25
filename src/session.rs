@@ -181,6 +181,16 @@ pub enum Event {
         #[serde(default)]
         detail: Option<String>,
     },
+    /// A session opens or is re-entered (start, `--resume`, mid-REPL
+    /// `/session` switch). Metadata: not projected into model turns.
+    /// `cwd` is the working directory at that moment; resuming a
+    /// session restores it so the session stays in its project.
+    SessionStart {
+        #[serde(default)]
+        ts: Option<String>,
+        #[serde(default)]
+        cwd: String,
+    },
 }
 
 impl Event {
@@ -203,6 +213,7 @@ impl Event {
             Event::Approval { .. } => "approval",
             Event::Policy { .. } => "policy",
             Event::Hook { .. } => "hook",
+            Event::SessionStart { .. } => "session_start",
         }
     }
 
@@ -223,7 +234,8 @@ impl Event {
             | Event::RequestContext { ts, .. }
             | Event::Approval { ts, .. }
             | Event::Policy { ts, .. }
-            | Event::Hook { ts, .. } => ts.as_deref(),
+            | Event::Hook { ts, .. }
+            | Event::SessionStart { ts, .. } => ts.as_deref(),
         }
     }
 
@@ -280,6 +292,12 @@ impl Event {
                 ..
             } => format!("policy: {name} [{level}] → {verdict}"),
             Event::Hook { name, outcome, .. } => format!("hook: {name} {outcome}"),
+            Event::SessionStart { cwd, .. } => {
+                format!(
+                    "session_start: cwd={}",
+                    if cwd.is_empty() { "(unrecorded)" } else { cwd }
+                )
+            }
         }
     }
 }
@@ -581,6 +599,10 @@ fn stamp_event(ev: &Event) -> Event {
             outcome: outcome.clone(),
             detail: detail.clone(),
         },
+        Event::SessionStart { cwd, .. } => Event::SessionStart {
+            ts: Some(ts),
+            cwd: cwd.clone(),
+        },
     }
 }
 
@@ -588,6 +610,38 @@ fn stamp_event(ev: &Event) -> Event {
 /// Legacy lines (no `e` tag) are parsed as turns and projected into
 /// events on the fly, so old session files keep working unchanged.
 /// Returns `(events, next_seq)`.
+/// Working directory recorded by the newest `SessionStart` event
+/// (no such event, or an empty `cwd` on a legacy line, is `None`).
+pub fn last_session_cwd(sessions_dir: &Path, id: &str) -> std::io::Result<Option<PathBuf>> {
+    let events = load_events(sessions_dir, id)?;
+    let cwd = events.iter().rev().find_map(|ev| match ev {
+        Event::SessionStart { cwd, .. } if !cwd.is_empty() => Some(cwd.clone()),
+        _ => None,
+    });
+    Ok(cwd.map(PathBuf::from))
+}
+
+/// Return to the session's recorded working directory (its newest
+/// `SessionStart` event) and record the effective cwd as a new
+/// `SessionStart` event.
+///
+/// REPL and pipe mode are dedicated processes (one conversation at a
+/// time), so a process-wide chdir is safe; the daemon hosts many
+/// sessions in one process and must not call this. If the recorded
+/// directory no longer exists (project deleted), the chdir is skipped
+/// and the current cwd is recorded instead — the session self-heals.
+pub fn enter_session(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
+    if let Some(dir) = last_session_cwd(sessions_dir, id)? {
+        if dir.exists() {
+            std::env::set_current_dir(&dir)?;
+        }
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    append_event(sessions_dir, id, &Event::SessionStart { ts: None, cwd })
+}
+
 pub fn load_events(sessions_dir: &Path, id: &str) -> std::io::Result<Vec<Event>> {
     let path = sessions_dir.join(format!("{id}.jsonl"));
     if !path.exists() {
@@ -1885,5 +1939,119 @@ mod tests {
             !h.summary().contains("bad lua"),
             "detail not leaked to summary"
         );
+    }
+
+    #[test]
+    fn session_start_records_cwd_and_last_wins() {
+        let dir = std::env::temp_dir().join(format!("sigil-session-cwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::User {
+                ts: None,
+                text: "hi".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::SessionStart {
+                ts: None,
+                cwd: "/proj/first".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::SessionStart {
+                ts: None,
+                cwd: "/proj/second".into(),
+            },
+        )
+        .unwrap();
+
+        // Newest SessionStart wins.
+        let cwd = last_session_cwd(&dir, &id).unwrap();
+        assert_eq!(cwd.as_deref(), Some(Path::new("/proj/second")));
+
+        // A session without SessionStart (legacy) has no recorded cwd.
+        let id2 = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id2,
+            &Event::User {
+                ts: None,
+                text: "old".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(last_session_cwd(&dir, &id2).unwrap(), None);
+
+        // Raw log keeps both events, all stamped.
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind() == "session_start")
+                .count(),
+            2
+        );
+        assert!(events.iter().all(|e| e.ts().is_some()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_start_never_reaches_model_context_or_turns() {
+        let dir =
+            std::env::temp_dir().join(format!("sigil-session-cwd-proj-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let id = start(&dir).unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::SessionStart {
+                ts: None,
+                cwd: "/proj".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::User {
+                ts: None,
+                text: "q".into(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &dir,
+            &id,
+            &Event::Assistant {
+                ts: None,
+                text: "a".into(),
+            },
+        )
+        .unwrap();
+
+        let events = load_events(&dir, &id).unwrap();
+        assert_eq!(events.len(), 3, "raw log keeps the event");
+
+        let turns = load(&dir, &id).unwrap();
+        assert_eq!(turns.len(), 2, "turn view drops session_start");
+
+        let msgs = events_to_messages(&events);
+        assert_eq!(msgs.len(), 2, "model context drops session_start");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

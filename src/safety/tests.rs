@@ -221,8 +221,7 @@ fn git_aliases_and_unknown_helpers_require_approval() {
 // ---------------------------------------------------------------------------
 
 fn root(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("sigil-write-scope-{tag}-{}", std::process::id()));
-    dir
+    std::env::temp_dir().join(format!("sigil-write-scope-{tag}-{}", std::process::id()))
 }
 
 #[test]

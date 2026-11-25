@@ -32,6 +32,7 @@ mod tests {
 
     /// crc32.lua needs the host's zlib (`ffi.load('z')`); hosts without
     /// it (stock Windows) skip the test instead of going red.
+    #[cfg(feature = "lua-ffi")]
     fn zlib_available() -> bool {
         let rt = lua_rt();
         let Ok(guard) = rt.try_lock() else {

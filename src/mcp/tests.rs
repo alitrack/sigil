@@ -222,6 +222,82 @@ mod mcp_tests {
             assert!(parse_sse_messages("event: message\nid: 1\n\n").is_empty());
         }
     }
+
+    /// The MCP child must see the public system-path vars (SystemRoot
+    /// et al.) that `connect` passes through on Windows — the WSAEDISTRO
+    /// (10106) fix — while NOT seeing a parent secret (env_clear policy).
+    /// Live spawn, not a unit stub: the bug this guards was a dropped
+    /// rebinding that unit reasoning could not catch.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn child_sees_systemroot_but_not_parent_secrets() {
+        let Some(py) = python_cmd() else {
+            eprintln!("skipping: no working python interpreter (set SIGIL_PYTHON)");
+            return;
+        };
+        let probe = r#"
+import json, os, sys
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method", "")
+    rid = msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "serverInfo": {"name": "envprobe", "version": "0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [{
+            "name": "env_probe", "description": "env probe",
+            "inputSchema": {"type": "object", "properties": {}}}]}})
+    elif method == "tools/call":
+        env = os.environ
+        text = "sysroot={0};secret={1}".format(
+            "present" if env.get("SystemRoot") else "absent",
+            "present" if env.get("SIGIL_MCP_TEST_SECRET") else "absent")
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "content": [{"type": "text", "text": text}]}})
+"#;
+        let dir = std::env::temp_dir().join(format!("sigil-mcp-envprobe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("envprobe.py");
+        std::fs::write(&server, probe).unwrap();
+
+        unsafe { std::env::set_var("SIGIL_MCP_TEST_SECRET", "not-a-real-secret") };
+        let (client, tools) =
+            McpClient::connect("envprobe", &py, &[server.to_string_lossy().into_owned()])
+                .await
+                .expect("connect to envprobe server");
+        let result = client.call_tool("env_probe", serde_json::json!({})).await;
+        unsafe { std::env::remove_var("SIGIL_MCP_TEST_SECRET") };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "env_probe");
+        let value = result.unwrap();
+        let text = value.as_str().expect("string tool result");
+        assert!(
+            text.contains("sysroot=present"),
+            "SystemRoot must reach the MCP child (WSAEDISTRO fix): {text}"
+        );
+        assert!(
+            text.contains("secret=absent"),
+            "parent secrets must NOT reach the MCP child: {text}"
+        );
+    }
 }
 
 #[tokio::test]

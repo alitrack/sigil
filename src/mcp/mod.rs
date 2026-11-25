@@ -200,19 +200,23 @@ impl McpClient {
         let child = child.args(args).env_clear();
         let child = child.env("PATH", std::env::var("PATH").unwrap_or_default());
         let child = child.env("HOME", std::env::var("HOME").unwrap_or_default());
+        // WSAEDISTRO (10106) — children doing Winsock I/O fail to init
+        // Winsock without SystemRoot (python3/node/curl); .NET hides the
+        // bug by resolving it separately, so only non-.NET MCP servers
+        // hit it. Pass public system-path vars (not secrets). The
+        // `#[cfg]` gates a `let` that CONTINUES the binding chain — not a
+        // nested block: a rebinding inside `{ }` dies with the block, and
+        // the chain below would silently resume from the pre-block binding,
+        // dropping all three vars (the pre-fix behavior, which also
+        // silently voided the WSAEDISTRO fix).
         #[cfg(windows)]
-        {
-            // WSAEDISTRO (10106) — children doing Winsock I/O fail to init
-            // Winsock without SystemRoot (python3/node/curl); .NET hides the
-            // bug by resolving it separately, so only non-.NET MCP servers
-            // hit it. Pass public system-path vars (not secrets).
-            let sysroot = std::env::var("SystemRoot").unwrap_or_default();
-            let windir = std::env::var("WINDIR").unwrap_or_default();
-            let temp = std::env::var("TEMP").unwrap_or_default();
-            let child = child.env("SystemRoot", sysroot);
-            let child = child.env("WINDIR", windir);
-            let child = child.env("TEMP", temp);
-        }
+        let child = child
+            .env(
+                "SystemRoot",
+                std::env::var("SystemRoot").unwrap_or_default(),
+            )
+            .env("WINDIR", std::env::var("WINDIR").unwrap_or_default())
+            .env("TEMP", std::env::var("TEMP").unwrap_or_default());
         let child = child
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -41,6 +41,7 @@ async fn probe_endpoint_errors_on_connection_refused() {
 }
 
 #[test]
+#[cfg(feature = "lua-ffi")]
 fn lua_check_proves_real_ffi_without_optional_libs() {
     // The doctor must not depend on optional system libraries (the old
     // probe needed zlib, absent on stock Windows): it calls a symbol

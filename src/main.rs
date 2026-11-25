@@ -2,6 +2,7 @@ mod acp;
 mod agent;
 mod cli;
 mod config;
+#[cfg(unix)]
 mod cron;
 #[cfg(unix)]
 mod daemon;

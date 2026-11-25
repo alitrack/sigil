@@ -541,7 +541,7 @@ fn wsl_form(p: &std::path::Path) -> Option<String> {
     if b.len() >= 3 && b[1] == b':' && b[2] == b'\\' {
         Some(format!(
             "/mnt/{}/{}",
-            (b[0] as char).to_ascii_lowercase().to_string(),
+            (b[0] as char).to_ascii_lowercase(),
             s[3..].replace('\\', "/")
         ))
     } else {

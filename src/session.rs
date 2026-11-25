@@ -325,6 +325,7 @@ pub fn start(sessions_dir: &Path) -> std::io::Result<String> {
 /// Start a session under an explicit id (daemon panes keep the name
 /// the client asked for — `sigil send --session foo` persists as
 /// `foo.jsonl`, not a generated timestamp).
+#[cfg(unix)]
 pub fn start_with_id(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
     fs::create_dir_all(sessions_dir)?;
     let path = sessions_dir.join(format!("{id}.jsonl"));

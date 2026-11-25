@@ -20,9 +20,52 @@ mod mcp_tests {
             .to_string()
     }
 
+    /// Absolute path to a working Python interpreter, or None to skip.
+    /// MCP servers are spawned with `env_clear()`, so a bare name (or a
+    /// WindowsApps Store alias) does not resolve in the child: walk PATH
+    /// for a real interpreter file and verify it runs. `SIGIL_PYTHON`
+    /// (absolute path) overrides the search.
+    fn python_cmd() -> Option<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(p) = std::env::var_os("SIGIL_PYTHON") {
+            candidates.push(p.to_string_lossy().into_owned());
+        }
+        for name in ["python3", "python"] {
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    if dir
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("windowsapps")
+                    {
+                        continue; // Store stubs die under env_clear
+                    }
+                    let mut cand = dir.join(name);
+                    if cfg!(windows) && cand.extension().is_none() {
+                        cand.set_extension("exe");
+                    }
+                    if cand.is_file() {
+                        candidates.push(cand.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        candidates.into_iter().find(|c| {
+            std::process::Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    }
+
     #[tokio::test]
     async fn connects_and_discovers_echo_tool() {
-        let (client, tools) = McpClient::connect("echo_test", "python3", &[server_path()])
+        let Some(py) = python_cmd() else {
+            eprintln!("skipping: no working python interpreter (set SIGIL_PYTHON)");
+            return;
+        };
+        let (client, tools) = McpClient::connect("echo_test", &py, &[server_path()])
             .await
             .expect("connect to echo server");
 
@@ -41,7 +84,11 @@ mod mcp_tests {
 
     #[tokio::test]
     async fn multiple_requests_route_correctly() {
-        let (client, _) = McpClient::connect("echo_test2", "python3", &[server_path()])
+        let Some(py) = python_cmd() else {
+            eprintln!("skipping: no working python interpreter (set SIGIL_PYTHON)");
+            return;
+        };
+        let (client, _) = McpClient::connect("echo_test2", &py, &[server_path()])
             .await
             .expect("connect");
 
@@ -65,7 +112,11 @@ mod mcp_tests {
 
     #[tokio::test]
     async fn lists_and_reads_resources() {
-        let (client, _) = McpClient::connect("echo_res", "python3", &[server_path()])
+        let Some(py) = python_cmd() else {
+            eprintln!("skipping: no working python interpreter (set SIGIL_PYTHON)");
+            return;
+        };
+        let (client, _) = McpClient::connect("echo_res", &py, &[server_path()])
             .await
             .expect("connect");
 
@@ -91,7 +142,11 @@ mod mcp_tests {
 
     #[tokio::test]
     async fn lists_and_gets_prompts() {
-        let (client, _) = McpClient::connect("echo_prompt", "python3", &[server_path()])
+        let Some(py) = python_cmd() else {
+            eprintln!("skipping: no working python interpreter (set SIGIL_PYTHON)");
+            return;
+        };
+        let (client, _) = McpClient::connect("echo_prompt", &py, &[server_path()])
             .await
             .expect("connect");
 

@@ -574,6 +574,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "lua-ffi")]
+    #[cfg(not(windows))]
     fn lua_ffi_calls_system_libc() {
         // Real FFI: call strlen from libc. Exercises cdef + ffi.load +
         // cdata conversion in one shot.
@@ -582,7 +583,7 @@ mod tests {
             .run(
                 r#"
 local ffi = require('ffi')
-ffi.cdef[[ int strlen(const char* s); ]]
+ffi.cdef[[ size_t strlen(const char* s); ]]
 local libc = ffi.load('c')
 return tostring(libc.strlen('hello'))
 "#,
@@ -592,12 +593,36 @@ return tostring(libc.strlen('hello'))
     }
 
     #[test]
+    #[cfg(feature = "lua-ffi")]
+    #[cfg(windows)]
+    fn lua_ffi_calls_system_c_library() {
+        // Real FFI on Windows: kernel32 is guaranteed to exist (libc is
+        // not, and msvcrt symbols are underscore-mangled). GetCurrent
+        // ProcessId returns this process' id — a verifiable anchor.
+        let rt = LuaRuntime::new().unwrap();
+        let out = rt
+            .run(
+                r#"
+local ffi = require('ffi')
+ffi.cdef[[ unsigned long GetCurrentProcessId(); ]]
+local k = ffi.load('kernel32')
+return string.format('%d', k.GetCurrentProcessId())
+"#,
+            )
+            .unwrap();
+        let pid: u32 = out.trim_matches('"').parse().unwrap();
+        assert_eq!(pid, std::process::id(), "FFI must run in this process");
+    }
+
+    #[test]
     fn host_helpers_available() {
         let rt = LuaRuntime::new().unwrap();
         // write + read round-trip through host helpers.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("sigil-host-helper-{}.txt", std::process::id()));
-        let p = path.to_string_lossy();
+        // Backslashes in a Windows path are invalid Lua string escapes
+        // ('\U' etc.) — double them before embedding in the literal.
+        let p = path.to_string_lossy().replace('\\', "\\\\");
         let out = rt
             .run(&format!(
                 "host.write_file('{p}', 'hello helper'); return host.read_file('{p}')"

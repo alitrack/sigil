@@ -312,23 +312,43 @@ async fn probe_endpoint(url: &str, api_key: &str) -> Result<Option<usize>> {
 }
 
 /// Check the embedded LuaJIT runtime and real FFI: boot a Lua state
-/// and run the crc32 FFI anchor (crc32("hello") == 0x3610a686).
-fn lua_check() -> Result<String> {
+/// and make a real call into a C library that exists on every platform
+/// sigil runs on — kernel32 on Windows (GetCurrentProcessId, verifiable
+/// against the OS process id), libc elsewhere (strlen). The old probe
+/// loaded zlib (`ffi.load('z')`), which is not installed on a stock
+/// Windows machine: doctor reported "FFI broken" on healthy installs.
+pub(crate) fn lua_check() -> Result<String> {
     let rt = crate::lua::LuaRuntime::new()?;
-    let out = rt.run(
-        "local ffi = require('ffi')
-         ffi.cdef[[unsigned long crc32(unsigned long, const unsigned char*, unsigned long);]]
-         local z = ffi.load('z')
-         local crc = z.crc32(0, 'hello', 5)
-         return string.format('crc32(hello)=%08x', crc)",
-    )?;
-    let trimmed = out.trim();
-    if trimmed.contains("3610a686") {
+    #[cfg(windows)]
+    let (out, ok) = {
+        let out = rt.run(
+            "local ffi = require('ffi')
+             ffi.cdef[[unsigned long GetCurrentProcessId();]]
+             local k = ffi.load('kernel32')
+             return string.format('pid=%d', k.GetCurrentProcessId())",
+        )?;
+        // rt.run returns the Lua string with its surrounding quotes.
+        let ok = out.trim() == format!("\"pid={}\"", std::process::id()).as_str();
+        (out, ok)
+    };
+    #[cfg(not(windows))]
+    let (out, ok) = {
+        let out = rt.run(
+            "local ffi = require('ffi')
+             ffi.cdef[[size_t strlen(const char* s);]]
+             local c = ffi.load('c')
+             return string.format('strlen=%d', c.strlen('hello'))",
+        )?;
+        let ok = out.trim() == "\"strlen=5\"";
+        (out, ok)
+    };
+    if ok {
         Ok(format!(
-            "vendored LuaJIT + FFI ok ({trimmed} — real zlib crc32 call)"
+            "vendored LuaJIT + FFI ok ({} — real C library call)",
+            out.trim()
         ))
     } else {
-        anyhow::bail!("FFI crc32 anchor mismatch: {trimmed}")
+        anyhow::bail!("FFI anchor mismatch: {}", out.trim())
     }
 }
 

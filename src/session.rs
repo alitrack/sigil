@@ -631,10 +631,10 @@ pub fn last_session_cwd(sessions_dir: &Path, id: &str) -> std::io::Result<Option
 /// directory no longer exists (project deleted), the chdir is skipped
 /// and the current cwd is recorded instead — the session self-heals.
 pub fn enter_session(sessions_dir: &Path, id: &str) -> std::io::Result<()> {
-    if let Some(dir) = last_session_cwd(sessions_dir, id)? {
-        if dir.exists() {
-            std::env::set_current_dir(&dir)?;
-        }
+    if let Some(dir) = last_session_cwd(sessions_dir, id)?
+        && dir.exists()
+    {
+        std::env::set_current_dir(&dir)?;
     }
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())

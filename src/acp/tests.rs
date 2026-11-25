@@ -34,6 +34,15 @@ fn make_fake_turn(store: TranscriptStore) -> Arc<TurnFn> {
     )
 }
 
+#[cfg(not(windows))]
+fn wsl_form_maybe(_p: &std::path::Path) -> Option<String> {
+    None
+}
+#[cfg(windows)]
+fn wsl_form_maybe(p: &std::path::Path) -> Option<String> {
+    wsl_form(p)
+}
+
 fn fake_state() -> AcpState {
     let mut s = AcpState::new();
     s.turn = Some(make_fake_turn(s.transcripts()));
@@ -106,7 +115,7 @@ mod acp_tests {
             &mut s,
             &json!({
                 "jsonrpc": "2.0", "id": 2, "method": "agent/session/new",
-                "params": { "cwd": "/tmp", "mcpServers": [] }
+                "params": { "cwd": std::env::temp_dir(), "mcpServers": [] }
             }),
         )
         .await
@@ -367,7 +376,7 @@ mod acp_tests {
             &mut s,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "agent/session/new",
-                "params": { "cwd": "/tmp", "mcpServers": [] }
+                "params": { "cwd": std::env::temp_dir(), "mcpServers": [] }
             }),
         )
         .await
@@ -522,6 +531,39 @@ mod acp_tests {
     }
 }
 
+/// Windows: the bash tool runs in WSL, which reports the same
+/// directory in /mnt/<drive>/... form (C:\\proj -> /mnt/c/proj). The
+/// session-cwd assertion must accept that translated form.
+#[cfg(windows)]
+fn wsl_form(p: &std::path::Path) -> Option<String> {
+    let s = p.to_string_lossy().into_owned();
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[1] == b':' && b[2] == b'\\' {
+        Some(format!(
+            "/mnt/{}/{}",
+            (b[0] as char).to_ascii_lowercase().to_string(),
+            s[3..].replace('\\', "/")
+        ))
+    } else {
+        None
+    }
+}
+
+/// Windows: an exited child process may still hold its working
+/// directory briefly; retry the removal instead of panicking (Linux
+/// never hits this, one attempt is enough there but retry is harmless).
+fn remove_dir_all_retry(dir: &std::path::Path) {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(_) if attempt < 10 => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => panic!("remove_dir_all({dir:?}) failed after {attempt} attempts: {e}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn regression_prompt_uses_session_cwd() {
     use crate::tools::Tool;
@@ -562,14 +604,21 @@ async fn regression_prompt_uses_session_cwd() {
     .unwrap();
     let (_, _, done) = deferred(out.into_iter().next().unwrap());
     let (text, _) = done.await.unwrap().unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    remove_dir_all_retry(&dir);
     assert!(
         text.contains("session contents"),
         "relative file escaped session cwd: {text}"
     );
+    // On Windows the WSL bash reports the session dir in /mnt/<drive>
+    // form; on other platforms it reports the native path.
+    let wsl = wsl_form_maybe(&dir);
+    let shell_in_session_cwd = text.contains(dir.to_str().unwrap())
+        || wsl.as_ref().is_some_and(|w| text.contains(w.as_str()));
     assert!(
-        text.contains(dir.to_str().unwrap()),
-        "shell escaped session cwd: {text}"
+        shell_in_session_cwd,
+        "shell escaped session cwd (dir={}, wsl={:?}): {text}",
+        dir.to_str().unwrap(),
+        wsl
     );
     assert_eq!(std::env::current_dir().unwrap(), original_cwd);
 }

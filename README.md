@@ -341,6 +341,8 @@ echo "what files are in this repo?" | ./target/release/sigil
 | `SIGIL_MODEL` | `deepseek-v4-flash` | Model name |
 | `SIGIL_BASE_URL` | `http://127.0.0.1:15722/v1` | OpenAI-compatible endpoint (cc-switch local proxy) |
 | `SIGIL_API_KEY` | `EMPTY` | API key (bearer token) |
+| `SIGIL_BASH_TIMEOUT_SECS` | `60` | Wall-clock budget (seconds) per `bash` command; the process is killed when exceeded |
+| `SIGIL_NO_PROGRESS` | `2` | No-progress guard: stop and wrap up after N consecutive stalled rounds (`0` disables) |
 
 Any OpenAI-compatible endpoint works via `SIGIL_BASE_URL` — vLLM, Ollama,
 llama.cpp, DeepSeek, etc. Config file at the platform config dir

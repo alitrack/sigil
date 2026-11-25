@@ -293,6 +293,8 @@ echo "这个仓库里有哪些文件？" | ./target/release/sigil
 | `SIGIL_MODEL` | `deepseek-v4-flash` | 模型名 |
 | `SIGIL_BASE_URL` | `http://127.0.0.1:15722/v1` | OpenAI 兼容端点（cc-switch 本地代理） |
 | `SIGIL_API_KEY` | `EMPTY` | API key（bearer token） |
+| `SIGIL_BASH_TIMEOUT_SECS` | `60` | 单条 `bash` 命令的墙钟预算（秒）；超时后进程被杀 |
+| `SIGIL_NO_PROGRESS` | `2` | 无进展守卫：连续 N 轮无进展后收尾停止（`0` 关闭） |
 
 任意 OpenAI 兼容端点都可通过 `SIGIL_BASE_URL` 使用——vLLM、Ollama、
 llama.cpp、DeepSeek 等。配置文件位于平台配置目录

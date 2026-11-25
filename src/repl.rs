@@ -269,11 +269,16 @@ pub async fn run(
         // the accumulated conversation (multi-turn context).
         messages = crate::agent::messages_for_turn(&messages, config.system_prompt_for(line));
         messages.push(crate::llm::ChatMessage::user(line));
-        let stream_cb = |delta: Option<&str>| {
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_for_cb = streamed.clone();
+        let stream_cb = move |delta: Option<&str>| {
             match delta {
                 Some(d) => {
                     print!("{d}");
                     let _ = std::io::stdout().flush();
+                    if let Ok(mut acc) = streamed_for_cb.lock() {
+                        acc.push_str(d);
+                    }
                 }
                 None => {
                     // Tool call interrupted the text stream.
@@ -313,6 +318,15 @@ pub async fn run(
         // (assistant turn is logged by the loop's session sink — repl wired
         //  it above; run_messages emits Assistant/TurnEnd on every success
         //  exit. Appending here too would double-log the answer.)
+        // A floor answer (first-frame draft / "no usable answer" verdict) is
+        // never streamed, so the turn would otherwise end in a blank line.
+        let streamed = streamed.lock().map(|s| s.clone()).unwrap_or_default();
+        if let Some(answer) = crate::agent::unstreamed_answer(&streamed, &result.output) {
+            if !streamed.is_empty() && !streamed.ends_with('\n') {
+                println!();
+            }
+            println!("{answer}");
+        }
         println!();
         let _ = stdout.flush();
     }

@@ -294,6 +294,53 @@ async fn cache_diagnostics_never_generate_an_extra_completion() {
     assert!(output.tokens.is_none());
 }
 
+/// A model that answers with nothing visible (the Qwen3.8 "empty content,
+/// finish_reason=stop" shape) must not produce a blank successful run: the
+/// answer is what every caller prints, so `""` is indistinguishable from a run
+/// that said nothing.
+#[tokio::test]
+async fn an_empty_answer_run_never_returns_empty_output() {
+    #[derive(Debug)]
+    struct EmptyAnswerProvider;
+    #[async_trait]
+    impl LlmProvider for EmptyAnswerProvider {
+        fn name(&self) -> &str {
+            "empty-answer"
+        }
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<crate::llm::provider::ChatStream> {
+            Ok(Box::new(futures_util::stream::iter(vec![Ok(
+                crate::llm::provider::ChatChunk {
+                    delta: String::new(),
+                    thinking: false,
+                    done: true,
+                    tool_calls_requested: false,
+                    streamed_tool_calls: vec![],
+                    usage: None,
+                },
+            )])))
+        }
+        async fn chat_complete(&self, _req: ChatRequest) -> Result<ChatComplete> {
+            panic!("an empty final answer must not trigger a second completion");
+        }
+    }
+    let result = run_messages(
+        &EmptyAnswerProvider,
+        &mut ToolRegistry::new(),
+        &test_config(),
+        &[ChatMessage::system("base"), ChatMessage::user("task")],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.state, RunState::Success);
+    assert!(
+        !result.output.trim().is_empty(),
+        "an empty run must return a verdict, got {result:?}"
+    );
+    assert_eq!(result.output, EMPTY_ANSWER);
+}
+
 #[test]
 fn compaction_preserves_multiline_user_constraints_and_previous_summary() {
     let msgs = |n| {

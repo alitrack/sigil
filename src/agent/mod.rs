@@ -39,6 +39,27 @@ mod scheduler_tests;
 #[cfg(test)]
 mod tests;
 
+/// Returned as the answer when the model produced no visible content and the
+/// run has no draft to fall back on. Never empty on purpose: every caller
+/// streams or prints `RunResult::output`, so `""` reads as a successful run
+/// that silently said nothing (and an exit-0 blank transcript).
+const EMPTY_ANSWER: &str =
+    "run ended — the model produced no visible answer (empty content, no tool calls)";
+
+/// What a streaming caller still has to print: streaming UIs (pipe mode,
+/// REPL) print deltas as they arrive and never echo `RunResult::output`, so an
+/// answer the loop synthesised without the model (first-frame draft, the
+/// "no usable answer" verdict, `EMPTY_ANSWER`) would never reach the user — a
+/// blank turn. Returns `None` when the stream already carried the answer.
+pub fn unstreamed_answer<'a>(streamed: &str, output: &'a str) -> Option<&'a str> {
+    let answer = output.trim();
+    if answer.is_empty() || streamed.contains(answer) {
+        None
+    } else {
+        Some(answer)
+    }
+}
+
 /// Agent loop configuration.
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -1024,13 +1045,24 @@ pub async fn run_messages(
         }
         // Scheduler ①: still empty after the nudge — a reasoning-only model
         // must not turn into a silent empty success. The pre-loop draft is the
-        // floor this run was promised.
-        if text.trim().is_empty()
-            && let Some(draft) = fallback_draft.as_ref()
-            && !draft.trim().is_empty()
-        {
-            eprintln!("[scheduler] empty answer — falling back to the first-frame draft");
-            text = draft.clone();
+        // floor this run was promised; when there is no draft either, return an
+        // explicit verdict: callers print or stream the answer, so returning ""
+        // reads downstream as a successful run that said nothing at all.
+        if text.trim().is_empty() {
+            let usable_draft = fallback_draft
+                .as_ref()
+                .filter(|d| !d.trim().is_empty())
+                .cloned();
+            match usable_draft {
+                Some(draft) => {
+                    eprintln!("[scheduler] empty answer — falling back to the first-frame draft");
+                    text = draft;
+                }
+                None => {
+                    eprintln!("[scheduler] empty answer — the model produced no content");
+                    text = EMPTY_ANSWER.to_string();
+                }
+            }
         }
         // P0 hook (emit observation): an `on_done` listener may react to
         // the finished turn (log, metrics, notify). Purely observational —

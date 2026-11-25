@@ -447,11 +447,21 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(session::default_sessions_dir);
-            // Pipe mode with live streaming to stdout.
-            let stream_cb = |delta: Option<&str>| {
+            // Pipe mode is stream-only: the answer reaches the user as `stream_cb`
+            // prints each delta, and `RunResult::output` is never echoed at the
+            // end. Any answer the loop synthesises *without* the model — the
+            // first-frame draft, or the "no usable answer" verdict — is therefore
+            // never streamed, and the caller sees a blank success (exit 0, empty
+            // stdout). Accumulate what was streamed so we can tell the two apart.
+            let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let streamed_for_cb = streamed.clone();
+            let stream_cb = move |delta: Option<&str>| {
                 if let Some(d) = delta {
                     print!("{d}");
                     let _ = std::io::stdout().flush();
+                    if let Ok(mut acc) = streamed_for_cb.lock() {
+                        acc.push_str(d);
+                    }
                 }
             };
             // `--resume <id>` (or `latest`) continues an existing
@@ -483,7 +493,18 @@ async fn main() -> Result<()> {
             )
             .await
             .context("agent turn failed")?;
-            println!();
+            // Print the answer only if the stream did not already carry it.
+            let streamed = streamed.lock().map(|s| s.clone()).unwrap_or_default();
+            match agent::unstreamed_answer(&streamed, &result.output) {
+                Some(answer) => {
+                    // Separate the floor text from any partial streamed output.
+                    if !streamed.is_empty() && !streamed.ends_with('\n') {
+                        println!();
+                    }
+                    println!("{answer}");
+                }
+                None => println!(),
+            }
             // Machine-readable per-run stats on stderr (benchmark drivers
             // capture stderr; humans never see it in streaming mode).
             if let Some(u) = &result.tokens {
@@ -601,6 +622,41 @@ fn plan_cli(action: &PlanAction) -> Result<()> {
 #[cfg(test)]
 mod pipe_tests {
     use super::*;
+
+    #[test]
+    fn a_non_streamed_floor_answer_is_printed() {
+        // The model answered empty, so the loop handed back its own verdict.
+        // Nothing was streamed: pipe mode must print that text, not a blank line.
+        let verdict = "run ended (StepLimitReached) — the model produced no usable answer";
+        assert_eq!(agent::unstreamed_answer("", verdict), Some(verdict));
+    }
+
+    #[test]
+    fn an_answer_the_stream_already_carried_is_not_printed_twice() {
+        assert_eq!(agent::unstreamed_answer("正常", "正常"), None);
+        // Trailing whitespace differs between the stream and the result.
+        assert_eq!(agent::unstreamed_answer("正常\n", "正常"), None);
+        // A draft that was streamed first, then returned as the answer.
+        assert_eq!(
+            agent::unstreamed_answer("part one part two", "part one part two"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_prints_nothing() {
+        assert_eq!(agent::unstreamed_answer("", ""), None);
+        assert_eq!(agent::unstreamed_answer("streamed", "   "), None);
+    }
+
+    #[test]
+    fn a_floor_answer_that_replaces_partial_stream_is_printed() {
+        // The stream carried a draft that the loop then discarded.
+        assert!(
+            agent::unstreamed_answer("draft text", "run ended (NoProgress) — wrap-up unavailable")
+                .is_some()
+        );
+    }
 
     #[test]
     fn recorded_pipe_turns_resume_without_losing_new_history() {

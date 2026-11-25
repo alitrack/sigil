@@ -12,9 +12,13 @@
 //!    the run keeps paying for it. Detect the repetition, tell the model once,
 //!    then stop and ask for a wrap-up.
 //!
-//! Both are opt-in through the environment rather than `config.toml` / CLI: a
-//! scheduler experiment should not permanently enlarge the configuration
-//! surface (see `review-multidomain-263bd58.md` §3).
+//! The no-progress guard is **on by default** (limit 2); the environment
+//! variable remains the switch so experiments and benchmarks can tune or
+//! disable it (`SIGIL_NO_PROGRESS=0`). The first-frame floor stays opt-in
+//! (`SIGIL_FIRST_FRAME=1`) — it costs one extra model call per run and is a
+//! weak-model hedge, not a default. Kept in the environment rather than
+//! `config.toml` / CLI so the configuration surface stays small (see
+//! `review-multidomain-263bd58.md` §3).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -44,8 +48,11 @@ pub fn first_frame_enabled() -> bool {
     std::env::var_os("SIGIL_FIRST_FRAME").is_some_and(|v| v == "1")
 }
 
-/// Stop after this many consecutive identical tool rounds (`SIGIL_NO_PROGRESS`,
-/// 0 = off). Two is a sensible value: one repeat is often a legitimate retry.
+/// Stop after this many consecutive identical tool rounds.
+///
+/// On by default (limit 2): one repeat is often a legitimate retry, two
+/// earns a nudge, a third identical round ends the run with a wrap-up.
+/// `SIGIL_NO_PROGRESS` overrides; `0` disables the guard.
 pub fn no_progress_limit() -> u32 {
     #[cfg(test)]
     if let Some(v) = TEST_LIMITS.with(|c| c.borrow().1) {
@@ -53,8 +60,12 @@ pub fn no_progress_limit() -> u32 {
     }
     std::env::var_os("SIGIL_NO_PROGRESS")
         .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<u32>().ok()))
-        .unwrap_or(0)
+        .unwrap_or(DEFAULT_NO_PROGRESS_LIMIT)
 }
+
+/// Default no-progress limit: nudge on the 2nd consecutive identical tool
+/// round, wrap up on the 3rd.
+pub const DEFAULT_NO_PROGRESS_LIMIT: u32 = 2;
 
 /// Stable signature of one executed tool round: the ordered `(name, ok,
 /// output)` triples. Two rounds with the same signature achieved the same
@@ -136,6 +147,17 @@ mod tests {
         let a = vec![receipt("a", true, "1"), receipt("b", true, "2")];
         let b = vec![receipt("b", true, "2"), receipt("a", true, "1")];
         assert_ne!(progress_signature(&a), progress_signature(&b));
+    }
+
+    #[test]
+    fn no_progress_is_on_by_default() {
+        // Guarded: a host that exports SIGIL_NO_PROGRESS would shadow the
+        // default; the test must not mutate process env (parallel tests).
+        if std::env::var_os("SIGIL_NO_PROGRESS").is_some() {
+            eprintln!("skipping: SIGIL_NO_PROGRESS is set in this environment");
+            return;
+        }
+        assert_eq!(no_progress_limit(), DEFAULT_NO_PROGRESS_LIMIT);
     }
 
     #[test]

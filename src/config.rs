@@ -16,7 +16,7 @@
 //! ]
 //!
 //! [agent]
-//! max_steps = 10
+//! max_steps = 10            # default: 100 (graceful wrap-up when hit)
 //! max_context_messages = 0 # no message-count trigger
 //! max_context_tokens = 48000 # estimated input threshold; 0 disables
 //! system_prompt = "..."   # optional override
@@ -27,6 +27,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::Deserialize;
+
+/// Default step budget per turn when the config does not set one. 100
+/// tool rounds is far beyond any real task (typical runs: 3-50); the
+/// cap exists to bound pathological loops (the no-progress guard already
+/// catches exact repeats, but an A/B-alternating loop would not). Hitting
+/// it is not an error: the loop makes one final tool-less call for a
+/// wrap-up summary and tags the run `StepLimitReached`.
+pub const DEFAULT_MAX_STEPS: u32 = 100;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -162,7 +170,7 @@ impl Config {
             .ok()
             .or(file_cfg.agent.system_prompt)
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-        let max_steps = file_cfg.agent.max_steps.unwrap_or(0);
+        let max_steps = file_cfg.agent.max_steps.unwrap_or(DEFAULT_MAX_STEPS);
         let mcp_servers = file_cfg.mcp.servers;
         // Fallback endpoints: env overrides file (comma-separated list
         // of base_urls; api_key shared with the primary unless the file
@@ -242,6 +250,19 @@ you have finished the task.";
 #[cfg(test)]
 mod context_tests {
     use super::*;
+    #[test]
+    fn max_steps_defaults_to_a_finite_budget() {
+        let path =
+            std::env::temp_dir().join(format!("sigil-maxsteps-config-{}.toml", std::process::id()));
+        std::fs::write(&path, "[agent]\n").unwrap();
+        let config = Config::load(path.to_str()).unwrap();
+        assert_eq!(config.max_steps, DEFAULT_MAX_STEPS);
+        std::fs::write(&path, "[agent]\nmax_steps = 7\n").unwrap();
+        let config = Config::load(path.to_str()).unwrap();
+        assert_eq!(config.max_steps, 7, "explicit config still wins");
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn context_policy_defaults_to_tokens_and_accepts_explicit_count_limit() {
         let path = std::env::temp_dir().join(format!(

@@ -325,8 +325,9 @@ pub enum RunState {
     /// `max_steps` was exhausted; the loop asked the model for a
     /// wrap-up summary instead of aborting mid-work.
     StepLimitReached,
-    /// Consecutive tool rounds produced identical results (`SIGIL_NO_PROGRESS`):
-    /// the loop stopped repeating them and asked for a wrap-up instead.
+    /// Consecutive tool rounds produced identical results (no-progress
+    /// guard, default limit 2, `SIGIL_NO_PROGRESS=0` disables it): the
+    /// loop stopped repeating them and asked for a wrap-up instead.
     NoProgress,
 }
 

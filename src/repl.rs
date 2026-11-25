@@ -334,6 +334,14 @@ pub async fn run(
             );
             eprintln!("\n{msg}");
         }
+        // Per-turn cost line on stderr: the transcript stays clean, and
+        // pipe mode prints its own [stats] line.
+        if let Some(u) = &result.tokens {
+            eprintln!(
+                "  [{:?}] steps={} prompt_tokens={} completion_tokens={}",
+                result.state, result.steps, u.prompt_tokens, u.completion_tokens
+            );
+        }
         messages = result.messages;
         // (assistant turn is logged by the loop's session sink — repl wired
         //  it above; run_messages emits Assistant/TurnEnd on every success

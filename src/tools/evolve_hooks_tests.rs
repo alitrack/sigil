@@ -233,6 +233,7 @@ async fn self_evolution_loop_hook_goes_live_same_session() {
     ));
     let config = crate::agent::AgentConfig {
         model: "test".into(),
+        reasoning_effort: None,
         max_steps: 8,
         prompt_state: prompt_state.clone(),
         max_inline_skills: 0,

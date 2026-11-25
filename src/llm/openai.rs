@@ -400,6 +400,9 @@ fn build_body(req: &ChatRequest) -> Value {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    if let Some(e) = &req.reasoning_effort {
+        body["reasoning_effort"] = json!(e);
+    }
     body
 }
 
@@ -993,6 +996,7 @@ mod tests {
     fn chat_request() -> ChatRequest {
         ChatRequest {
             model: "test".into(),
+            reasoning_effort: None,
             messages: vec![ChatMessage::user("hi")],
             tools: vec![],
             stream: false,
@@ -1239,6 +1243,7 @@ mod tests {
     fn streaming_requests_ask_for_usage() {
         let body = build_body(&ChatRequest {
             model: "m".into(),
+            reasoning_effort: None,
             messages: vec![ChatMessage::user("task")],
             tools: vec![],
             stream: true,
@@ -1320,6 +1325,7 @@ mod tests {
         // [system, system(summary), assistant(tool_calls), tool, ...].
         let req = ChatRequest {
             model: "test".into(),
+            reasoning_effort: None,
             messages: vec![
                 ChatMessage::system("sys"),
                 ChatMessage::system("[earlier conversation compressed]"),
@@ -1348,6 +1354,7 @@ mod tests {
     fn build_body_leaves_user_messages_untouched() {
         let req = ChatRequest {
             model: "test".into(),
+            reasoning_effort: None,
             messages: vec![ChatMessage::system("sys"), ChatMessage::user("do it")],
             tools: vec![],
             stream: false,
@@ -1359,6 +1366,26 @@ mod tests {
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"], "do it");
+    }
+
+    #[test]
+    fn build_body_forwards_reasoning_effort() {
+        // Qwen3.8's chat_template defaults `reasoning_effort` to `xhigh`, so a
+        // client that stays silent pays the most expensive tier on every call.
+        // The field must reach the wire verbatim, and must stay absent when
+        // unset (so providers that reject unknown keys keep working).
+        let mut req = ChatRequest {
+            model: "test".into(),
+            reasoning_effort: Some("medium".into()),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            stream: false,
+            temperature: None,
+        };
+        assert_eq!(build_body(&req)["reasoning_effort"], "medium");
+
+        req.reasoning_effort = None;
+        assert!(build_body(&req).get("reasoning_effort").is_none());
     }
 
     #[tokio::test]

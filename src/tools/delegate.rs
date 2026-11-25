@@ -1093,6 +1093,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -1478,6 +1479,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -1583,6 +1585,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -1700,6 +1703,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -1791,6 +1795,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -1996,6 +2001,7 @@ mod tests {
             registry: ToolRegistry::with_tools(None, None, None, None, None, None),
             config: AgentConfig {
                 model: "test".into(),
+                reasoning_effort: None,
                 max_steps: 3,
                 prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                     crate::harness::PromptState {
@@ -2128,6 +2134,7 @@ mod tests {
                 ToolRegistry::with_tools(None, None, None, None, None, None),
                 AgentConfig {
                     model: "test".into(),
+                    reasoning_effort: None,
                     max_steps: 3,
                     prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                         crate::harness::PromptState {
@@ -2173,6 +2180,7 @@ mod tests {
         };
         let config = AgentConfig {
             model: "test".into(),
+            reasoning_effort: None,
             max_steps: 3,
             prompt_state: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::harness::PromptState {

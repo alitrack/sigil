@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
     // on the very next turn.
     let agent_config = agent::AgentConfig {
         model: config.model.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
         max_steps: config.max_steps,
         prompt_state: prompt_state.clone(),
         // Agent-loop Lua hooks (P-A thin-core roadmap).

@@ -422,6 +422,7 @@ async fn appended_tool_output_is_budgeted_after_reported_usage() {
 pub(crate) fn test_config() -> AgentConfig {
     AgentConfig {
         model: "m".into(),
+        reasoning_effort: None,
         max_steps: 0,
         prompt_state: std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
             system_prompt: "base".into(),
@@ -452,6 +453,7 @@ async fn reactive_compaction_retries_after_context_error() {
     let mut tools = crate::tools::ToolRegistry::new();
     let config = AgentConfig {
         model: "m".into(),
+        reasoning_effort: None,
         max_steps: 0,
         prompt_state: std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
             system_prompt: "base".into(),
@@ -554,6 +556,7 @@ async fn planning_interval_injects_checkpoints() {
     tools.register(Arc::new(FastTool(Arc::new(Mutex::new(Vec::new())))));
     let config = AgentConfig {
         model: "m".into(),
+        reasoning_effort: None,
         max_steps: 0,
         prompt_state: std::sync::Arc::new(std::sync::RwLock::new(crate::harness::PromptState {
             system_prompt: "base".into(),

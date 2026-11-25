@@ -177,6 +177,7 @@ fn agent_config_inlines_relevant_skills_per_prompt() {
 
     let cfg = AgentConfig {
         model: "m".into(),
+        reasoning_effort: None,
         max_steps: 0,
         prompt_state: std::sync::Arc::new(std::sync::RwLock::new(PromptState {
             system_prompt: "base".into(),

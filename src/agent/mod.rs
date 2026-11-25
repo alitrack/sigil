@@ -43,6 +43,11 @@ mod tests;
 #[derive(Clone)]
 pub struct AgentConfig {
     pub model: String,
+    /// Forwarded to the provider as `reasoning_effort` on every request.
+    /// `None` leaves the provider default in place — for Qwen3.8 that is the
+    /// `xhigh` tier (its chat_template ships `|default('xhigh')`), which costs
+    /// ~2.4x the output tokens of `medium` for the same answer.
+    pub reasoning_effort: Option<String>,
     /// 0 = no step limit (a turn runs until the model stops calling tools).
     pub max_steps: u32,
     /// Live prompt state (system prompt + skills). Shared with the
@@ -643,6 +648,7 @@ pub async fn run_messages(
             tools: specs.clone(),
             stream: true,
             temperature: None,
+            reasoning_effort: config.reasoning_effort.clone(),
         };
 
         // Reactive compaction (borrowed from OpenHands' condenser):
@@ -683,6 +689,7 @@ pub async fn run_messages(
                         tools: specs.clone(),
                         stream: true,
                         temperature: None,
+                        reasoning_effort: config.reasoning_effort.clone(),
                     };
                     provider
                         .chat_stream(req.clone())
@@ -1098,6 +1105,7 @@ async fn tool_less_call(
         tools: vec![],
         stream: true,
         temperature: None,
+        reasoning_effort: config.reasoning_effort.clone(),
     };
     let mut stream = provider.chat_stream(req).await.context("tool-less call")?;
     let mut text = String::new();

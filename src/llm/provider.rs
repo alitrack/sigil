@@ -125,6 +125,11 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub stream: bool,
     pub temperature: Option<f32>,
+    /// `reasoning_effort` forwarded verbatim to the provider (e.g. `low`,
+    /// `medium`, `xhigh`). Models with a chat-template default (Qwen3.8 ships
+    /// `|default('xhigh')`) otherwise run the most expensive tier on every
+    /// request — measured 2.4x output tokens vs `medium` on the same prompt.
+    pub reasoning_effort: Option<String>,
 }
 
 /// One streaming chunk from the provider.

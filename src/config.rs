@@ -42,6 +42,9 @@ struct LlmConfig {
     model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
+    /// Forwarded as `reasoning_effort` on every request (e.g. `medium`).
+    /// Omitted = provider default, which for Qwen3.8 is the `xhigh` tier.
+    reasoning_effort: Option<String>,
     /// Fallback endpoints (base_url + api_key) tried in order after the
     /// primary on transient failures.
     fallbacks: Vec<FallbackConfig>,
@@ -98,6 +101,8 @@ pub struct Config {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+    /// `reasoning_effort` sent with every request; `None` = provider default.
+    pub reasoning_effort: Option<String>,
     /// System prompt override — superseded by the harness bundle
     /// (kept for future CLI/config precedence).
     #[allow(dead_code)]
@@ -148,6 +153,11 @@ impl Config {
             .ok()
             .or(file_cfg.llm.api_key.clone())
             .unwrap_or_else(|| "EMPTY".to_string());
+        let reasoning_effort = env::var("SIGIL_REASONING_EFFORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| file_cfg.llm.reasoning_effort.clone())
+            .map(|s| s.trim().to_string());
         let system_prompt = env::var("SIGIL_SYSTEM_PROMPT")
             .ok()
             .or(file_cfg.agent.system_prompt)
@@ -178,6 +188,7 @@ impl Config {
             model,
             base_url,
             api_key,
+            reasoning_effort,
             system_prompt,
             max_steps,
             max_context_messages: file_cfg.agent.max_context_messages.unwrap_or(0),

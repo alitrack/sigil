@@ -551,8 +551,38 @@ MCP tool list.
 Full per-phase history: [CHANGELOG.md](CHANGELOG.md) (entries are frozen history — not rewritten when behavior evolves).
 
 <details>
-<summary><strong>Release notes</strong> — v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
+<summary><strong>Release notes</strong> — v0.3.0 (2026-11-26) · v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
 
+### v0.3.0 — 2026-11-26
+Default loop guardrails, reliability & safety hardening, daemon
+approvals, cost visibility — plus the subtraction the 2026-11-23
+multi-domain review asked for. Highlights (116 commits since v0.2.0):
+
+- **Loop guardrails, on by default**: no-progress detection (the loop
+  stops re-burning tokens when the model stops making progress), a
+  finite step budget with a graceful wrap-up, per-turn cost lines in
+  the REPL, and a per-run [stats] line on stderr in one-shot mode so
+  cost-per-task is measurable.
+- **Sessions**: the working directory is recorded at session start and
+  restored on --resume, so resuming returns you to the project.
+- **Safety hardening**: one freeze chokepoint (SIGIL_FREEZE) checked by
+  every write surface; write_file confined to the workspace / temp /
+  state roots; model-directed reads of credential stores and
+  secret-named env vars refused; relative tool paths anchored to the
+  process cwd (no more path escapes via a moved cwd).
+- **Daemon approvals**: human approval round-trips over the daemon
+  socket (300 s no-reply = deny, fail closed); a disconnected client
+  denies pending approvals immediately.
+- **Context**: deep-cut compaction skips the rewrite when the history
+  already fits — compaction no longer costs more than it saves.
+- **Tools**: bash wall-clock budget configurable via SIGIL_BASH_TIMEOUT_SECS.
+- **Windows**: MCP child env passthrough repaired (SystemRoot etc.
+  actually reach the child now), test suite green on Windows, clippy
+  -D warnings on the CI Windows job.
+- **Subtraction**: EDG bypass path removed, ACP client / acp_call
+  removed, delegate message bus dropped, plan DSL frozen behind a
+  non-default feature (parked, still compiling and tested).
+- 376 unit & integration tests.
 ### v0.2.0 — 2026-08-13
 Delegation & sub-agents, daemon + cron, robustness, and the thin-core
 roadmap (Lua policy layer). Highlights:

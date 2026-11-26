@@ -485,8 +485,32 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 完整的逐阶段历史见 [CHANGELOG_cn.md](CHANGELOG_cn.md)（条目为冻结历史——行为演进不改写）。
 
 <details>
-<summary><strong>发布说明</strong> — v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
+<summary><strong>发布说明</strong> — v0.3.0 (2026-11-26) · v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
 
+### v0.3.0 — 2026-11-26
+默认循环护栏、可靠性与安全加固、daemon 人工审批、成本可见性——
+外加 2026-11-23 多领域评审要求的减法。要点（v0.2.0 之后共 116 个提交）：
+
+- **循环护栏（默认开启）**：无进展检测（模型停止推进时停止空烧
+  token）、有限步数预算 + 优雅收尾、REPL 每轮成本行、一次性模式
+  stderr 输出 [stats] 行——单任务成本可度量。
+- **会话**：记录启动时工作目录，--resume 恢复时回到项目目录。
+- **安全加固**：单一冻结闸（SIGIL_FREEZE）覆盖全部写表面；write_file
+  限定在工作区/临时目录/状态目录；拒绝模型主导读取凭据存储与
+  秘密命名的环境变量；相对工具路径锚定到进程 cwd（不再能通过
+  漂移的 cwd 逃逸）。
+- **daemon 审批**：人工审批走 daemon socket 往返（300 秒无应答 =
+  拒绝，fail closed）；客户端断开立即拒绝待决审批。
+- **上下文**：深度压缩在历史本就放得下时跳过改写——压缩不再
+  得不偿失。
+- **工具**：bash 墙钟预算可用 SIGIL_BASH_TIMEOUT_SECS 配置。
+- **Windows**：修复 MCP 子进程 env 透传（SystemRoot 等真正到达
+  子进程）、测试套件 Windows 全绿、CI Windows job 加 clippy -D
+  warnings。
+- **减法**：移除 EDG 旁路路径、移除 ACP 客户端 / acp_call、delegate
+  消息总线下线、plan DSL 冻结在非默认 feature（停泊中，仍可编译
+  与测试）。
+- 376 个单元与集成测试。
 ### v0.2.0 — 2026-08-13
 委托与子代理、daemon + cron、健壮性、以及薄化路线（Lua 策略层）。要点：
 

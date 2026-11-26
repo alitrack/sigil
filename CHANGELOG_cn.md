@@ -2,6 +2,16 @@
 
 逐阶段工程日志，2026-11-26 从 README 移出，让 README 聚焦当前行为。条目为冻结历史：行为演进不改写。
 
+## v0.3.0 — 2026-11-26（tag）
+自 v0.2.0 后 116 个提交切版：默认循环护栏（无进展停止、有限步数
+预算、每轮成本行）、resume 恢复工作目录、安全加固（单一
+SIGIL_FREEZE 闸、写范围策略、凭据读 denylist、cwd 锚定相对
+路径）、daemon socket 审批（fail closed）、深度压缩、bash 超时可
+配置、MCP Windows env 透传修复，以及减法轮（移除 EDG 旁路、移除
+ACP 客户端、delegate 消息总线下线、plan DSL 冻结在非默认
+feature）。376 测试。
+
+
 ### Phase 48 — 2026-08-10（外部调研落地：smolagents + OpenHands）
 四项调研机制落地：
 - **并行工具执行**（OpenHands ParallelToolExecutor）：模型一次返回

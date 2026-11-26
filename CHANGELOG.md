@@ -2,6 +2,17 @@
 
 Per-phase engineering log, moved out of the README on 2026-11-26 to keep the README focused on current behavior. Entries are frozen history: they are not rewritten when current behavior changes.
 
+## v0.3.0 — 2026-11-26 (tag)
+Release cut from 116 commits after v0.2.0: default loop guardrails (no-progress
+stop, finite step budget, per-turn cost lines), resume restores the working
+directory, safety hardening (single SIGIL_FREEZE chokepoint, write-scope
+policy, credential-read denylist, cwd-anchored relative paths), daemon
+approvals over the socket (fail closed), deep-cut compaction, configurable
+bash timeout, MCP Windows env passthrough fix, and the subtraction round
+(EDG bypass removed, ACP client removed, delegate message bus dropped,
+plan DSL frozen behind a non-default feature). 376 tests.
+
+
 ### Phase 48 — 2026-08-10 (external research landing: smolagents + OpenHands)
 Four mechanisms borrowed from the research round landed:
 - **Parallel tool execution** (OpenHands' ParallelToolExecutor): when

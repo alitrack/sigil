@@ -414,7 +414,10 @@ file > defaults. `--tools-dir` (Lua tools, default `config dir/sigil/tools/`),
 - **Streaming output** — assistant text streams live in pipe and REPL modes
   (`[using tools…]` marks tool calls mid-stream).
 - **Resumable sessions** — every REPL turn is recorded to
-  `~/.sigil/sessions/<id>.jsonl`; `--resume <id>` continues a conversation.
+  `~/.sigil/sessions/<id>.jsonl`; `--resume <id>` continues the
+  conversation and restores the session's original working directory
+  (recorded at session start), so relative paths resolve the same way
+  as before even when you resume from a different folder.
 - **Sub-agents** — `delegate` tool: the main agent spins off an independent
   sub-agent (own conversation, own tool loop) and gets back a summary.
 - **Ratchet tests** — `test-tools/ratchet.py` runs a fixed task battery
@@ -434,7 +437,11 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
 - **`llm::LlmProvider`** — the provider contract; every backend implements
   it, so the agent loop stays provider-agnostic.
 - **`agent::run_turn(_with_approver)`** — the loop: stream → replay for tool
-  calls → approve → execute → repeat until the model stops (or `max_steps`).
+  calls → approve → execute → repeat until the model stops. Guarded by
+  default: a no-progress guard stops exact-repeat rounds (disable with
+  `SIGIL_NO_PROGRESS=0`), and a step budget (`max_steps`, default 100)
+  ends the turn with one final tool-less wrap-up call instead of a hard
+  cut.
 - **`tools::ToolRegistry`** — one lookup for all tools; specs are refreshed
   every turn so hot-registered tools appear to the model immediately.
 - **`lua::LuaRuntime`** — vendored LuaJIT with `ffi` enabled; `host`

@@ -355,7 +355,8 @@ llama.cpp、DeepSeek 等。配置文件位于平台配置目录
 - **流式输出** — 管道与 REPL 模式实时流式显示 assistant 文本
   （`[using tools…]` 标记工具调用中断）。
 - **可续会话** — REPL 每轮记录到 `~/.sigil/sessions/<id>.jsonl`；
-  `--resume <id>` 继续对话。
+  `--resume <id>` 继续对话，并恢复到会话开始时的原始工作目录
+  （会话开始时记录），即使从别的目录续接，相对路径解析方式也不变。
 - **子代理** — `delegate` 工具：主 agent 派发独立子代理（独立对话、
   独立工具循环），收回摘要。
 - **Ratchet 测试** — `test-tools/ratchet.py` 用真实二进制 + 真实 LLM
@@ -375,7 +376,9 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 - **`llm::LlmProvider`** — provider 契约；所有后端实现它，agent 循环与
   provider 无关。
 - **`agent::run_turn(_with_approver)`** — 循环：流式 → 重放拿工具调用 →
-  审批 → 执行 → 重复直到模型停止（或 `max_steps`）。
+  审批 → 执行 → 重复直到模型停止。默认带护栏：无进展守卫停止
+  精确重复轮次（`SIGIL_NO_PROGRESS=0` 关闭）；步数预算（`max_steps`，
+  默认 100）用尽时以一次无工具收尾调用结束，而非硬截断。
 - **`tools::ToolRegistry`** — 所有工具统一 lookup；每轮刷新 specs，
   热注册的新工具立刻对模型可见。
 - **`lua::LuaRuntime`** — vendored LuaJIT 开启 `ffi`；`host` 辅助表

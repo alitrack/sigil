@@ -219,7 +219,8 @@ workspace (escalation fails closed without an approval channel), so
   no `<br/>`, no `#` in node text, no emoji).
 - License: MIT (Copyright alitrack).
 - Commit style: conventional commits (`feat:`, `fix:`, `docs:`, `refactor:`).
-- Version bumps: README top + README changelog + Cargo.toml version, one
-  commit, then tag `vX.Y.Z` for the release workflow.
+- Version bumps: README top + README release notes + CHANGELOG.md/CHANGELOG_cn.md
+  phase entries + Cargo.toml version, one commit, then tag `vX.Y.Z` for
+  the release workflow.
 - Git push to GitHub requires the proxy:
   `https_proxy=http://172.19.112.1:7897 timeout 150 git push origin main`.

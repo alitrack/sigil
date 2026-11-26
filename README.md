@@ -25,77 +25,9 @@ binary** as the evolution engine: the model can write its own Lua tools at
 runtime, hot-register them, and grow the agent's capabilities from within —
 no recompile needed.
 
-### Context budgeting and cache diagnostics
+<details>
+<summary><strong>DREAM exploration and replay</strong> — bounded self-generated task loops; policy preview / collect / compare (preview makes no model calls)</summary>
 
-Skill relevance selects which bodies are inlined; score ties and the final selected set use name ordering. Changes in relevance scores alone therefore do not reorder an unchanged set of skill bodies. Skill membership, content edits, and dynamic hook output can still change the prompt.
-
-When rebuilding a system prompt from an event-sourced history, skill relevance and `on_prompt_build` use the latest user message. A resumed pipe turn can therefore select skills for its current task instead of the first task in the session.
-
-Active-goal prompts show the objective and static turn budget. The changing turns-used counter stays in persistent state and `manage_goals` output, so accounting alone does not rewrite the prompt prefix. Goal additions, completion, pauses, and budget changes still refresh the context.
-
-The default compaction trigger is an estimated 48,000 input-prompt tokens, with no message-count trigger. Configure it for your model under `[agent]`:
-
-```toml
-[agent]
-max_context_tokens = 48000
-max_context_messages = 0
-planning_interval = 0       # restate the plan every N steps (0 = off)
-```
-
-Each zero disables that trigger; setting both to zero disables proactive compaction. The estimate includes message framing and tool schemas. Real usage calibrates the current request rather than reusing a previous absolute token count, so new tool outputs and history shrinkage are reflected. Cold estimates allow roughly two tokens per non-ASCII character and one per four ASCII characters; this is a heuristic, not a model tokenizer. The threshold is not a hard request-size limit: pinned instructions, summary overhead, and an indivisible current tool turn can exceed it. Configure it below your model context window to reserve output capacity. Provider context errors still allow one reactive compaction retry.
-
-Compaction pins leading system instructions and live goal blocks outside the historical summary, uses bounded multiline excerpts, carries previous summary content forward, and preserves tool-call/result pairing. It remains lossy: excerpts retain at most 2,000 user characters, 1,000 assistant characters, 500 tool characters, or 8,000 previous-summary characters; the combined summary is capped at 16,000 characters plus a truncation notice. Consult the original session log when details are omitted. It does not generate an LLM summary request.
-
-`SIGIL_DEBUG_CACHE=1` observes actual stream, tool replay, and final-summary requests without sending diagnostic completions. Streaming requests ask for usage; a usage-only trailer after `finish_reason` is read for at most 250 ms (32 frames). Missing usage/cache fields remain unavailable rather than becoming a reported zero hit rate. Session event sinks record `request_usage` metadata, including the request kind, model, and observed usage. Aggregate cache metrics retain the number of prompt tokens with reported cache coverage; old logs without this field remain readable but have unknown coverage. Multiple usage snapshots within one request are counted once, using the latest observed snapshot even if the bounded trailer read times out. Token-only compaction retains the original history when its summary would not reduce the input estimate. This is token telemetry, not a complete bill: unreported usage, cache-write rates, provider-internal retries, and pricing are not inferred. Compression can invalidate the changed prefix and increase first-request cost; fewer tokens alone do not demonstrate savings. Compare successful-task cost and quality on your actual provider.
-
-
-Record pipe turns for subsequent comparison:
-
-```bash
-sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
-sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
-```
-
-Explicit `--sessions-dir` records pipe history and request usage; `--resume` appends new events to the resumed session. Ordinary pipe runs without either option remain ephemeral. The session ID is printed on stderr; pipe IDs must be plain filenames. Session logs contain conversation and tool content, so keep evaluation artifacts in an appropriate local directory.
-
-Report explicit session logs offline (Python standard library only):
-
-```bash
-python3 test-tools/usage_report.py path/to/session.jsonl
-python3 test-tools/usage_report.py --json path/to/session.jsonl
-```
-
-Run a paired synthetic task-state retention experiment (Python 3.11+):
-
-```bash
-python3 test-tools/context_eval.py
-python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
-```
-
-The first command only prints a plan. The second uses an already configured `SIGIL_API_KEY`; generated configuration and summary reports do not contain credentials. The output directory must be new. Both policies receive identical seeded histories; one disables proactive compaction and the other defaults to an 8,000-token trigger (`--threshold` overrides it). Two repetitions alternate policy order. `report.json` includes exact-answer success, request counts, observed tokens, cache coverage, per-policy totals, and the binary SHA-256. Failed attempts remain in the denominator, and interrupted/invalid observations keep accounting incomplete. The default fixture measures one key-retention task, not general coding quality. Provider cache state is uncontrolled, and these runs do not establish cold-cache/warm-cache cost or monetary savings. Three tool steps and `--timeout` bound execution, not token billing; the model's output limit remains provider-controlled. Sessions contain synthetic histories plus actual model/tool output; keep them local. Compare provider bills separately before drawing cost conclusions.
-
-`write_file` accepts text strings verbatim for any target. For `.json` targets (case-insensitive), it also accepts JSON objects or arrays and serializes them as formatted JSON. Structured content for other file types, null, and numeric/boolean values are rejected before any filesystem mutation.
-
-Use `--case json-edit` for a file-edit fixture instead of exact-answer retention:
-
-```bash
-python3 test-tools/context_eval.py --case json-edit --execute --repetitions 1 --output ./context-json-run --model MODEL --base-url http://127.0.0.1:3001/v1
-```
-
-This case requires the model to read and modify `settings.json` according to earlier instructions. Success requires correct field values/types, unchanged unrelated nested/Unicode fields, an unchanged protected file, successful process exit, and a recorded `read_file` before `write_file`. Other tools, other paths, or unexpected workspace changes fail the case; evaluator session logs and runtime goal accounting are excluded from the workspace check. JSON parsing is bounded and rejects duplicate keys, symlinks and non-regular files. Generated code is never executed by the checker. This adds a small tool-use/artifact check, not a representative coding benchmark. A single repetition does not balance policy order or establish quality/cost non-inferiority.
-
-Analyze an existing paired report without any model calls:
-
-```bash
-python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repeat.json
-```
-
-Without prices, this prints the observed token difference and a symbolic charge relation. Monetary fields remain null. To estimate, supply all of `--uncached-input-rate`, `--cached-input-rate`, `--output-rate` (currency units per million tokens), and `--currency`. Rates must match the actual billed model/route; the tool never looks them up. They must be finite and nonnegative (at most 1e12, 28 decimal digits, exponents -36 to 12). Incomplete usage or unknown cache splits prevent a full estimate; identical cached/uncached rates are the exception because the split then does not affect cost. Failed attempts remain in spend, and cost per success is null at zero successes. Duplicate/unpaired records, mismatched fixture versions and mixed-model flat pricing are rejected. Estimates exclude unreported requests, cache-write fees and other invoice charges. A cache-loss regression demonstrates that fewer input tokens can cost more under explicitly hypothetical prices; this is not a current provider quote.
-
-The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
-
-
-## DREAM exploration and replay
 
 `test-tools/dream.py` provides an opt-in discovery → historical replay → policy
 selection → next-round deployment loop around the unchanged sigil binary.
@@ -136,7 +68,11 @@ online worlds cannot share a selection pool. Run deterministic tests with
 `SIGIL_DREAM_E2E=1` for the actual-binary local fake-provider test. This fixture
 validates orchestration, not general coding improvements or the paper's benchmarks.
 
-## Evidence: the harness really does evolve
+</details>
+
+<details>
+<summary><strong>Evidence: the harness really does evolve</strong> — 8-epoch reproducible benchmark: evolving group ramps 1/3 -> 3/3, frozen control 0/16, capability surface 7 -> 39 assets</summary>
+
 
 The core thesis — *an agent that modifies its own harness gets stronger over
 time* — is not a roadmap item. It was tested with a reproducible benchmark
@@ -315,6 +251,8 @@ versioned rollback, refinement gate, revertible effects — already exist).
 > inlining, TUI colors, `/tools` search, and a diagnostic `doctor`
 > subcommand — all end to end.
 
+</details>
+
 ## Quick start
 
 ```bash
@@ -448,7 +386,81 @@ stdin / REPL / ACP ──► agent loop ──► LlmProvider (OpenAI-compatible
   helper table (`read_file` / `write_file` / `env`) is the script↔host
   boundary.
 
-## Using sigil with Claude Desktop (MCP)
+<details>
+<summary><strong>Context budgeting and cache diagnostics</strong> — compaction triggers & heuristics, prompt prefix stability rules, evaluation-session recording, SIGIL_DEBUG_CACHE token telemetry</summary>
+
+
+Skill relevance selects which bodies are inlined; score ties and the final selected set use name ordering. Changes in relevance scores alone therefore do not reorder an unchanged set of skill bodies. Skill membership, content edits, and dynamic hook output can still change the prompt.
+
+When rebuilding a system prompt from an event-sourced history, skill relevance and `on_prompt_build` use the latest user message. A resumed pipe turn can therefore select skills for its current task instead of the first task in the session.
+
+Active-goal prompts show the objective and static turn budget. The changing turns-used counter stays in persistent state and `manage_goals` output, so accounting alone does not rewrite the prompt prefix. Goal additions, completion, pauses, and budget changes still refresh the context.
+
+The default compaction trigger is an estimated 48,000 input-prompt tokens, with no message-count trigger. Configure it for your model under `[agent]`:
+
+```toml
+[agent]
+max_context_tokens = 48000
+max_context_messages = 0
+planning_interval = 0       # restate the plan every N steps (0 = off)
+```
+
+Each zero disables that trigger; setting both to zero disables proactive compaction. The estimate includes message framing and tool schemas. Real usage calibrates the current request rather than reusing a previous absolute token count, so new tool outputs and history shrinkage are reflected. Cold estimates allow roughly two tokens per non-ASCII character and one per four ASCII characters; this is a heuristic, not a model tokenizer. The threshold is not a hard request-size limit: pinned instructions, summary overhead, and an indivisible current tool turn can exceed it. Configure it below your model context window to reserve output capacity. Provider context errors still allow one reactive compaction retry.
+
+Compaction pins leading system instructions and live goal blocks outside the historical summary, uses bounded multiline excerpts, carries previous summary content forward, and preserves tool-call/result pairing. It remains lossy: excerpts retain at most 2,000 user characters, 1,000 assistant characters, 500 tool characters, or 8,000 previous-summary characters; the combined summary is capped at 16,000 characters plus a truncation notice. Consult the original session log when details are omitted. It does not generate an LLM summary request.
+
+`SIGIL_DEBUG_CACHE=1` observes actual stream, tool replay, and final-summary requests without sending diagnostic completions. Streaming requests ask for usage; a usage-only trailer after `finish_reason` is read for at most 250 ms (32 frames). Missing usage/cache fields remain unavailable rather than becoming a reported zero hit rate. Session event sinks record `request_usage` metadata, including the request kind, model, and observed usage. Aggregate cache metrics retain the number of prompt tokens with reported cache coverage; old logs without this field remain readable but have unknown coverage. Multiple usage snapshots within one request are counted once, using the latest observed snapshot even if the bounded trailer read times out. Token-only compaction retains the original history when its summary would not reduce the input estimate. This is token telemetry, not a complete bill: unreported usage, cache-write rates, provider-internal retries, and pricing are not inferred. Compression can invalidate the changed prefix and increase first-request cost; fewer tokens alone do not demonstrate savings. Compare successful-task cost and quality on your actual provider.
+
+
+Record pipe turns for subsequent comparison:
+
+```bash
+sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
+sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
+```
+
+Explicit `--sessions-dir` records pipe history and request usage; `--resume` appends new events to the resumed session. Ordinary pipe runs without either option remain ephemeral. The session ID is printed on stderr; pipe IDs must be plain filenames. Session logs contain conversation and tool content, so keep evaluation artifacts in an appropriate local directory.
+
+Report explicit session logs offline (Python standard library only):
+
+```bash
+python3 test-tools/usage_report.py path/to/session.jsonl
+python3 test-tools/usage_report.py --json path/to/session.jsonl
+```
+
+Run a paired synthetic task-state retention experiment (Python 3.11+):
+
+```bash
+python3 test-tools/context_eval.py
+python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+The first command only prints a plan. The second uses an already configured `SIGIL_API_KEY`; generated configuration and summary reports do not contain credentials. The output directory must be new. Both policies receive identical seeded histories; one disables proactive compaction and the other defaults to an 8,000-token trigger (`--threshold` overrides it). Two repetitions alternate policy order. `report.json` includes exact-answer success, request counts, observed tokens, cache coverage, per-policy totals, and the binary SHA-256. Failed attempts remain in the denominator, and interrupted/invalid observations keep accounting incomplete. The default fixture measures one key-retention task, not general coding quality. Provider cache state is uncontrolled, and these runs do not establish cold-cache/warm-cache cost or monetary savings. Three tool steps and `--timeout` bound execution, not token billing; the model's output limit remains provider-controlled. Sessions contain synthetic histories plus actual model/tool output; keep them local. Compare provider bills separately before drawing cost conclusions.
+
+`write_file` accepts text strings verbatim for any target. For `.json` targets (case-insensitive), it also accepts JSON objects or arrays and serializes them as formatted JSON. Structured content for other file types, null, and numeric/boolean values are rejected before any filesystem mutation.
+
+Use `--case json-edit` for a file-edit fixture instead of exact-answer retention:
+
+```bash
+python3 test-tools/context_eval.py --case json-edit --execute --repetitions 1 --output ./context-json-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+This case requires the model to read and modify `settings.json` according to earlier instructions. Success requires correct field values/types, unchanged unrelated nested/Unicode fields, an unchanged protected file, successful process exit, and a recorded `read_file` before `write_file`. Other tools, other paths, or unexpected workspace changes fail the case; evaluator session logs and runtime goal accounting are excluded from the workspace check. JSON parsing is bounded and rejects duplicate keys, symlinks and non-regular files. Generated code is never executed by the checker. This adds a small tool-use/artifact check, not a representative coding benchmark. A single repetition does not balance policy order or establish quality/cost non-inferiority.
+
+Analyze an existing paired report without any model calls:
+
+```bash
+python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repeat.json
+```
+
+Without prices, this prints the observed token difference and a symbolic charge relation. Monetary fields remain null. To estimate, supply all of `--uncached-input-rate`, `--cached-input-rate`, `--output-rate` (currency units per million tokens), and `--currency`. Rates must match the actual billed model/route; the tool never looks them up. They must be finite and nonnegative (at most 1e12, 28 decimal digits, exponents -36 to 12). Incomplete usage or unknown cache splits prevent a full estimate; identical cached/uncached rates are the exception because the split then does not affect cost. Failed attempts remain in spend, and cost per success is null at zero successes. Duplicate/unpaired records, mismatched fixture versions and mixed-model flat pricing are rejected. Estimates exclude unreported requests, cache-write fees and other invoice charges. A cache-loss regression demonstrates that fewer input tokens can cost more under explicitly hypothetical prices; this is not a current provider quote.
+
+The JSON output groups requests by model and request kind. Cache hit rate uses only input tokens with reported cache coverage; `cache_coverage_rate` is the fraction of requests reporting cache data. Missing observations are excluded from token sums and shown through request counts and `usage_complete`; old logs without `request_usage` cannot reconstruct usage. Repeating the same file path does not count it twice, but overlapping copies or forked session histories must be excluded manually. Invalid records fail with a file/line location without printing their content. For a compaction comparison, run the same fixed tasks under the same model, tool definitions, and output limits; evaluate task success separately and compare provider bills as well as observed tokens. Keep cold-cache and warm-cache runs separate. This reporter does not send model requests or infer task success or monetary cost.
+</details>
+
+<details>
+<summary><strong>Using sigil with Claude Desktop (MCP)</strong> — claude_desktop_config.json snippet for sigil mcp</summary>
+
 
 `sigil mcp` is a standard MCP server over stdio, so Claude Desktop can
 use every sigil tool (bash, files, git, Lua scripted tools, memory,
@@ -474,7 +486,11 @@ Point `command` at `cargo build --release` output, set `env` to your
 endpoint, restart Claude Desktop, and the sigil tools appear in the
 MCP tool list.
 
-## Roadmap
+</details>
+
+<details>
+<summary><strong>Roadmap</strong> — all 48 phases complete (phase table)</summary>
+
 
 | Phase | Scope |
 |-------|-------|
@@ -528,9 +544,14 @@ MCP tool list.
 | **47** ✅ | CLI consistency (pipe --resume latest works, session list timestamps) |
 | **48** ✅ | Research landing (parallel tool calls, reactive compaction, planning checkpoints, delegate reports) |
 
+</details>
+
 ## Changelog
 
 Full per-phase history: [CHANGELOG.md](CHANGELOG.md) (entries are frozen history — not rewritten when behavior evolves).
+
+<details>
+<summary><strong>Release notes</strong> — v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
 
 ### v0.2.0 — 2026-08-13
 Delegation & sub-agents, daemon + cron, robustness, and the thin-core
@@ -560,6 +581,8 @@ vendored LuaJIT with real FFI, self-evolution (Lua tools + harness
 instruction layer), three-layer safety, sessions with true multi-turn
 context, sub-agent delegation, streaming, ratchet tests, `sigil doctor`,
 shell completions, 48 unit tests.
+
+</details>
 
 ## Development
 

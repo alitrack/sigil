@@ -23,77 +23,9 @@ sigil 是用 Rust 从零开发的终端 coding agent。它说 OpenAI 兼容的 c
 **LuaJIT 已嵌入二进制**作为进化引擎：模型可以在运行时编写自己的 Lua
 工具、热注册、从内部成长 agent 能力——无需重新编译。
 
-### 上下文预算与缓存诊断
+<details>
+<summary><strong>DREAM 探索与重放</strong> — 有界自生成任务循环；策略 preview / collect / compare（preview 无模型调用）</summary>
 
-活动目标提示词只展示目标和固定回合预算。不断变化的已用回合数保留在持久状态及 `manage_goals` 输出中，计数本身不再改写提示词前缀。目标新增、完成、暂停和预算变更仍会刷新上下文。
-
-从事件历史重建系统提示词时，技能相关性与 `on_prompt_build` 使用最后一条用户消息。因此管道续接能按本轮任务选择技能，而不是沿用会话最早任务的输入。
-
-技能相关性决定内联哪些正文；同分时及选中集合的最终输出均按名称排序。因此，仅相关性分数变化不会重排相同技能集合。技能集合变化、正文编辑及动态 hook 输出仍会改变提示词。
-
-默认在估算的输入提示词达到约 48,000 tokens 时触发压缩，不再按消息条数触发。在 `[agent]` 中按实际模型配置：
-
-```toml
-[agent]
-max_context_tokens = 48000
-max_context_messages = 0
-planning_interval = 0       # 每 N 步重述一次计划（0 = 关闭）
-```
-
-每个零值关闭对应触发条件；两个都为零则关闭主动压缩。估算包含消息封装和工具定义。真实 usage 用于校准当前请求，而不是复用上一次请求的绝对 token 数；新增工具输出和历史缩短都会重新计入。首轮粗估为非 ASCII 字符约两个 tokens、ASCII 约每四字符一个 token；它是启发式，不是模型 tokenizer。阈值不是请求大小的硬上限：固定系统指令、摘要开销和不能拆开的当前工具回合仍可能超出它。应按实际模型上下文窗口设置更低阈值，为输出预留空间。遇到服务端上下文错误时，仍允许一次被动压缩重试。
-
-压缩将开头的系统指令和当前目标固定保留在历史摘要之外，使用有上限的多行摘录，保留已有摘要内容及工具调用/结果配对。它仍然有损：用户消息最多保留 2,000 字符、助手 1,000 字符、工具 500 字符、已有摘要 8,000 字符；合并摘要最多 16,000 字符，另附截断提示。被省略的细节应从原始会话日志查阅。压缩不会额外调用 LLM 生成摘要。
-
-`SIGIL_DEBUG_CACHE=1` 观察实际流式请求、工具重放和最终总结请求，不发送诊断生成请求。流式请求主动要求 usage；在 `finish_reason` 后最多等待 250 毫秒、读取 32 个尾帧以收集 usage。缺失 usage 或缓存字段时明确报告不可用，不当成零命中。会话事件 sink 保存 `request_usage` 元数据，记录请求类别、模型和观测到的 usage。聚合缓存指标单独保留已报告缓存数据的 prompt token 数；旧记录仍可读取，但其覆盖范围视为未知。同一请求的多个 usage 快照只计一次，采用最后观测到的快照，尾帧读取超时也保留已取得的数据。仅按 token 触发压缩时，若摘要无法降低输入估算，则保留原历史。这是 token 观测，不是完整账单：未报告的 usage、缓存写入费率、提供方内部重试及价格都不会被推算。压缩可能使变化位置之后的缓存失效，增加首次请求费用；token 更少不能证明省钱，应在实际提供方上比较成功任务的总费用与质量。
-
-
-记录管道回合，供后续比较：
-
-```bash
-sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
-sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
-```
-
-显式指定 `--sessions-dir` 时，管道模式保存历史和请求 usage；使用 `--resume` 时，新事件追加到被续接的会话。不使用这两个选项的普通管道运行仍不保存会话。会话 ID 输出到 stderr；管道 ID 必须是普通文件名。日志包含对话和工具内容，应将实验数据保存在合适的本地目录。
-
-离线汇总指定会话日志（仅依赖 Python 标准库）：
-
-```bash
-python3 test-tools/usage_report.py path/to/session.jsonl
-python3 test-tools/usage_report.py --json path/to/session.jsonl
-```
-
-运行成对的合成任务状态保留实验（Python 3.11+）：
-
-```bash
-python3 test-tools/context_eval.py
-python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
-```
-
-第一条命令只显示计划。第二条使用已在本机配置的 `SIGIL_API_KEY`；生成配置和汇总报告不包含密钥。输出目录必须是新目录。两种策略使用相同种子历史：一组关闭主动压缩，另一组默认以 8,000-token 阈值触发（可用 `--threshold` 调整）。默认两组重复实验交替执行顺序。`report.json` 包含严格答案正确率、请求数、观测 token、缓存覆盖率、策略汇总及二进制 SHA-256。失败尝试仍计入分母，中断或损坏观测保留用量不完整状态。默认样本只测试一个任务键的保留能力，不代表通用编码质量。服务端缓存状态不可控，不能据此判定冷/热缓存成本或金额节省。三步工具上限和 `--timeout` 限制执行，不是计费 token 上限；输出限制仍由模型服务控制。会话包含合成历史及真实模型/工具输出，应保存在本机。费用结论仍需核对服务商账单。
-
-`write_file` 对任意目标均支持原样文本字符串；对于 `.json` 目标（扩展名不区分大小写），也接受 JSON 对象或数组并序列化为格式化 JSON。其他文件类型的结构化内容，以及 null、数字和布尔内容，均在文件操作前拒绝。
-
-可用 `--case json-edit` 改为文件修改样本：
-
-```bash
-python3 test-tools/context_eval.py --case json-edit --execute --repetitions 1 --output ./context-json-run --model MODEL --base-url http://127.0.0.1:3001/v1
-```
-
-该样本要求模型读取并按历史指令修改 `settings.json`。成功需同时满足字段值与类型正确、无关嵌套字段和 Unicode 保留、受保护文件不变、进程成功退出，以及日志记录先 `read_file` 后 `write_file`。使用其他工具、访问其他路径或产生额外工作区变化均判失败；会话日志和运行时目标计数不纳入工作区变更检查。JSON 读取有大小限制，拒绝重复键、符号链接和非普通文件；检查器不执行生成代码。它是一个小型工具使用/文件成果检查，不代表通用编码能力。单次配对不平衡执行顺序，也不能证明质量或费用不劣。
-
-不调用模型即可分析已有成对报告：
-
-```bash
-python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repeat.json
-```
-
-未提供单价时，只输出观测 token 差额和费用公式，金额字段保持 null。需要估算时，必须一起提供 `--uncached-input-rate`、`--cached-input-rate`、`--output-rate`（每百万 token 的货币单位）及 `--currency`。单价须与实际计费模型/路由匹配，工具不会自动查询。价格须有限且非负（上限 1e12、28 位十进制数字、指数 -36 至 12）。用量不完整或缓存分类未知时不计算完整估算；缓存与未缓存输入单价相同是例外，因为分类不影响费用。失败尝试仍计入支出，零成功时每个成功任务的费用为 null。重复或缺失配对、样本版本不一致和混合模型使用同一单价均会拒绝。估算不包含未报告请求、缓存写入费及其他账单项目。缓存丢失的回归样本证明：在明确标注的假设价格下，更少输入 token 也可能更贵；它不代表当前服务商报价。
-
-JSON 输出按模型和请求类型分组。缓存命中率只使用已报告缓存覆盖的输入 token 作分母；`cache_coverage_rate` 表示报告缓存数据的请求比例。缺失观测不计入 token 总和，通过请求计数和 `usage_complete` 明确显示；没有 `request_usage` 的旧日志无法还原用量。同一路径重复传入只统计一次，但重叠副本或分叉会话中重复的历史必须手动排除。无效记录以文件和行号报错，不打印记录内容。比较压缩策略时，应使用相同固定任务、模型、工具定义和输出限制，另行验证任务成功率，并同时比较服务商账单和观测 token。冷缓存与热缓存实验应分别统计。该脚本不发送模型请求，也不推断任务成功或金额。
-
-
-## DREAM 探索与重放
 
 `test-tools/dream.py` 在现有 sigil 二进制之外提供按需开启的闭环：
 真实探索 → 历史重放 → 策略择优 → 下一轮部署。
@@ -128,7 +60,11 @@ python3 test-tools/dream.py replay --world ./dream-run/round-1/world.json --worl
 `SIGIL_DREAM_E2E=1` 可运行真实二进制与本地模拟接口的闭环测试。
 此任务验证编排正确性，不代表通用编码能力提升，也不是论文基准复现。
 
-## 证据：harness 真的在进化
+</details>
+
+<details>
+<summary><strong>证据：harness 真的在进化</strong> — 8 epoch 可复现基准：进化组 1/3 -> 3/3 爬升，冻结对照组 0/16，能力面 7 -> 39 资产</summary>
+
 
 核心命题——*能修改自己 harness 的 agent 会随时间变强*——不是路线图上的
 愿景，而是已经用可复现实验验证过的（2026-08-19，8 个 epoch，
@@ -267,6 +203,8 @@ Qwen3.8-27B）、同一任务、同一套断言。
 > TUI 彩色输出、`/tools` 搜索、`sigil doctor` 环境自检、shell 补全
 > ——全部端到端可用。
 
+</details>
+
 ## 快速开始
 
 ```bash
@@ -384,7 +322,81 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 - **`lua::LuaRuntime`** — vendored LuaJIT 开启 `ffi`；`host` 辅助表
   （`read_file` / `write_file` / `env`）是脚本↔宿主的安全边界。
 
-## 与 Claude Desktop 集成（MCP）
+<details>
+<summary><strong>上下文预算与缓存诊断</strong> — 压缩触发与估算、提示前缀稳定性规则、评测会话记录、SIGIL_DEBUG_CACHE token 遥测</summary>
+
+
+活动目标提示词只展示目标和固定回合预算。不断变化的已用回合数保留在持久状态及 `manage_goals` 输出中，计数本身不再改写提示词前缀。目标新增、完成、暂停和预算变更仍会刷新上下文。
+
+从事件历史重建系统提示词时，技能相关性与 `on_prompt_build` 使用最后一条用户消息。因此管道续接能按本轮任务选择技能，而不是沿用会话最早任务的输入。
+
+技能相关性决定内联哪些正文；同分时及选中集合的最终输出均按名称排序。因此，仅相关性分数变化不会重排相同技能集合。技能集合变化、正文编辑及动态 hook 输出仍会改变提示词。
+
+默认在估算的输入提示词达到约 48,000 tokens 时触发压缩，不再按消息条数触发。在 `[agent]` 中按实际模型配置：
+
+```toml
+[agent]
+max_context_tokens = 48000
+max_context_messages = 0
+planning_interval = 0       # 每 N 步重述一次计划（0 = 关闭）
+```
+
+每个零值关闭对应触发条件；两个都为零则关闭主动压缩。估算包含消息封装和工具定义。真实 usage 用于校准当前请求，而不是复用上一次请求的绝对 token 数；新增工具输出和历史缩短都会重新计入。首轮粗估为非 ASCII 字符约两个 tokens、ASCII 约每四字符一个 token；它是启发式，不是模型 tokenizer。阈值不是请求大小的硬上限：固定系统指令、摘要开销和不能拆开的当前工具回合仍可能超出它。应按实际模型上下文窗口设置更低阈值，为输出预留空间。遇到服务端上下文错误时，仍允许一次被动压缩重试。
+
+压缩将开头的系统指令和当前目标固定保留在历史摘要之外，使用有上限的多行摘录，保留已有摘要内容及工具调用/结果配对。它仍然有损：用户消息最多保留 2,000 字符、助手 1,000 字符、工具 500 字符、已有摘要 8,000 字符；合并摘要最多 16,000 字符，另附截断提示。被省略的细节应从原始会话日志查阅。压缩不会额外调用 LLM 生成摘要。
+
+`SIGIL_DEBUG_CACHE=1` 观察实际流式请求、工具重放和最终总结请求，不发送诊断生成请求。流式请求主动要求 usage；在 `finish_reason` 后最多等待 250 毫秒、读取 32 个尾帧以收集 usage。缺失 usage 或缓存字段时明确报告不可用，不当成零命中。会话事件 sink 保存 `request_usage` 元数据，记录请求类别、模型和观测到的 usage。聚合缓存指标单独保留已报告缓存数据的 prompt token 数；旧记录仍可读取，但其覆盖范围视为未知。同一请求的多个 usage 快照只计一次，采用最后观测到的快照，尾帧读取超时也保留已取得的数据。仅按 token 触发压缩时，若摘要无法降低输入估算，则保留原历史。这是 token 观测，不是完整账单：未报告的 usage、缓存写入费率、提供方内部重试及价格都不会被推算。压缩可能使变化位置之后的缓存失效，增加首次请求费用；token 更少不能证明省钱，应在实际提供方上比较成功任务的总费用与质量。
+
+
+记录管道回合，供后续比较：
+
+```bash
+sigil --sessions-dir ./evaluation-sessions prompt -p "Read src/cli.rs and describe its first line"
+sigil --sessions-dir ./evaluation-sessions --resume latest prompt -p "Continue the task"
+```
+
+显式指定 `--sessions-dir` 时，管道模式保存历史和请求 usage；使用 `--resume` 时，新事件追加到被续接的会话。不使用这两个选项的普通管道运行仍不保存会话。会话 ID 输出到 stderr；管道 ID 必须是普通文件名。日志包含对话和工具内容，应将实验数据保存在合适的本地目录。
+
+离线汇总指定会话日志（仅依赖 Python 标准库）：
+
+```bash
+python3 test-tools/usage_report.py path/to/session.jsonl
+python3 test-tools/usage_report.py --json path/to/session.jsonl
+```
+
+运行成对的合成任务状态保留实验（Python 3.11+）：
+
+```bash
+python3 test-tools/context_eval.py
+python3 test-tools/context_eval.py --execute --output ./context-eval-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+第一条命令只显示计划。第二条使用已在本机配置的 `SIGIL_API_KEY`；生成配置和汇总报告不包含密钥。输出目录必须是新目录。两种策略使用相同种子历史：一组关闭主动压缩，另一组默认以 8,000-token 阈值触发（可用 `--threshold` 调整）。默认两组重复实验交替执行顺序。`report.json` 包含严格答案正确率、请求数、观测 token、缓存覆盖率、策略汇总及二进制 SHA-256。失败尝试仍计入分母，中断或损坏观测保留用量不完整状态。默认样本只测试一个任务键的保留能力，不代表通用编码质量。服务端缓存状态不可控，不能据此判定冷/热缓存成本或金额节省。三步工具上限和 `--timeout` 限制执行，不是计费 token 上限；输出限制仍由模型服务控制。会话包含合成历史及真实模型/工具输出，应保存在本机。费用结论仍需核对服务商账单。
+
+`write_file` 对任意目标均支持原样文本字符串；对于 `.json` 目标（扩展名不区分大小写），也接受 JSON 对象或数组并序列化为格式化 JSON。其他文件类型的结构化内容，以及 null、数字和布尔内容，均在文件操作前拒绝。
+
+可用 `--case json-edit` 改为文件修改样本：
+
+```bash
+python3 test-tools/context_eval.py --case json-edit --execute --repetitions 1 --output ./context-json-run --model MODEL --base-url http://127.0.0.1:3001/v1
+```
+
+该样本要求模型读取并按历史指令修改 `settings.json`。成功需同时满足字段值与类型正确、无关嵌套字段和 Unicode 保留、受保护文件不变、进程成功退出，以及日志记录先 `read_file` 后 `write_file`。使用其他工具、访问其他路径或产生额外工作区变化均判失败；会话日志和运行时目标计数不纳入工作区变更检查。JSON 读取有大小限制，拒绝重复键、符号链接和非普通文件；检查器不执行生成代码。它是一个小型工具使用/文件成果检查，不代表通用编码能力。单次配对不平衡执行顺序，也不能证明质量或费用不劣。
+
+不调用模型即可分析已有成对报告：
+
+```bash
+python3 test-tools/context_cost.py docs/evaluations/2026-10-12-context-json-repeat.json
+```
+
+未提供单价时，只输出观测 token 差额和费用公式，金额字段保持 null。需要估算时，必须一起提供 `--uncached-input-rate`、`--cached-input-rate`、`--output-rate`（每百万 token 的货币单位）及 `--currency`。单价须与实际计费模型/路由匹配，工具不会自动查询。价格须有限且非负（上限 1e12、28 位十进制数字、指数 -36 至 12）。用量不完整或缓存分类未知时不计算完整估算；缓存与未缓存输入单价相同是例外，因为分类不影响费用。失败尝试仍计入支出，零成功时每个成功任务的费用为 null。重复或缺失配对、样本版本不一致和混合模型使用同一单价均会拒绝。估算不包含未报告请求、缓存写入费及其他账单项目。缓存丢失的回归样本证明：在明确标注的假设价格下，更少输入 token 也可能更贵；它不代表当前服务商报价。
+
+JSON 输出按模型和请求类型分组。缓存命中率只使用已报告缓存覆盖的输入 token 作分母；`cache_coverage_rate` 表示报告缓存数据的请求比例。缺失观测不计入 token 总和，通过请求计数和 `usage_complete` 明确显示；没有 `request_usage` 的旧日志无法还原用量。同一路径重复传入只统计一次，但重叠副本或分叉会话中重复的历史必须手动排除。无效记录以文件和行号报错，不打印记录内容。比较压缩策略时，应使用相同固定任务、模型、工具定义和输出限制，另行验证任务成功率，并同时比较服务商账单和观测 token。冷缓存与热缓存实验应分别统计。该脚本不发送模型请求，也不推断任务成功或金额。
+</details>
+
+<details>
+<summary><strong>与 Claude Desktop 集成（MCP）</strong> — sigil mcp 的 claude_desktop_config.json 片段</summary>
+
 
 `sigil mcp` 是标准 stdio MCP server，Claude Desktop 可以直接使用 sigil
 的全部工具（bash、文件、git、Lua 脚本工具、memory、delegate 等）。
@@ -408,7 +420,11 @@ stdin / REPL / ACP ──► agent 循环 ──► LlmProvider (OpenAI 兼容�
 `command` 指向 `cargo build --release` 产物，`env` 填你的端点，重启
 Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 
-## 路线图
+</details>
+
+<details>
+<summary><strong>路线图</strong> — 全部 48 个阶段已完成（阶段表）</summary>
+
 
 | 阶段 | 范围 |
 |------|------|
@@ -462,9 +478,14 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 | **47** ✅ | CLI 一致性（pipe --resume latest 生效、session list 时间戳） |
 | **48** ✅ | 调研落地（并行工具调用、反应式压缩、规划检查点、delegate 报告） |
 
+</details>
+
 ## 更新日志
 
 完整的逐阶段历史见 [CHANGELOG_cn.md](CHANGELOG_cn.md)（条目为冻结历史——行为演进不改写）。
+
+<details>
+<summary><strong>发布说明</strong> — v0.2.0 (2026-08-13) · v0.1.0 (2026-08-09)</summary>
 
 ### v0.2.0 — 2026-08-13
 委托与子代理、daemon + cron、健壮性、以及薄化路线（Lua 策略层）。要点：
@@ -490,6 +511,8 @@ Claude Desktop 后 sigil 工具即出现在 MCP 工具列表。
 vendored LuaJIT 真实 FFI、自进化（Lua 工具 + harness 指令层）、
 三层 safety、真正多轮上下文的会话、子代理委托、流式输出、
 ratchet 测试、`sigil doctor`、shell 补全、48 个单元测试。
+
+</details>
 
 ## 开发
 

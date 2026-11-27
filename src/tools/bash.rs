@@ -98,6 +98,7 @@ impl BashTool {
 /// knows the mapping.
 fn tool_description_for(timeout: std::time::Duration) -> String {
     let secs = timeout.as_secs();
+    #[cfg_attr(not(windows), allow(unused_mut))] // only Windows pushes the extra note
     let mut d = format!(
         "Run a shell command in the project directory and capture stdout/stderr.          Returns combined output. Commands are killed after {secs}s.          Prefer relative paths — they resolve against the session working directory.",
     );

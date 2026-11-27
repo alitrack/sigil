@@ -585,7 +585,7 @@ mod tests {
 local ffi = require('ffi')
 ffi.cdef[[ size_t strlen(const char* s); ]]
 local libc = ffi.load('c')
-return tostring(libc.strlen('hello'))
+return tostring(tonumber(libc.strlen('hello')))
 "#,
             )
             .unwrap();
